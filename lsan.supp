@@ -1,0 +1,13 @@
+# Use wildcards to catch versioned NVIDIA drivers
+leak:libnvidia-glcore.so
+leak:libGLX_nvidia.so
+leak:libnvidia-rtcore.so
+leak:libnvidia-gpucomp.so
+
+# Catch the Vulkan loader/layers specifically
+leak:libvulkan.so
+leak:libVkLayer_khronos_validation.so
+
+# Catch X11/System leaks that often crop up in Vulkan init
+leak:libX11.so
+leak:libdbus-1.so

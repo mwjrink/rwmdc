@@ -1,0 +1,10 @@
+-std=gnu17
+-Isrc
+-DWAYLAND
+-D__DEBUG
+-Wall
+-Wextra
+-Wno-unused-parameter
+-Wno-unused-function
+-Wno-missing-field-initializers
+-xc

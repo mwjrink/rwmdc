@@ -1,0 +1,6 @@
+rwmd
+omp*
+examples/*
+tests/*
+bench/*
+*.spv
