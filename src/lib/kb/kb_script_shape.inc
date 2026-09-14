@@ -1,9 +1,8 @@
 typedef struct kbts__attach_state
 {
-  kbts__syllabic_position CurrentPosition;
-  kbts__syllabic_position LastPositionThatWasNotPreBaseMatra;
+  kbts_u32 CurrentKey;
+  kbts_u32 LastKeyThatWasNotPreBaseMatra;
   kbts_indic_syllabic_class LastClass;
-  kbts_glyph_ref Start;
   kbts_glyph_ref OnePastLast;
   kbts_glyph_ref At;
 } kbts__attach_state;
@@ -173,7 +172,7 @@ static kbts_glyph_ref kbts__BeginCluster(kbts_shape_scratchpad *Scratchpad, kbts
         if(OnePastRephIndex)
         {
           OnePastReph = kbts__NextGlyphRef(Storage, FirstGlyphs[OnePastRephIndex - 1]);
-          while(kbts__GlyphIsValid(Storage, OnePastReph) &&
+          while(OnePastReph != OnePastLastSyllableGlyph &&
                 KBTS__IN_SET(kbts__Glyph(Storage, OnePastReph)->SyllabicClass, KBTS__SET32((KBTS_INDIC_SYLLABIC_CLASS_ZWJ)
                                                                    (KBTS_INDIC_SYLLABIC_CLASS_ZWNJ))))
           {
@@ -195,6 +194,10 @@ static kbts_glyph_ref kbts__BeginCluster(kbts_shape_scratchpad *Scratchpad, kbts
         }
 
         kbts__Glyph(Storage, BaseGlyph)->UserIdOrCodepointIndex = kbts__Glyph(Storage, OnePastReph)->UserIdOrCodepointIndex;
+        /* The inserted base is now the first glyph after reph. Keeping the
+         * old boundary would start the forward pre-base attachment walk after
+         * its end and let it escape into following clusters. */
+        OnePastReph = BaseGlyph;
       }
       else
       {
@@ -213,10 +216,11 @@ static kbts_glyph_ref kbts__BeginCluster(kbts_shape_scratchpad *Scratchpad, kbts
         kbts__syllabic_position SyllabicPosition = KBTS__SYLLABIC_POSITION_SYLLABLE_BASE;
         kbts_indic_syllabic_class LastClass = KBTS_INDIC_SYLLABIC_CLASS_COUNT;
 
-        for(Glyph = kbts__PrevGlyphRef(Storage, OnePastLastSyllableGlyph);
-            ;
-            Glyph = kbts__PrevGlyphRef(Storage, Glyph))
+        /* Search only the post-reph interval. It may be empty when the
+         * entire cluster is reph; that case uses the base fallback below. */
+        for(Glyph = OnePastLastSyllableGlyph; Glyph != OnePastReph;)
         {
+          Glyph = kbts__PrevGlyphRef(Storage, Glyph);
           kbts_indic_syllabic_class Class = kbts__Glyph(Storage, Glyph)->SyllabicClass;
 
           switch(Class)
@@ -226,7 +230,7 @@ static kbts_glyph_ref kbts__BeginCluster(kbts_shape_scratchpad *Scratchpad, kbts
           case KBTS_INDIC_SYLLABIC_CLASS_CONSONANT_WITH_STACKER:
           case KBTS_INDIC_SYLLABIC_CLASS_CONSONANT_MEDIAL:
             // Apply locl first.
-            Scratch[1] = kbts__Substitute1(Scratchpad, Config, Storage, LookupList, Locl, KBTS__SKIP_FLAG_ZWNJ | KBTS__SKIP_FLAG_ZWJ, kbts__Glyph(Storage, Glyph));
+            Scratch[1] = kbts__Substitute1(Scratchpad, Config, 0, LookupList, Locl, KBTS__SKIP_FLAG_ZWNJ | KBTS__SKIP_FLAG_ZWJ, kbts__Glyph(Storage, Glyph));
 
             // Microsoft says to "move backwards until a consonant is found that does not have a below-base
             // or post-base form".
@@ -300,10 +304,6 @@ static kbts_glyph_ref kbts__BeginCluster(kbts_shape_scratchpad *Scratchpad, kbts
           }
 
           LastClass = Class;
-          if(Glyph == OnePastReph)
-          {
-            break;
-          }
         }
       DoneScanningForBase:;
       }
@@ -370,15 +370,9 @@ static kbts_glyph_ref kbts__BeginCluster(kbts_shape_scratchpad *Scratchpad, kbts
         }
       }
 
-      /* REVIEW[GLYPH6 CLEANUP]: This pass repacks SyllabicPosition into a temporary
-       * sort key, attachment propagation consumes that encoding, and a later full
-       * walk shifts it back. Can an explicit key lifetime remove the conversion
-       * round-trip while keeping canonical positions available to EndCluster?
-       * Retain stable slots, stable equal-key order, and matra attachment groups. */
-      { // @Temporary @Cleanup
-        // Left matras should be ordered backwards.
-        // We want to bake this ordering into our sort, so we increase our syllabic position bits
-        // and sub-order matras with the low nibble. (There should only be 4 matras tops, anyway.)
+      { /* Script keys live only through this reorder. GPOS assigns fresh
+         * logical-order keys after structural shaping has finished. */
+        // Left matras sort backwards within their canonical syllabic position.
         kbts_un LeftMatraCount = 0;
         for(Glyph = kbts__NextGlyphRef(Storage, OneBeforeSyllableGlyph);
             Glyph != OnePastLastSyllableGlyph;
@@ -393,7 +387,7 @@ static kbts_glyph_ref kbts__BeginCluster(kbts_shape_scratchpad *Scratchpad, kbts
             SyllabicPosition += (15 - LeftMatraCount++) & 0xF;
           }
 
-          kbts__Glyph(Storage, Glyph)->SyllabicPosition = (kbts_u8)SyllabicPosition;
+          kbts__Glyph(Storage, Glyph)->SortKey = (kbts_u32)SyllabicPosition;
         }
       }
 
@@ -409,15 +403,13 @@ static kbts_glyph_ref kbts__BeginCluster(kbts_shape_scratchpad *Scratchpad, kbts
             KBTS__SYLLABIC_POSITION_RA_TO_BECOME_REPH << 4,
             KBTS__SYLLABIC_POSITION_RA_TO_BECOME_REPH << 4,
             KBTS_INDIC_SYLLABIC_CLASS_COUNT,
-            OnePastReph,
             BaseGlyph,
             OnePastReph,
           },
           {
-            (kbts_u8)(LastConsonantPosition << 4),
-            (kbts_u8)(LastConsonantPosition << 4),
+            (kbts_u32)LastConsonantPosition << 4,
+            (kbts_u32)LastConsonantPosition << 4,
             KBTS_INDIC_SYLLABIC_CLASS_COUNT,
-            LastConsonant ? kbts__NextGlyphRef(Storage, LastConsonant) : OnePastLastSyllableGlyph,
             OnePastLastSyllableGlyph,
             LastConsonant ? kbts__NextGlyphRef(Storage, LastConsonant) : OnePastLastSyllableGlyph,
           },
@@ -442,8 +434,9 @@ static kbts_glyph_ref kbts__BeginCluster(kbts_shape_scratchpad *Scratchpad, kbts
               case KBTS_INDIC_SYLLABIC_CLASS_CONSONANT_WITH_STACKER:
               case KBTS_INDIC_SYLLABIC_CLASS_CONSONANT_MEDIAL:
                 // This only happens in the pre-base state.
-                kbts__Glyph(Storage, Glyph)->SyllabicPosition = (KBTS__SYLLABIC_POSITION_PREBASE_CONSONANT << 4);
-                Attach->CurrentPosition = (KBTS__SYLLABIC_POSITION_PREBASE_CONSONANT << 4);
+                kbts__Glyph(Storage, Glyph)->SyllabicPosition = KBTS__SYLLABIC_POSITION_PREBASE_CONSONANT;
+                kbts__Glyph(Storage, Glyph)->SortKey = KBTS__SYLLABIC_POSITION_PREBASE_CONSONANT << 4;
+                Attach->CurrentKey = KBTS__SYLLABIC_POSITION_PREBASE_CONSONANT << 4;
                 break;
 
               case KBTS_INDIC_SYLLABIC_CLASS_MATRA_POST:
@@ -454,21 +447,23 @@ static kbts_glyph_ref kbts__BeginCluster(kbts_shape_scratchpad *Scratchpad, kbts
                 if(Attach->LastClass == KBTS_INDIC_SYLLABIC_CLASS_SYLLABLE_MODIFIER)
                 {
                   kbts__Glyph(Storage, kbts__PrevGlyphRef(Storage, Glyph))->SyllabicPosition = kbts__Glyph(Storage, Glyph)->SyllabicPosition;
+                  kbts__Glyph(Storage, kbts__PrevGlyphRef(Storage, Glyph))->SortKey = kbts__Glyph(Storage, Glyph)->SortKey;
                 }
                 KBTS__FALLTHROUGH;
               case KBTS_INDIC_SYLLABIC_CLASS_MATRA:
-                Attach->CurrentPosition = kbts__Glyph(Storage, Glyph)->SyllabicPosition;
-                if((Attach->CurrentPosition >> 4) != KBTS__SYLLABIC_POSITION_PREBASE_MATRA)
+                Attach->CurrentKey = kbts__Glyph(Storage, Glyph)->SortKey;
+                if(kbts__Glyph(Storage, Glyph)->SyllabicPosition != KBTS__SYLLABIC_POSITION_PREBASE_MATRA)
                 {
-                  Attach->LastPositionThatWasNotPreBaseMatra = Attach->CurrentPosition;
+                  Attach->LastKeyThatWasNotPreBaseMatra = Attach->CurrentKey;
                 }
                 break;
 
               case KBTS_INDIC_SYLLABIC_CLASS_HALANT:
-                if((Attach->CurrentPosition >> 4) == KBTS__SYLLABIC_POSITION_PREBASE_MATRA)
+                if((Attach->CurrentKey >> 4) == KBTS__SYLLABIC_POSITION_PREBASE_MATRA)
                 {
                   // Uniscribe does not reorder halants with pre-base matras. Not sure why.
-                  kbts__Glyph(Storage, Glyph)->SyllabicPosition = Attach->LastPositionThatWasNotPreBaseMatra;
+                  kbts__Glyph(Storage, Glyph)->SortKey = Attach->LastKeyThatWasNotPreBaseMatra;
+                  kbts__Glyph(Storage, Glyph)->SyllabicPosition = (kbts_u8)(Attach->LastKeyThatWasNotPreBaseMatra >> 4);
                   break;
                 }
                 KBTS__FALLTHROUGH;
@@ -476,7 +471,8 @@ static kbts_glyph_ref kbts__BeginCluster(kbts_shape_scratchpad *Scratchpad, kbts
               case KBTS_INDIC_SYLLABIC_CLASS_ZWJ:
               case KBTS_INDIC_SYLLABIC_CLASS_ZWNJ:
                 // @Incomplete: Register Shifter
-                kbts__Glyph(Storage, Glyph)->SyllabicPosition = Attach->CurrentPosition;
+                kbts__Glyph(Storage, Glyph)->SortKey = Attach->CurrentKey;
+                kbts__Glyph(Storage, Glyph)->SyllabicPosition = (kbts_u8)(Attach->CurrentKey >> 4);
                 break;
               }
 
@@ -496,7 +492,7 @@ static kbts_glyph_ref kbts__BeginCluster(kbts_shape_scratchpad *Scratchpad, kbts
       { // Do the sort!
         // NOTE: It is important that we sort _now_, because some characters will be reordered across the base from
         // where they started, which can change which features will apply to them.
-        KBTS__SORT_GLYPHS(Storage, kbts__NextGlyphRef(Storage, OneBeforeSyllableGlyph), OnePastLastSyllableGlyph, SyllabicPosition);
+        KBTS__SORT_GLYPHS(Storage, kbts__NextGlyphRef(Storage, OneBeforeSyllableGlyph), OnePastLastSyllableGlyph, SortKey);
 
 #ifdef KBTS_SANITY_CHECK
         {
@@ -509,7 +505,7 @@ static kbts_glyph_ref kbts__BeginCluster(kbts_shape_scratchpad *Scratchpad, kbts
             {
               if(Glyph1 != OnePastLastSyllableGlyph)
               {
-                KBTS_ASSERT(kbts__Glyph(Storage, Glyph0)->SyllabicPosition <= kbts__Glyph(Storage, Glyph1)->SyllabicPosition);
+                KBTS_ASSERT(kbts__Glyph(Storage, Glyph0)->SortKey <= kbts__Glyph(Storage, Glyph1)->SortKey);
               }
               else
               {
@@ -519,15 +515,6 @@ static kbts_glyph_ref kbts__BeginCluster(kbts_shape_scratchpad *Scratchpad, kbts
           }
         }
         #endif
-      }
-
-      // @Temporary @Cleanup
-      // Revert our syllabic position shift for now.
-      for(Glyph = kbts__NextGlyphRef(Storage, OneBeforeSyllableGlyph);
-          Glyph != OnePastLastSyllableGlyph;
-          Glyph = kbts__NextGlyphRef(Storage, Glyph))
-      {
-        kbts__Glyph(Storage, Glyph)->SyllabicPosition >>= 4;
       }
 
       // This is what Harfbuzz does:
@@ -785,16 +772,12 @@ static kbts_glyph_ref kbts__BeginCluster(kbts_shape_scratchpad *Scratchpad, kbts
   case KBTS_SHAPER_MYANMAR:
   {
     int NonCluster = 0;
-    /* REVIEW[GLYPH7 SUSPECT]: Unlike the Indic/USE/Khmer non-cluster loops, this
-     * body neither advances Glyph nor changes the predicate's glyph properties.
-     * Unproved reachability: can OTHER survive normalization and pre-cluster GSUB?
-     * If so, ShapeDirect cannot reach its next cluster; establish a progress
-     * invariant for both cluster and non-cluster paths. */
     while(kbts__GlyphIsValid(Storage, Glyph) &&
           ((kbts__Glyph(Storage, Glyph)->SyllabicClass == KBTS_INDIC_SYLLABIC_CLASS_OTHER) ||
            (kbts__Glyph(Storage, Glyph)->SyllabicClass >= KBTS_MYANMAR_SYLLABIC_CLASS_COUNT)))
     {
       NonCluster = 1;
+      Glyph = kbts__NextGlyphRef(Storage, Glyph);
     }
 
     if(!NonCluster)

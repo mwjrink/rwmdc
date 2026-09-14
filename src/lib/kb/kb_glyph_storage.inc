@@ -117,6 +117,9 @@ static kbts_glyph_ref kbts__AllocateGlyph(kbts_glyph_storage *Storage, kbts_u32 
   if(!kbts__ReserveGlyphs(Storage, Storage->Count + !Storage->FreeSlotCount)) return 0;
   kbts_u32 Slot = Storage->FreeSlotCount ? Storage->FreeSlots[--Storage->FreeSlotCount] : Storage->Count++;
   Storage->Glyphs[Slot].Ref = Slot + 1;
+  Storage->Links[Slot].FirstAttached = 0;
+  Storage->Links[Slot].NextAttached = 0;
+  Storage->Links[Slot].PrevAttached = 0;
   kbts__LinkGlyphBefore(Storage, Slot, Before);
   ++Storage->LiveCount;
   return Slot + 1;
@@ -274,13 +277,35 @@ static void kbts__PopGlyphRange(kbts_glyph_storage *Storage, kbts__glyph_range *
   *Range = KBTS__ZERO_TYPE(kbts__glyph_range);
 }
 
+/* GPOS does not change slot identity or logical order. Rebuild its direct-child
+ * links after GSUB, including existing attachments in the active range. */
+static void kbts__RebuildAttachmentLinks(kbts_glyph_storage *Storage)
+{
+  for(kbts_u32 Slot = Storage->First; Slot != Storage->End; Slot = Storage->Links[Slot].Next)
+  {
+    kbts__glyph_link *Link = &Storage->Links[Slot];
+    Link->FirstAttached = Link->NextAttached = Link->PrevAttached = 0;
+    kbts_glyph_ref Parent = Storage->Glyphs[Slot].AttachGlyph;
+    if(kbts__GlyphIsValid(Storage, Parent)) Storage->Links[Parent - 1].FirstAttached = 0;
+  }
+  for(kbts_u32 Slot = Storage->First; Slot != Storage->End; Slot = Storage->Links[Slot].Next)
+  {
+    kbts_glyph_ref Parent = Storage->Glyphs[Slot].AttachGlyph;
+    if(!kbts__GlyphIsValid(Storage, Parent)) continue;
+    kbts__glyph_link *ParentLink = &Storage->Links[Parent - 1];
+    kbts_glyph_ref First = ParentLink->FirstAttached;
+    Storage->Links[Slot].NextAttached = First;
+    if(First) Storage->Links[First - 1].PrevAttached = Slot + 1;
+    ParentLink->FirstAttached = Slot + 1;
+  }
+}
+
 static void kbts__ResetGlyphSlots(kbts_glyph_storage *Storage)
 {
   Storage->Count = Storage->LiveCount = Storage->FreeSlotCount = 0;
   Storage->Head = Storage->Tail = Storage->First = Storage->End = KBTS__GLYPH_END;
   Storage->RangeActive = 0;
   Storage->Ordered = 1;
-  Storage->AttachmentEnd = 0;
   Storage->IndexedScratchpad = 0;
   Storage->Boundary = KBTS__ZERO_TYPE(kbts_glyph);
 }
@@ -351,14 +376,14 @@ KBTS_EXPORT void kbts_FreeAllGlyphs(kbts_glyph_storage *Storage)
   kbts__ResetGlyphSlots(Storage);
 }
 
-KBTS_EXPORT kbts_glyph *kbts_PushGlyph(kbts_glyph_storage *Storage, kbts_font *Font, int Codepoint, kbts_glyph_config *Config, int UserId)
+static kbts_glyph *kbts__PushMappedGlyph(kbts_glyph_storage *Storage, kbts_font *Font, int Codepoint, kbts_glyph_config *Config, int UserId, kbts_u16 Id)
 {
   KB_PROFILE_SCOPE(KBP_GLYPH_PUSH);
   if(!Storage || Storage->Error) return 0;
   kbts_glyph_ref Ref = kbts__AllocateGlyph(Storage, Storage->End);
   if(!Ref) return 0;
   kbts_glyph *Result = kbts__Glyph(Storage, Ref);
-  if(Font) kbts__InitializeGlyph(Result, Font, Codepoint, Config, UserId);
+  if(Font) kbts__InitializeMappedGlyph(Result, Font, Codepoint, Config, UserId, Id);
   else
   {
     *Result = KBTS__ZERO_TYPE(kbts_glyph);
@@ -368,6 +393,13 @@ KBTS_EXPORT kbts_glyph *kbts_PushGlyph(kbts_glyph_storage *Storage, kbts_font *F
   Result->Ref = Ref;
   if(Storage->IndexedScratchpad) kbts__GsubInsertSlot(Storage->IndexedScratchpad, Ref - 1);
   return Result;
+}
+
+KBTS_EXPORT kbts_glyph *kbts_PushGlyph(kbts_glyph_storage *Storage, kbts_font *Font, int Codepoint, kbts_glyph_config *Config, int UserId)
+{
+  if(!Storage || Storage->Error) return 0;
+  kbts_u16 Id = Font ? (kbts_u16)kbts_CodepointToGlyphId(Font, Codepoint) : 0;
+  return kbts__PushMappedGlyph(Storage, Font, Codepoint, Config, UserId, Id);
 }
 
 KBTS_EXPORT int kbts_GlyphIteratorIsValid(kbts_glyph_iterator *It)

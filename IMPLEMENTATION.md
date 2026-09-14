@@ -25,11 +25,57 @@ The approved storage/window design is implemented. The frozen design artifact is
 - `os/input.h` / window backends: queued UTF-8/key/pointer/scroll events, text
   conversion, repeat, focus and asynchronous clipboard protocols.
 - `gfx/`: Vulkan device/queue/swapchain/frame slots and buffer/device-address helpers.
-- `lib/kb/kb_text_shape.h`, `kb_gsub_plan.inc`, `kb_gsub_stream.inc` and
-  `kb_profile.h`: isolated owned shaping fork, canonical indexed execution,
-  and optional nested RDTSCP instrumentation; not used by the editor yet.
+- `lib/kb/kb_text_shape.h`, `kb_font_tables.inc`, `kb_context_compile.inc`,
+  `kb_context_fuse.inc`, `kb_gsub_plan.inc` and `kb_gsub_stream.inc`: owned shaping
+  fork with checked font descriptors, collect/analyze/emit compilation, selected
+  configuration plans and canonical stable-slot execution. `kb_profile.h`
+  provides optional nested RDTSCP instrumentation. Not used by the editor yet.
 - `bench/shaping*`: separate upstream/owned/HarfBuzz adapters, equivalence runner
   and matched SSE2/AVX2 profiling/benchmark builds.
+
+## Owned shaping invariants
+
+Font construction establishes actual blob extents and immutable lookup/subtable
+descriptors, including extension type/direction and filtering data. Font-owned
+glyph-class tables preserve 16-bit attachment classes and the distinction between
+Unicode fallback initialization and post-substitution classes without GDEF.
+Native blob placement produces complete serialized bytes before compilation;
+owning constructors retain independent blob storage, while manual native loading
+borrows it.
+
+Context compilation groups coverage/class sources, retains logical rules and
+ordered dispatch through fusion, then emits one interned resident cache. The
+classifier remains font-global. Per-lookup summaries retain only facts consumed
+by configuration construction; configurations derive their reachable closure and
+window bounds from selected required/default/optional/nested roots. Construction
+scratch, advertised placement capacity and heap-resident size are distinct.
+Public `kbts_PlaceShapeConfig` takes the available `MemorySize` and rejects a
+null, invalid or undersized request before writing; callers must pass the
+advertised construction capacity, not merely the resident payload size.
+
+Effective feature sets are immutable, sorted and last-wins, including explicit
+zero and nonbinary values. Preparation resolves configurations and retains exact
+font mapping in the existing input records; execution does not compile configs.
+Nominal coverage does not eagerly enumerate normalization parents. Missing-only
+coverage resolves aliases/compositions in one parent walk, preserving singleton
+priority; no second parent-list representation or general grapheme cache remains.
+One context-owned scratchpad rebinds and reuses capacity across runs. Reset and
+destruction cannot dereference storage from a previous run.
+Allocation failure leaves arena block links intact. Context errors remain sticky;
+destruction releases earlier blocks, and recovery uses a fresh context.
+
+The canonical glyph array uses stable slots, logical links and a free-slot list.
+There is no prepared-glyph mirror. Native and symbol index families have separate
+ownership; active intervals determine their consumers and readable extent.
+GPOS queues use contiguous entries, tombstones and reusable merge storage, with
+membership indices republished after movement. Matching never silently relocates
+the action anchor; each contextual action resolves against the current live
+sequence with the parent's filtering policy. Structural cluster ranges restore on
+both success and error. Temporary ordering keys do not replace semantic positions.
+
+The acceptance ledger and source/work evidence are in
+`docs/plans/shaping-simplification.md`. Timing gates remain deferred; historical
+benchmark tables are not measurements of this cutover.
 
 ## Document invariants
 
@@ -366,12 +412,16 @@ restores that view, including on error unwind: it never compacts a suffix.
 Normalization, reordering, GPOS and output all traverse the same canonical slots,
 skipping tombstones but retaining live missing-glyph records with glyph ID zero.
 
-GPOS keeps its existing buckets and algorithms. Its metrics pass assigns logical
-ordinal sort keys and reconstructs the last attached-child bound; updates scan
-only through that bound.
-This preserves anti-topological direct-child propagation and reattachment without
-repeatedly scanning a known-unattached suffix. GPOS is nonstructural; the bound is
-reconstructed before a subsequent shaping pass.
+GPOS keeps its existing buckets and assigns logical ordinal sort keys after
+structural work. A direct-child attachment index is rebuilt over the active
+range before positioning. Each stable-slot link carries a child head and two
+sibling references (12 additional bytes per slot), reusing the storage allocation.
+Reparenting unlinks/relinks in constant time; eager offset updates visit only
+actual direct children whose logical order is later than the updated glyph.
+They do not recurse into descendants. This removes the repeated run-suffix
+search without changing `NO_BREAK` interval propagation, RTL compensation or
+attachment-time offset semantics. GPOS is nonstructural; slot reuse clears the
+links and a later positioning pass reconstructs them from canonical parents.
 
 Config sizing includes immutable plans and proof workspace. Scratch growth is
 checked and uses the existing allocator, including fixed arenas; destruction

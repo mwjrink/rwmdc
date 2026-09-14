@@ -38,7 +38,6 @@ typedef struct kbts__gsub_plan
   kbts__gsub_node *Nodes;
   kbts__gsub_stage *Stages;
   kbts_u32 *Order;
-  kbts_u32 *FirstSymbols;
   kbts_u32 *RequiredFlags;
   /* Cold glyph-to-stage aggregation. Possible includes feature overrides;
    * live lookup checks remain authoritative for flags and feature values. */
@@ -52,8 +51,12 @@ typedef struct kbts__gsub_plan
 typedef struct kbts__gsub_stream
 {
   void *Memory;
+  void *SymbolMemory, *NativeMemory;
+  kbts_un MetadataCapacity, SymbolCapacity, NativeCapacity;
+  const kbts_shape_config *BoundConfig;
   kbts_un Capacity;
-  kbts_un SymbolStride;
+  kbts_un SymbolStride, WordCount;
+  kbts_u32 NativeFirst, NativeCount;
   /* One bit per stage; native/symbol rows use absolute physical glyph slots.
    * Stage/native admission is conservative; symbol positions remain exact. */
   kbts_u64 *StageCandidates;

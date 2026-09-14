@@ -25,15 +25,7 @@ static const kbts__compiled_program *kbts__CompiledProgram(kbts_shape_scratchpad
   return kbts__ProgramForSubtable(Scratchpad->Config->Font->CompiledContexts, FlatSubtable);
 }
 
-typedef struct kbts__sequence_match
-{
-  kbts_glyph_ref OnePastMatchGlyph;
-
-  kbts_u16 MatchCount;
-  kbts_u16 MatchOrSkipCount;
-} kbts__sequence_match;
-
-static kbts__sequence_match kbts__MatchCoverageSequence(kbts_glyph_storage *Storage, kbts__unpacked_lookup *Lookup, kbts_u32 SkipFlags, kbts_u32 SkipUnicodeFlags,
+static kbts_b32 kbts__MatchCoverageSequence(kbts_glyph_storage *Storage, const kbts__unpacked_lookup *Lookup, kbts_u32 SkipFlags, kbts_u32 SkipUnicodeFlags,
                                                         void *Base, kbts_u16 *CoverageOffsets, kbts_un CoverageCount,
                                                         kbts_glyph_ref AtGlyph, int Backward
                                                         KB_PROFILE_ONLY(, KbProfileStage ProfileStage, KbProfileWork ProfileWork))
@@ -42,7 +34,6 @@ static kbts__sequence_match kbts__MatchCoverageSequence(kbts_glyph_storage *Stor
   KB_PROFILE_SCOPE(ProfileStage);
 #endif
   kbts_un CoverageIndex = 0;
-  kbts_un GlyphCounter = 0;
   while(kbts__GlyphIsValid(Storage, AtGlyph) && (CoverageIndex < CoverageCount))
   {
     KB_PROFILE_WORK(ProfileWork, 1);
@@ -63,14 +54,9 @@ static kbts__sequence_match kbts__MatchCoverageSequence(kbts_glyph_storage *Stor
     }
 
     AtGlyph = Backward ? kbts__PrevGlyphRef(Storage, AtGlyph) : kbts__NextGlyphRef(Storage, AtGlyph);
-    GlyphCounter += 1;
   }
 
-  kbts__sequence_match Result = KBTS__ZERO;
-  Result.MatchCount = (kbts_u16)CoverageIndex;
-  Result.MatchOrSkipCount = (kbts_u16)GlyphCounter;
-  Result.OnePastMatchGlyph = AtGlyph;
-  return Result;
+  return CoverageIndex == CoverageCount;
 }
 
 
@@ -84,7 +70,7 @@ static void kbts__ApplyValueRecord(kbts_glyph *Glyph, kbts__unpacked_value_recor
   Glyph->AdvanceY += Unpacked->AdvanceY;
 }
 
-static kbts_b32 kbts__NextGlyph(kbts_glyph_storage *Storage, kbts__unpacked_lookup *Lookup, kbts_glyph_ref AtGlyph, kbts__skip_flags SkipFlags, kbts_u32 SkipUnicodeFlags, kbts_glyph_ref *Match, int Backward)
+static kbts_b32 kbts__NextGlyph(kbts_glyph_storage *Storage, const kbts__unpacked_lookup *Lookup, kbts_glyph_ref AtGlyph, kbts__skip_flags SkipFlags, kbts_u32 SkipUnicodeFlags, kbts_glyph_ref *Match, int Backward)
 {
   kbts_glyph_ref MatchingGlyph = 0;
 
@@ -105,12 +91,52 @@ static kbts_b32 kbts__NextGlyph(kbts_glyph_storage *Storage, kbts__unpacked_look
   return MatchingGlyph != 0;
 }
 
+/* Index zero is the supplied matched anchor. Subsequent positions are resolved
+ * against the parent's live filtered sequence after every preceding action. */
+static kbts_glyph_ref kbts__SequenceTarget(kbts_glyph_storage *Storage,
+    const kbts__unpacked_lookup *Lookup, kbts_glyph_ref Anchor, kbts_un SequenceIndex,
+    kbts__skip_flags SkipFlags, kbts_u32 SkipUnicodeFlags, kbts_un *Distance)
+{
+  *Distance = 0;
+  if(!kbts__GlyphIsValid(Storage, Anchor)) return 0;
+  while(SequenceIndex)
+  {
+    Anchor = kbts__NextGlyphRef(Storage, Anchor);
+    ++*Distance;
+    if(!kbts__GlyphIsValid(Storage, Anchor)) return 0;
+    KB_PROFILE_WORK(KBW_INPUT_GLYPHS, 1);
+    if(!kbts__SkipGlyph(kbts__Glyph(Storage, Anchor), Lookup, SkipFlags, SkipUnicodeFlags))
+      --SequenceIndex;
+  }
+  return Anchor;
+}
+
 static void kbts__AttachGlyph(kbts_glyph_storage *Storage, kbts_glyph_ref Parent, kbts_glyph_ref Child, kbts_s32 X, kbts_s32 Y)
 {
   kbts_glyph *ParentGlyph = kbts__Glyph(Storage, Parent);
   kbts_glyph *ChildGlyph = kbts__Glyph(Storage, Child);
   kbts_s32 DeltaOffsetX = X - ChildGlyph->OffsetX;
   kbts_s32 DeltaOffsetY = Y - ChildGlyph->OffsetY;
+
+  kbts__glyph_link *ChildLink = &Storage->Links[Child - 1];
+  if(ChildGlyph->AttachGlyph != Parent)
+  {
+    if(kbts__GlyphIsValid(Storage, ChildGlyph->AttachGlyph))
+    {
+      if(ChildLink->PrevAttached)
+        Storage->Links[ChildLink->PrevAttached - 1].NextAttached = ChildLink->NextAttached;
+      else
+        Storage->Links[ChildGlyph->AttachGlyph - 1].FirstAttached = ChildLink->NextAttached;
+      if(ChildLink->NextAttached)
+        Storage->Links[ChildLink->NextAttached - 1].PrevAttached = ChildLink->PrevAttached;
+    }
+    kbts__glyph_link *ParentLink = &Storage->Links[Parent - 1];
+    ChildLink->PrevAttached = 0;
+    ChildLink->NextAttached = ParentLink->FirstAttached;
+    if(ChildLink->NextAttached)
+      Storage->Links[ChildLink->NextAttached - 1].PrevAttached = Child;
+    ParentLink->FirstAttached = Child;
+  }
 
   ChildGlyph->OffsetX = X;
   ChildGlyph->OffsetY = Y;
@@ -119,27 +145,24 @@ static void kbts__AttachGlyph(kbts_glyph_storage *Storage, kbts_glyph_ref Parent
 
   ParentGlyph->Flags |= KBTS_GLYPH_FLAG_USED_IN_GPOS;
   kbts_u32 ChildEnd = ChildGlyph->SortKey;
-  Storage->AttachmentEnd = KBTS__MAX(Storage->AttachmentEnd, ChildEnd);
 
+  /* GPOS is nonstructural after logical-order keys are assigned. Attachment
+   * owns the sole parent-to-child NO_BREAK walk, including ligature marks. */
   for(kbts_glyph_ref Middle = kbts__NextGlyphRef(Storage, Parent);
       Middle && kbts__Glyph(Storage, Middle)->SortKey < ChildEnd;
       Middle = kbts__NextGlyphRef(Storage, Middle))
     kbts__Glyph(Storage, Middle)->Flags |= KBTS_GLYPH_FLAG_NO_BREAK;
 
-  // Anti-topological attachments move later direct children, not descendants.
-  // The inclusive logical GPOS bound excludes all glyphs without later attachments.
-  if(ChildEnd < Storage->AttachmentEnd)
+  /* Preserve eager, forward-only, one-level propagation. Visit actual direct
+   * children instead of rescanning the unrelated remainder of the run. */
+  for(kbts_glyph_ref Post = ChildLink->FirstAttached; Post;
+      Post = Storage->Links[Post - 1].NextAttached)
   {
-    for(kbts_glyph_ref Post = kbts__NextGlyphRef(Storage, Child);
-        Post && kbts__Glyph(Storage, Post)->SortKey <= Storage->AttachmentEnd;
-        Post = kbts__NextGlyphRef(Storage, Post))
+    kbts_glyph *PostGlyph = kbts__Glyph(Storage, Post);
+    if(PostGlyph->SortKey > ChildEnd)
     {
-      kbts_glyph *PostGlyph = kbts__Glyph(Storage, Post);
-      if(PostGlyph->AttachGlyph == Child)
-      {
-        PostGlyph->OffsetX += DeltaOffsetX;
-        PostGlyph->OffsetY += DeltaOffsetY;
-      }
+      PostGlyph->OffsetX += DeltaOffsetX;
+      PostGlyph->OffsetY += DeltaOffsetY;
     }
   }
 }
@@ -172,8 +195,12 @@ KBTS_INLINE void kbts__SetCursiveFlags(kbts_glyph *Glyph, kbts__cursive_flags Cu
   Glyph->MarkOrdering = (kbts_u8)CursiveFlags;
 }
 
+static kbts_b32 kbts__DoAdjustment(kbts_shape_scratchpad *Scratchpad, kbts_shape_config *Config,
+    kbts_glyph_storage *Storage, kbts_un LookupIndex, kbts_glyph_ref CurrentGlyph,
+    kbts_un StartIndex, kbts__skip_flags RequestedSkipFlags);
+
 static kbts_b32 kbts__DoSingleAdjustment(kbts_shape_scratchpad *Scratchpad, kbts_shape_config *Config, kbts_glyph_storage *Storage,
-                                         kbts_lookup_list *LookupList, kbts_un LookupIndex, kbts_un SubtableIndex, kbts__unpacked_lookup *Lookup, kbts_u16 *Base,
+                                         kbts_un LookupIndex, kbts_un SubtableIndex, const kbts__unpacked_lookup *Lookup, kbts_u16 *Base,
                                          kbts_glyph_ref CurrentGlyph, kbts_un StartIndex, kbts__skip_flags RequestedSkipFlags)
 {
   KB_PROFILE_SCOPE(KBP_ADJUST);
@@ -190,19 +217,6 @@ static kbts_b32 kbts__DoSingleAdjustment(kbts_shape_scratchpad *Scratchpad, kbts
 
   if(kbts__GlyphIncludedInLookupSubtable(Scratchpad, KBTS_SHAPING_TABLE_GPOS, LookupIndex, SubtableIndex, kbts__Glyph(Storage, CurrentGlyph)))
   {
-    // CAREFUL: We want kbts__unpacked_lookup to be a useful bag-of-arguments type, but, for extension
-    // lookups, each subtable may specify its own lookup type, so we save it here and restore it at
-    // the end of this function.
-    kbts_u16 OriginalLookupType = Lookup->Type;
-
-    while(Lookup->Type == 9)
-    {
-      KB_PROFILE_SCOPE(KBP_LOOKUP_DECODE);
-      kbts__extension *Extension = (kbts__extension *)Base;
-
-      Lookup->Type = Extension->LookupType;
-      Base = KBTS__POINTER_OFFSET(kbts_u16, Extension, Extension->Offset);
-    }
 
     kbts__cover_glyph_result Cover = KBTS__ZERO;
     Cover.Valid = kbts__GlyphPassesLookupFilter(kbts__Glyph(Storage, CurrentGlyph), Lookup);
@@ -770,17 +784,6 @@ static kbts_b32 kbts__DoSingleAdjustment(kbts_shape_scratchpad *Scratchpad, kbts
               kbts__Glyph(Storage, CurrentGlyph)->AdvanceX = 0;
               kbts__Glyph(Storage, CurrentGlyph)->AdvanceY = 0;
 
-              /* REVIEW[GLYPH1 CLEANUP]: AttachGlyph already walks this same
-               * parent-to-child interval and sets NO_BREAK using GPOS SortKey order.
-               * Can this second linked walk be removed after stating that GPOS
-               * never reorders slots between key assignment and attachment? */
-              for(kbts_glyph_ref MiddleGlyph = kbts__NextGlyphRef(Storage, LigatureGlyph);
-                  MiddleGlyph != CurrentGlyph;
-                  MiddleGlyph = kbts__NextGlyphRef(Storage, MiddleGlyph))
-              {
-                kbts__Glyph(Storage, MiddleGlyph)->Flags |= KBTS_GLYPH_FLAG_NO_BREAK;
-              }
-
               Result = 1;
             }
           }
@@ -791,55 +794,24 @@ static kbts_b32 kbts__DoSingleAdjustment(kbts_shape_scratchpad *Scratchpad, kbts
       case 8:
       {
         const kbts__compiled_program *Program = kbts__CompiledProgram(Scratchpad, KBTS_SHAPING_TABLE_GPOS, LookupIndex, SubtableIndex);
+        if(Program->FirstFiltered &&
+           kbts__SkipGlyph(kbts__Glyph(Storage, CurrentGlyph), Lookup, SequenceSkipFlags, SkipUnicodeFlags))
+          break;
         KB_PROFILE_CONTEXT((Lookup->Type == 8 ? 3 : 0) + Base[0] - 1);
         kbts__sequence_lookup_result SequenceLookup = kbts__MatchCompiledContext(Scratchpad, Storage, Lookup, Program, CurrentGlyph, SequenceSkipFlags, SkipUnicodeFlags);
         if(SequenceLookup.Matched)
         {
           Result = 1;
-          kbts__gdef *Gdef = kbts__BlobTableDataType(Config->Font->Blob, KBTS_BLOB_TABLE_ID_GDEF, kbts__gdef);
 
           KBTS__FOR(RecordIndex, 0, SequenceLookup.RecordCount)
           {
             kbts__sequence_lookup_record *Record = &SequenceLookup.Records[RecordIndex];
-            kbts__lookup *PackedRecordLookup = kbts__GetLookup(LookupList, Record->LookupListIndex);
-            kbts__unpacked_lookup RecordLookup = kbts__UnpackLookup(Gdef, PackedRecordLookup);
-
-            kbts_glyph_ref NestedCurrentGlyph = CurrentGlyph;
-            kbts_un NestedCurrentGlyphIndex = 0;
-            { // Figure out where in the input sequence we need to apply the lookup.
-              kbts_un SequenceIndex = 0;
-              for(kbts_glyph_ref Glyph = CurrentGlyph;
-                  kbts__GlyphIsValid(Storage, Glyph);
-                  Glyph = kbts__NextGlyphRef(Storage, Glyph))
-              {
-                if(!kbts__SkipGlyph(kbts__Glyph(Storage, Glyph), Lookup, SequenceSkipFlags, SkipUnicodeFlags))
-                {
-                  if(SequenceIndex == Record->SequenceIndex)
-                  {
-                    NestedCurrentGlyph = Glyph;
-
-                    break;
-                  }
-
-                  SequenceIndex += 1;
-                }
-
-                NestedCurrentGlyphIndex += 1;
-              }
-            }
-
-            /* REVIEW[GLYPH2 SUSPECT]: This nested path ignores adjustment success
-             * and visits every subtable, whereas top-level GPOS stops at the first
-             * successful subtable. Could overlapping child coverages apply twice?
-             * Unproved: compare an ordered two-subtable child lookup in both paths. */
-            KBTS__FOR(NestedSubtableIndex, 0, RecordLookup.SubtableCount)
-            {
-              kbts_u16 *NestedBase = KBTS__POINTER_OFFSET(kbts_u16, PackedRecordLookup, RecordLookup.SubtableOffsets[NestedSubtableIndex]);
-
-              kbts__DoSingleAdjustment(Scratchpad, Config, Storage, LookupList,
-                                       Record->LookupListIndex, NestedSubtableIndex, &RecordLookup, NestedBase,
-                                       NestedCurrentGlyph, StartIndex + NestedCurrentGlyphIndex, RequestedSkipFlags);
-            }
+            kbts_un Distance;
+            kbts_glyph_ref Target = kbts__SequenceTarget(Storage, Lookup, CurrentGlyph,
+                Record->SequenceIndex, SequenceSkipFlags, SkipUnicodeFlags, &Distance);
+            if(Target)
+              kbts__DoAdjustment(Scratchpad, Config, Storage, Record->LookupListIndex,
+                                 Target, StartIndex + Distance, RequestedSkipFlags);
           }
 
           OnePastLastGlyphIndex = StartIndex + SequenceLookup.InputSequenceCountIncludingSkippedGlyphs;
@@ -851,11 +823,28 @@ static kbts_b32 kbts__DoSingleAdjustment(kbts_shape_scratchpad *Scratchpad, kbts
       kbts__SetLookupOnePastLastGlyph(Scratchpad, OnePastLastGlyphIndex + OnePastLastGlyphOffset, OnePastLastGlyph);
     }
 
-    Lookup->Type = OriginalLookupType;
   }
 
   KBTS_INSTRUMENT_FUNCTION_END;
   return Result;
+}
+
+/* A lookup's subtables are ordered alternatives, for roots and children alike.
+ * Distinct contextual records call this separately and all remain observable. */
+static kbts_b32 kbts__DoAdjustment(kbts_shape_scratchpad *Scratchpad, kbts_shape_config *Config,
+    kbts_glyph_storage *Storage, kbts_un LookupIndex, kbts_glyph_ref CurrentGlyph,
+    kbts_un StartIndex, kbts__skip_flags RequestedSkipFlags)
+{
+  const kbts__font_lookup *Descriptor = kbts__FontLookup(Config->Font, KBTS_SHAPING_TABLE_GPOS, LookupIndex);
+  for(kbts_un Index = 0; Index < Descriptor->Filter.SubtableCount; ++Index)
+  {
+    const kbts__font_subtable *Subtable = kbts__FontSubtable(Config->Font, Descriptor, Index);
+    if(kbts__DoSingleAdjustment(Scratchpad, Config, Storage, LookupIndex, Index,
+                               &Descriptor->Filter, Subtable->Data, CurrentGlyph,
+                               StartIndex, RequestedSkipFlags))
+      return 1;
+  }
+  return 0;
 }
 
 typedef kbts_u32 kbts__mcm_sequence_state;
@@ -909,7 +898,7 @@ static kbts__hangul_syllable_info kbts__HangulSyllableInfo(kbts_u32 Codepoint)
   {
     Result.Type = KBTS__HANGUL_SYLLABLE_TYPE_L;
   }
-  else if((Codepoint == 0xAC00) && (Codepoint <= 0xD7A3))
+  else if((Codepoint >= 0xAC00) && (Codepoint <= 0xD7A3))
   {
     Result.Type = KBTS__HANGUL_SYLLABLE_TYPE_LVT;
 
@@ -1032,7 +1021,7 @@ static kbts_u32 kbts__ApplyCompiledFusion(kbts_shape_scratchpad *Scratchpad, kbt
 }
 
 static kbts__substitution_result_flags kbts__DoSubstitution(kbts_shape_scratchpad *Scratchpad, kbts_shape_config *Config, kbts_glyph_storage *Storage,
-                                                            kbts_lookup_list *LookupList, kbts_un SequentialLookupIndex, kbts_u16 FeatureValue,
+                                                            kbts_un SequentialLookupIndex, kbts_u16 FeatureValue,
                                                             kbts__gsub_frame *Frames, kbts_un *FrameCount_,
                                                             int CheckOnly, kbts__skip_flags RequestedSkipFlags, kbts_u32 GeneratedGlyphFlags, int AllowFusion)
 {
@@ -1052,34 +1041,21 @@ static kbts__substitution_result_flags kbts__DoSubstitution(kbts_shape_scratchpa
     return Result;
   }
 
-  kbts__lookup *PackedLookup = kbts__GetLookup(LookupList, Frame->LookupIndex);
-  kbts__unpacked_lookup Lookup = kbts__UnpackLookup(kbts__BlobTableDataType(Font->Blob, KBTS_BLOB_TABLE_ID_GDEF, kbts__gdef), PackedLookup);
-  kbts_u16 BaseLookupType = Lookup.Type;
+  const kbts__font_lookup *Descriptor = kbts__FontLookup(Font, KBTS_SHAPING_TABLE_GSUB, Frame->LookupIndex);
+  const kbts__unpacked_lookup *Lookup = &Descriptor->Filter;
 
   kbts_glyph_ref CurrentGlyph = Frame->InputGlyph;
 
-  while(Frame->SubtableIndex < Lookup.SubtableCount)
+  while(Frame->SubtableIndex < Lookup->SubtableCount)
   {
     KB_PROFILE_WORK(KBW_SUBTABLE_VISITS, 1);
-    kbts_u16 *Subtable = KBTS__POINTER_OFFSET(kbts_u16, PackedLookup, Lookup.SubtableOffsets[Frame->SubtableIndex]);
-    // In a type-7 lookup, each subtable can specify a different lookup type.
-    // We still want to pass kbts__unpacked_lookup around as a useful bag of arguments, though.
-    // So, we restore the original lookup's type here before resolving each subtable.
-    Lookup.Type = BaseLookupType;
-
-    while(Lookup.Type == 7)
-    {
-      KB_PROFILE_SCOPE(KBP_LOOKUP_DECODE);
-      kbts__extension *Extension = (kbts__extension *)Subtable;
-      Lookup.Type = Extension->LookupType;
-      Subtable = KBTS__POINTER_OFFSET(kbts_u16, Extension, Extension->Offset);
-    }
+    kbts_u16 *Subtable = kbts__FontSubtable(Font, Descriptor, Frame->SubtableIndex)->Data;
 
     if(kbts__GlyphIncludedInLookupSubtable(Scratchpad, KBTS_SHAPING_TABLE_GSUB, Frame->LookupIndex, Frame->SubtableIndex, kbts__Glyph(Storage, CurrentGlyph)))
     {
       kbts__cover_glyph_result Cover = KBTS__ZERO;
-      Cover.Valid = kbts__GlyphPassesLookupFilter(kbts__Glyph(Storage, CurrentGlyph), &Lookup);
-      if(Cover.Valid && Lookup.Type != 5 && Lookup.Type != 6 && kbts__GsubLookupBeginsWithCoverage(Lookup.Type, Subtable[0]))
+      Cover.Valid = kbts__GlyphPassesLookupFilter(kbts__Glyph(Storage, CurrentGlyph), Lookup);
+      if(Cover.Valid && Lookup->Type != 5 && Lookup->Type != 6 && kbts__GsubLookupBeginsWithCoverage(Lookup->Type, Subtable[0]))
       {
         kbts__coverage *Coverage = KBTS__POINTER_OFFSET(kbts__coverage, Subtable, Subtable[1]);
         Cover = kbts__CoverGlyph(Coverage, kbts__Glyph(Storage, CurrentGlyph)->Id);
@@ -1090,11 +1066,17 @@ static kbts__substitution_result_flags kbts__DoSubstitution(kbts_shape_scratchpa
         kbts_un OnePastLastGlyphOffset = 1;
         kbts_glyph_ref OnePastLastGlyph = kbts__NextGlyphRef(Storage, CurrentGlyph);
 
-        if((Lookup.Type == 5) || (Lookup.Type == 6))
+        if((Lookup->Type == 5) || (Lookup->Type == 6))
         {
           const kbts__compiled_program *Program = kbts__CompiledProgram(Scratchpad, KBTS_SHAPING_TABLE_GSUB, Frame->LookupIndex, Frame->SubtableIndex);
-          KB_PROFILE_CONTEXT((Lookup.Type == 6 ? 3 : 0) + Subtable[0] - 1);
-          kbts__sequence_lookup_result SequenceLookup = kbts__MatchCompiledContext(Scratchpad, Storage, &Lookup, Program, CurrentGlyph, SequenceSkipFlags, SkipUnicodeFlags);
+          if(Program->FirstFiltered &&
+             kbts__SkipGlyph(kbts__Glyph(Storage, CurrentGlyph), Lookup, SequenceSkipFlags, SkipUnicodeFlags))
+          {
+            ++Frame->SubtableIndex;
+            continue;
+          }
+          KB_PROFILE_CONTEXT((Lookup->Type == 6 ? 3 : 0) + Subtable[0] - 1);
+          kbts__sequence_lookup_result SequenceLookup = kbts__MatchCompiledContext(Scratchpad, Storage, Lookup, Program, CurrentGlyph, SequenceSkipFlags, SkipUnicodeFlags);
 
           if(SequenceLookup.Matched)
           {
@@ -1120,7 +1102,7 @@ static kbts__substitution_result_flags kbts__DoSubstitution(kbts_shape_scratchpa
         {
           // Do single substitution.
 
-          switch(Lookup.Type)
+          switch(Lookup->Type)
           {
           case 1:
           {
@@ -1278,7 +1260,7 @@ static kbts__substitution_result_flags kbts__DoSubstitution(kbts_shape_scratchpa
                   {
                     MatchingGlyphCount += 1;
                   }
-                  else if(!kbts__SkipGlyph(kbts__Glyph(Storage, LigatureGlyphCursor), &Lookup, RegularSkipFlags, SkipUnicodeFlags))
+                  else if(!kbts__SkipGlyph(kbts__Glyph(Storage, LigatureGlyphCursor), Lookup, RegularSkipFlags, SkipUnicodeFlags))
                   {
                     break;
                   }
@@ -1345,7 +1327,7 @@ static kbts__substitution_result_flags kbts__DoSubstitution(kbts_shape_scratchpa
                         kbts__FreeGlyph(Scratchpad, Storage, LigatureGlyphCursor);
                         GrowCount -= 1;
                       }
-                      else if(kbts__SkipGlyph(kbts__Glyph(Storage, LigatureGlyphCursor), &Lookup, RegularSkipFlags, SkipUnicodeFlags))
+                      else if(kbts__SkipGlyph(kbts__Glyph(Storage, LigatureGlyphCursor), Lookup, RegularSkipFlags, SkipUnicodeFlags))
                       {
                         kbts__Glyph(Storage, LigatureGlyphCursor)->LigatureComponentIndexPlusOne = (kbts_u16)LigatureGlyphCount;
                         kbts__Glyph(Storage, LigatureGlyphCursor)->LigatureUid = (kbts_u16)LigatureUid;
@@ -1432,13 +1414,13 @@ static kbts__substitution_result_flags kbts__DoSubstitution(kbts_shape_scratchpa
             if(Cover.Index < Unpacked.GlyphCount)
             {
               // Should we use regular or sequence skip flags here?
-              kbts__sequence_match BacktrackMatch = kbts__MatchCoverageSequence(Storage, &Lookup, RegularSkipFlags, SkipUnicodeFlags, Subst, Unpacked.BacktrackCoverageOffsets, Unpacked.BacktrackCount,
+              kbts_b32 BacktrackMatch = kbts__MatchCoverageSequence(Storage, Lookup, RegularSkipFlags, SkipUnicodeFlags, Subst, Unpacked.BacktrackCoverageOffsets, Unpacked.BacktrackCount,
                                                                                 kbts__PrevGlyphRef(Storage, CurrentGlyph), 1
                                                                                 KB_PROFILE_ONLY(, KBP_BACKTRACK_GATHER, KBW_BACKTRACK_GLYPHS));
-              kbts__sequence_match LookaheadMatch = kbts__MatchCoverageSequence(Storage, &Lookup, RegularSkipFlags, SkipUnicodeFlags, Subst, Unpacked.LookaheadCoverageOffsets, Unpacked.LookaheadCount,
+              kbts_b32 LookaheadMatch = kbts__MatchCoverageSequence(Storage, Lookup, RegularSkipFlags, SkipUnicodeFlags, Subst, Unpacked.LookaheadCoverageOffsets, Unpacked.LookaheadCount,
                                                                                 kbts__NextGlyphRef(Storage, CurrentGlyph), 0
                                                                                 KB_PROFILE_ONLY(, KBP_LOOKAHEAD_GATHER, KBW_LOOKAHEAD_GLYPHS));
-              if((BacktrackMatch.MatchCount == Unpacked.BacktrackCount) && (LookaheadMatch.MatchCount == Unpacked.LookaheadCount))
+              if(BacktrackMatch && LookaheadMatch)
               {
                 Result |= KBTS__SUBSTITUTION_RESULT_FLAG_MATCHED_SUBSTITUTION;
                 KB_PROFILE_WORK(KBW_SUBSTITUTION_MATCHES, 1);
@@ -1474,41 +1456,10 @@ static kbts__substitution_result_flags kbts__DoSubstitution(kbts_shape_scratchpa
     {
       kbts__gsub_frame NewFrame = KBTS__ZERO;
       NewFrame.LookupIndex = SequenceRecord->LookupListIndex;
-      NewFrame.StartIndex = Frame->StartIndex;
-      NewFrame.InputGlyph = Frame->InputGlyph;
-
-      /* REVIEW[GLYPH3 SUSPECT]: Context matching uses SequenceSkipFlags, but this
-       * record-target rescan passes zero; an intervening joiner may change which
-       * glyph SequenceIndex names. After prior deletions, an unfound target also
-       * leaves InputGlyph at the original anchor. Unproved: pin the intended
-       * filtering and missing-target semantics without freezing pre-mutation refs. */
-      if(SequenceRecord->SequenceIndex)
-      {
-        KB_PROFILE_SCOPE(KBP_INPUT_GATHER);
-        // @Speed: Re-scan the sequence to find where we are in the _filtered_ sequence.
-        kbts_un SequenceInputIndex = 0;
-        for(kbts_glyph_ref FilterGlyph = kbts__NextGlyphRef(Storage, Frame->InputGlyph);
-            kbts__GlyphIsValid(Storage, FilterGlyph);
-            FilterGlyph = kbts__NextGlyphRef(Storage, FilterGlyph))
-        {
-          KB_PROFILE_WORK(KBW_INPUT_GLYPHS, 1);
-          // @Incomplete: SequenceSkipFlags? 0?
-          // What do we use here?
-          if(!kbts__SkipGlyph(kbts__Glyph(Storage, FilterGlyph), &Lookup, 0, SkipUnicodeFlags))
-          {
-            SequenceInputIndex += 1;
-
-            if(SequenceInputIndex == SequenceRecord->SequenceIndex)
-            {
-              NewFrame.InputGlyph = FilterGlyph;
-
-              break;
-            }
-          }
-
-          NewFrame.StartIndex += 1;
-        }
-      }
+      kbts_un Distance;
+      NewFrame.InputGlyph = kbts__SequenceTarget(Storage, Lookup, Frame->InputGlyph,
+          SequenceRecord->SequenceIndex, SequenceSkipFlags, SkipUnicodeFlags, &Distance);
+      NewFrame.StartIndex = Frame->StartIndex + Distance;
 
       Frames[FrameCount++] = NewFrame;
     }
@@ -1578,7 +1529,7 @@ static int kbts__WouldSubstitute(kbts_shape_scratchpad *Scratchpad, kbts_shape_c
       while(FrameCount && !Scratchpad->Error)
       {
         kbts__substitution_result_flags SubstitutionResult = kbts__DoSubstitution(Scratchpad, Config, Storage,
-            LookupList, 0, 0, Frames, &FrameCount, 1, SkipFlags, 0, 0);
+            0, 0, Frames, &FrameCount, 1, SkipFlags, 0, 0);
         if(SubstitutionResult & KBTS__SUBSTITUTION_RESULT_FLAG_MATCHED_SUBSTITUTION)
         {
           Result = 1;
@@ -1596,38 +1547,50 @@ Done:;
   return Result;
 }
 
-static kbts_glyph kbts__Substitute1(kbts_shape_scratchpad *Scratchpad, kbts_shape_config *Config, kbts_glyph_storage *Storage,
+static kbts_glyph kbts__Substitute1(kbts_shape_scratchpad *Scratchpad, kbts_shape_config *Config, kbts_glyph_storage *ProbeStorage,
                                    kbts_lookup_list *LookupList, kbts__feature *Feature, kbts__skip_flags SkipFlags, kbts_glyph *Glyph)
 {
   kbts_glyph Result = *Glyph;
   kbts_glyph_ref OriginalRef = Glyph->Ref;
   kbts_glyph_ref OriginalAttachment = Glyph->AttachGlyph;
   kbts_glyph ProbeGlyphs[4];
-  kbts__glyph_link ProbeLinks[4] = {{KBTS__GLYPH_END, KBTS__GLYPH_END}};
+  kbts__glyph_link ProbeLinks[4];
   kbts_u32 ProbeFreeSlots[4];
   kbts_glyph_storage Temporary = KBTS__ZERO;
-  Temporary.Allocator = Scratchpad->Allocator;
-  Temporary.AllocatorData = Scratchpad->AllocatorData;
-  Temporary.Glyphs = ProbeGlyphs;
-  Temporary.Links = ProbeLinks;
-  Temporary.FreeSlots = ProbeFreeSlots;
-  Temporary.Count = Temporary.LiveCount = 1;
-  Temporary.End = KBTS__GLYPH_END;
-  Temporary.Ordered = 1;
-  Temporary.Capacity = KBTS__ARRAY_LENGTH(ProbeGlyphs);
-  /* Memory remains null: reserve may grow these borrowed stack arrays, but
-   * only a subsequently allocated backing block belongs to the allocator. */
+  kbts_glyph_storage *Storage = ProbeStorage ? ProbeStorage : &Temporary;
+  if(ProbeStorage)
+  {
+    /* Config construction advertises and lends this complete fixed workspace. */
+    KBTS_ASSERT(Storage->FixedMemory && !Storage->LiveCount && Storage->Capacity);
+    KBTS_ASSERT(Storage->Glyphs && Storage->Links && Storage->FreeSlots);
+  }
+  else
+  {
+    Temporary.Allocator = Scratchpad->Allocator;
+    Temporary.AllocatorData = Scratchpad->AllocatorData;
+    Temporary.Glyphs = ProbeGlyphs;
+    Temporary.Links = ProbeLinks;
+    Temporary.FreeSlots = ProbeFreeSlots;
+    Temporary.Capacity = KBTS__ARRAY_LENGTH(ProbeGlyphs);
+    /* Only a subsequently grown backing block belongs to the allocator. */
+  }
+  Storage->Count = Storage->LiveCount = 1;
+  Storage->First = Storage->Tail = 0;
+  Storage->End = KBTS__GLYPH_END;
+  Storage->FreeSlotCount = 0;
+  Storage->Ordered = 1;
+  Storage->Links[0].Prev = Storage->Links[0].Next = KBTS__GLYPH_END;
   kbts_glyph_storage *SavedStorage = Scratchpad->Storage;
   kbts_glyph_ref SavedOnePast = Scratchpad->LookupOnePastLastGlyph;
   kbts_u32 SavedOnePastIndex = Scratchpad->LookupOnePastLastGlyphIndex;
   kbts__glyph_range SavedCluster = Scratchpad->Cluster;
   kbts_u32 SavedNextGlyphUid = Scratchpad->NextGlyphUid;
-  Scratchpad->Storage = Storage = &Temporary;
+  Scratchpad->Storage = Storage;
   Scratchpad->Cluster = KBTS__ZERO_TYPE(kbts__glyph_range);
   Result.Bucketed = 0;
   Result.AttachGlyph = 0;
   Result.Ref = 1;
-  ProbeGlyphs[0] = Result;
+  Storage->Glyphs[0] = Result;
 
   {
     kbts__iterate_lookups IterateLookups = kbts__IterateLookups(LookupList, Feature);
@@ -1640,14 +1603,20 @@ static kbts_glyph kbts__Substitute1(kbts_shape_scratchpad *Scratchpad, kbts_shap
       kbts_un FrameCount = 1;
       kbts__BeginLookupApplication(Scratchpad, Frames[0].InputGlyph);
       while(FrameCount && !Scratchpad->Error)
-        kbts__DoSubstitution(Scratchpad, Config, Storage, LookupList,
+        kbts__DoSubstitution(Scratchpad, Config, Storage,
             Scratchpad->SequentialLookupIndexIndex, 0, Frames, &FrameCount, 0, SkipFlags, 0, 0);
     }
     kbts_glyph_ref First = kbts__FirstGlyph(Storage);
     Result = First ? *kbts__Glyph(Storage, First) : KBTS__ZERO_TYPE(kbts_glyph);
   }
 
-  kbts_FreeAllGlyphs(&Temporary);
+  if(ProbeStorage)
+  {
+    Storage->Count = Storage->LiveCount = Storage->FreeSlotCount = 0;
+    Storage->First = Storage->Tail = Storage->End = KBTS__GLYPH_END;
+  }
+  else
+    kbts_FreeAllGlyphs(&Temporary);
   Scratchpad->Storage = SavedStorage;
   Scratchpad->LookupOnePastLastGlyph = SavedOnePast;
   Scratchpad->LookupOnePastLastGlyphIndex = SavedOnePastIndex;

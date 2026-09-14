@@ -211,6 +211,84 @@ Do not compare sanitizer builds or overlapping GPU workloads with release timing
 `b07373ded395b61d33a290181b957994db8edcfb`. Neither is wired into the editor yet.
 HarfBuzz development files are required only for these benchmark commands:
 
+### Canonical correctness and performance suite
+
+`bench/shaping-suite.json` defines 104 named cases: English/Latin, Arabic,
+Hebrew, Hindi/Devanagari, Bengali and Thai; eight fonts; code, prose and
+combining-heavy text; and 64, 512, 4,096 and 65,536-byte input budgets.
+Arabic and Hebrew run RTL. Default features cover every length; the four
+override modes cover short and 4 KiB cases in the eight primary workloads.
+Inputs are presegmented script runs, not paragraph-bidi or layout tests.
+
+The driver uses Python 3's standard library, Clang, `pkg-config`, HarfBuzz
+development files, the bundled JetBrains Mono font and seven Noto regular TTFs
+under `/usr/share/fonts/noto`. Change the Noto location with `--font-dir`.
+Missing selected fonts fail explicitly; `--allow-missing-fonts` is an explicit,
+recorded exclusion, never a substitution or a passed test.
+
+```sh
+just shaping-suite list
+just shaping-suite check --isa avx2 --isa sse2 --output /var/tmp/kb-check
+just shaping-suite bench --cpu 0 --output /var/tmp/kb-bench
+
+# Select named cases rather than editing a temporary benchmark script:
+just shaping-suite check --case '*-default-64'
+just shaping-suite bench --case 'arabic-*' --isa avx2 --repetitions 3
+
+# Use a single case from the benchmark's hotspot ranking:
+just shaping-suite profile --case arabic-default-65536 --isa avx2 \
+  --engine owned --kind sample --output /var/tmp/kb-arabic-sample
+just shaping-suite profile --case arabic-default-65536 \
+  --engine harfbuzz --kind counters
+just shaping-suite profile --case arabic-default-65536 \
+  --engine owned --kind core
+```
+
+`check` compares every output glyph's ID, source offset, two advances and two
+offsets over 16 changing variants and two passes per case. Owned/original KB
+differences fail; HarfBuzz equality is reported separately and is not a
+conformance assumption. Existing `shaping-verify` and `shaping-stress` add their
+broader feature, mutation and API coverage.
+The legacy mutation-stress CLI still stops at its pre-existing Arabic joiner
+warmup discrepancy (seed 1801614451, joiners ordinal 2). Its failure output is
+identical before and after the direct-child attachment fix; a canonical `check`
+pass is not a claim that the broader legacy stress suite passes.
+
+`bench` runs all three engines serially, rotating engine order across three
+repetitions and reversing case order on alternating repetitions. Each invocation
+warms all 16 variants twice and records five batch means. Two passes avoid the
+first-measured-pass scratch growth observed with combining-heavy text after only
+one pass. Default iterations per
+batch are 1,000 / 200 / 30 / 1 for the four lengths; `--iterations`, `--batches`,
+`--repetitions` and `--warmup-passes` override them. Repeat `--isa` to measure
+both SSE2 and AVX2. The default selects AVX2 when available, otherwise SSE2;
+installed HarfBuzz retains its own build and dispatch.
+
+Each new result directory contains the manifest/selection, source and font
+SHA-256 hashes, CPU/affinity and compiler metadata, exact build/run commands,
+raw stdout/stderr and incremental JSONL records. Final `results.json`,
+`summary.csv` and `comparisons.csv` retain phases, repeat distributions, setup,
+allocation deltas and checksum-qualified ratios. Unequal-output timings never
+become equivalent-work speedups. Batch-mean percentiles are not individual-shape
+latency percentiles. HarfBuzz allocation counts are unknown, not zero.
+
+Timings include input preparation, shaping and consumer output copying; setup,
+file I/O and output hashing are outside those timers. Setup is engine
+construction, not first-result latency: HarfBuzz can defer work to shaping.
+Profiles run separately and calibrate toward `--seconds` (default five).
+`sample`/`counters` require Linux `perf` and user-PMU permission and cover the
+whole process, including warmup/setup/hash work. `core` compares an identical
+production control against KB's TSC stage/lookup observer; TSC ticks are not
+hardware core cycles. Unsupported counters, timeouts and incomplete runs fail
+visibly. No CPU-frequency lock or system isolation is imposed.
+
+Omit `--output` for a unique directory under `/var/tmp`; an explicit output
+must not already exist. `--timeout` bounds each subprocess, not the whole suite.
+The legacy builder also supports `SHAPING_OUTPUT_DIR` (otherwise `$TMPDIR` or
+`/tmp`) and `SHAPING_BUILD_ONLY=1`; the canonical driver uses both.
+
+### One-off benchmarks and stress diagnostics
+
 ```sh
 just shaping-bench avx2 --size 4096 --features default
 just shaping-bench sse2 --size 4096 --features default
@@ -293,7 +371,7 @@ All four paired runs produced checksum `12ad74c63c50c10a` and requested no warm
 allocations. Cached symbol initialization adds input work; compilation adds setup
 work. Varied stress workloads can still grow the reusable sort workspace.
 
-The current compact cache for bundled JetBrains Mono contains 51 symbols, 166
+The initial compact cache for bundled JetBrains Mono contained 51 symbols, 166
 active contextual programs and 816 outcomes. Native subtable indices map to dense
 64-byte program descriptors, with one shared empty program. Local membership
 masks use 4, 8, 16 or 32 bits per symbol. Identical mask, dispatch, bucket and test
@@ -322,35 +400,109 @@ historical figures precede the GSUB stream cutover below.
 
 ### Canonical shaping pipeline
 
-Normalization, compiled/native GSUB, GPOS and output share one indexed
-`kbts_glyph` array. Full-stream row gathering, pending replacements, explicit
-unchanged spans, origin transport and cold synchronization are removed.
-Compiled matching retains its fixed-depth LUTs and original lookup ordering.
+Font construction establishes actual blob extents and one immutable checked
+lookup/subtable view. Extension types/directions and GDEF glyph/attachment classes
+are compiled once. Context compilation groups coverage/class sources, retains
+logical rules and ordered dispatch through fusion, and emits one interned resident
+cache; there is no intermediate full cache to decode and repack.
 
-Scratchpad-owned occurrence and symbol-slot indexes derive from canonical records.
-Insertion, deletion and substitution repair only affected slots. Configurations
-precompute default/possible glyph-to-stage admission rows; glyph configurations
-precompute wholly disabled stages. Runtime never rebuilds lookup-to-stage mappings.
-Canonical records occupy stable slots: deletions leave tombstones, recycled slots
-serve insertions, and logical links carry order. No insertion, deletion, reorder,
-or cluster-range exit shifts surviving records. Only allocation growth moves them.
-GPOS attachment propagation skips the known-unattached suffix using a bound
-rebuilt by metrics. Native-only plans allocate no unused symbol-position matrix.
+The exact classifier remains font-global. Configurations accumulate ordered roots
+per semantic stage and derive their reachable closure, admission rows and window
+bounds from required/default/optional/nested consumers. Stage boundaries use
+`u32`; a selected language is not restricted to 32 font features. Temporary proof
+storage, advertised fixed placement size and heap-resident size are distinct.
 
-Prepared runs use **`u32 boundaries[n+1]`**, with metadata stored separately.
-The final sentinel equals the prepared-input count, even for empty input.
-Feature ranges do not split runs; script boundaries respect graphemes, and
-font-boundary joining context is read without duplicate output. Configuration
-caches include language, use applicable-script/DFLT selection, and retain
-mandatory LangSys features.
+Normalization, compiled/native GSUB, GPOS and output share one stable-slot
+`kbts_glyph` array. Deletion leaves tombstones; insertions recycle slots; logical
+links carry order. Only allocation growth moves surviving records. There is no
+prepared-glyph mirror, span translation or cold synchronization. On this target
+the record is 96 bytes, plus 8-byte links and 4-byte free-slot metadata.
 
-Fonts own a **256-byte ASCII cmap**. Dense format-12 cmaps can use deduplicated
-32-codepoint pages; sparse cmaps retain ranges. The scalar UTF-8 decoder won the
-decoder experiment. Configs own script/language plans; scratchpads own mutable
-indexes. Existing iterators borrow canonical records in logical order; the
-benchmark's consumer projection remains explicit and timed.
+Native and symbol-position index families are independently allocated for actual
+interval consumers. A bounded active-range probe—not total storage size—selects
+the small native path. Readable word extent is separate from retained capacity.
+Mutations repair live consumers, not completed native rows. Compiled matching
+retains its fixed-depth all-stage SIMD contract and original lookup priority.
 
-### Stable-slot and static-admission correction
+GPOS uses one contiguous queue representation, tombstones and reusable same-entry
+merge scratch. Membership indices are republished after movement. One attachment
+owner propagates `NO_BREAK`; insertion sorting searches first and splices once.
+Context actions resolve against the current live sequence with the parent's
+filtering policy, and child GPOS lookups stop at their first successful subtable.
+
+Prepared runs retain **`u32 boundaries[n+1]`** and separate metadata. The sentinel
+equals the prepared-input count, including empty input. Immutable sorted,
+last-wins feature sets retain explicit zero and nonbinary values. Preparation
+resolves shape/glyph configurations and carries exact font mapping in the existing
+input record; execution does not compile configurations. One context-owned
+scratchpad rebinds and reuses capacity across runs and `ShapeBegin` cycles.
+
+Fonts retain the 256-byte ASCII cmap and existing dense/sparse cmap layouts.
+Iterators borrow canonical records in logical order; the benchmark's final
+consumer projection remains explicit. This library is still isolated from the
+editor's renderer.
+
+### Simplification cutover: work and ownership
+
+The implementation and acceptance ledger are in
+[`docs/plans/shaping-simplification.md`](docs/plans/shaping-simplification.md).
+These are operation/allocation counts, not timing improvements:
+
+| Exercised work | Frozen owned control | Simplified |
+|---|---:|---:|
+| Predicate full-domain source visits, bundled font | 4,054,092 | 84,966 class decodes |
+| Additional grouped-source work | — | 84,966 class-link writes; 1,273 coverage members |
+| High-level cmap API queries, 139,392 output glyphs | 278,792 | 139,396 |
+| Shape-config searches, 768 prepared runs | 768 | 8 |
+| Glyph-config searches, same workload | 139,392 | 8 |
+| Unicode decomposition queries, same single-font workload | 329,476 | 329,474 |
+| First execution allocation requests, 96 runs | 197 | 9 |
+| Sort splices, sorted/reverse/duplicate-key 130-slot inputs | 16,705 | 257 |
+| Evaluated source-level link reads, same sorting cases | 84,109 | 18,317 |
+
+Global symbol refinement, predicate hashing, dispatch emission and merge scratch
+still do real work; they are not relabeled zero. The sort comparison complexity
+is unchanged. A one-glyph native range at physical slot 8,192 performs one active
+probe and no index build/allocation, exactly like the one-glyph standalone case.
+After bounded warmup, 100 native/context/native cycles at that slot allocate
+nothing; contextual rows still clear their necessary readable extent.
+
+Memory is not uniformly smaller. The bundled Latin heap configuration retains
+883,247 bytes; fixed placement advertises 1,468,343 bytes, and split-allocator
+construction requests 2,351,590 bytes. The selected-root bound replaces the former
+925-entry temporary bound with 198 eligible references. Canonical glyphs shrink
+104→96 bytes, but prepared input grows 48→72 bytes and shared font facts add
+resident storage. The exercised two-config high-level workload retains 11,195,952
+bytes versus 8,314,593 in the frozen control, including fonts and arena high-water storage.
+Repeated warmed states allocate nothing; newly encountered capacity requirements
+can still grow the workspace. No overall speed or memory reduction is claimed.
+
+The completion audit found and fixed an arena-growth failure that lost ownership
+of earlier allocations. Public fail-each input/preparation/execution scenarios
+now preserve sticky errors and balance destruction. `kbts_PlaceShapeConfig`
+also now requires a fifth `MemorySize` argument; short buffers are rejected
+before writes. The active caller is migrated; the upstream vendor is unchanged.
+
+Coverage now discovers normalization alternatives only when nominal mapping is
+missing. The single-font decomposition count above removes the pre-audit doubling.
+The real two-font fallback workload still performs 9,956 decomposition queries
+versus 6,920 in the frozen control: necessary coverage certification is not free.
+No overall normalization-work reduction is claimed for fallback-heavy input.
+
+Final project checks and focused sanitized SSE2/AVX2 regressions pass. Both ISAs
+pass the 555-case default and 64 KiB exact verifiers. Complete sanitized stress
+exercises all 9,760 cases per ISA: 9,423 remain exact and 337 differ intentionally
+after live-target/Indic-boundary fixes, plus five Arabic warmup differences.
+The strict comparator is unchanged and reports failure on those differences;
+the plan ledger explains every difference and retains complete tuple reports.
+The rapid original TODO closure was not fully justified. Section 9.6 records the
+subsequent 139-item audit, code fixes, newly supplied proofs and source-matched
+final replays rather than treating delayed bookkeeping as acceptance evidence.
+
+### Historical stable-slot and static-admission correction
+
+The measurements and verification in this section predate the simplification
+cutover above; its older sizes and timing gate are retained as historical evidence.
 
 The compact-array cutover violated the no-suffix-copy requirement. It is replaced
 by one canonical stable-slot array, tombstones and logical slot links—not another
@@ -389,7 +541,7 @@ HarfBuzz differences remain diagnostic, not a conformance claim. Review found no
 remaining canonical-representation or static-ownership violation in the inspected
 paths; it does not certify unrelated inherited shaping behavior.
 
-**The strict performance gate still fails.** Final paired measurements cover
+**That historical strict performance gate was not met.** Final paired measurements cover
 17 cases, three rotated control-order repetitions and five batches on CPU 0:
 153 uninstrumented AVX2 runs. Values are medians of three batch-mean medians,
 in microseconds for input + core + output. Each batch uses 1,000 iterations,
@@ -717,15 +869,16 @@ Font mapping/hash-prefaulting, font/LUT construction and warm shaping are report
 separately. The load measurement is not a cold-disk benchmark. Disk LUT persistence
 and exhaustive font/sequence conformance testing remain deferred.
 
-Font constructors compile automatically. Manual `kbts_LoadFont`/`kbts_PlaceBlob`
-callers must call `kbts_CompileFont` before creating shape configs; `kbts_FreeFont`
-releases the cache independently of caller-owned blob storage. `just check` includes
-sanitized synthetic regressions for priority, blockers, wide contexts, ignored
-marks, fusion guards, allocation failure, config-time contextual localization,
-sparse native program indices and 4/8/16/32-bit mask boundaries.
-Both SIMD builds passed the 555-case verifier; the final AVX2 stress run matched
-upstream exactly across all 9,760 cases. This is exercised equivalence, not
-exhaustive OpenType conformance.
+Font constructors compile automatically and own their blob storage; native input
+is copied. Manual aligned-native `kbts_LoadFont` borrows caller storage;
+raw-font `kbts_PlaceBlob` produces complete serialized bytes before compilation.
+Manual callers must call `kbts_CompileFont` before creating shape configs.
+`kbts_FreeFont` releases compiled ownership without freeing a borrowed blob.
+Focused sanitized fixtures cover matching/priority, filtering and live actions,
+feature/config lifetime, script transformations, placement, odd allocators and
+allocation failures. Current differential results, intentional upstream
+differences and complete-corpus evidence are recorded in the simplification
+ledger; the historical exact-match reports above do not describe every bug fix.
 
 KB's upstream nonbinary-feature size helper underallocates when one override
 expands into multiple lookup entries. The fork fixes that bound. For `alternate`

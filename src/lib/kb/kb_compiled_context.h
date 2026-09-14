@@ -52,6 +52,15 @@ typedef struct kbts__compiled_program
   kbts_u8 OutcomeWidth;
 } kbts__compiled_program;
 
+/* Font-invariant planning facts. Configurations consume these domains and
+ * direct child edges without decoding the compact matcher representation. */
+typedef struct kbts__compiled_lookup
+{
+  kbts_u32 *ReadSymbols, *WriteSymbols, *FirstSymbols;
+  kbts_u32 *Children;
+  kbts_u32 ChildCount, WindowCapacity, Kind, MaxInserted;
+} kbts__compiled_lookup;
+
 struct kbts__compiled_contexts
 {
   kbts_allocator_function *Allocator;
@@ -66,8 +75,6 @@ struct kbts__compiled_contexts
   kbts_u32 WindowCapacity; // Font-static matching window including gather guards.
   void *ProgramIndices;
   kbts_u8 ProgramIndexWidth;
-  /* Present only in the temporary compiler cache, never resident after fusion. */
-  kbts_u32 **PredicateIds;
   kbts_u32 OutcomeCount;
   kbts_u16 GlyphPages[256];
   void *GlyphSymbols;
@@ -87,11 +94,10 @@ struct kbts__compiled_contexts
   kbts_u32 FusedChainCount;
   kbts_un ProgramBytes;
   kbts_un HotBytes;
+  kbts_u32 LookupCount;
+  kbts__compiled_lookup *LookupSummaries;
+  kbts_un SummaryBytes;
 };
-
-static kbts__compiled_contexts *kbts__CompileContexts(kbts_font *Font,
-    kbts_allocator_function *Allocator, void *AllocatorData,
-    kbts_allocator_function *ScratchAllocator, void *ScratchAllocatorData);
 
 static kbts__compiled_contexts *kbts__CompileFontData(kbts_font *Font,
     kbts_allocator_function *Allocator, void *AllocatorData,

@@ -671,176 +671,154 @@ static void kbts__ExecuteOp(kbts_shape_scratchpad *Scratchpad, kbts_glyph_storag
 
       for(kbts_u32 GlyphIndex = Storage->First; GlyphIndex != Storage->End;)
       {
-        kbts_glyph *CurrentGlyph = &Storage->Glyphs[GlyphIndex];
+        const kbts_glyph *Source[3];
+        Source[0] = &Storage->Glyphs[GlyphIndex];
+        Source[1] = Source[2] = Source[0];
+        kbts_glyph_ref Consumed[3] = {Source[0]->Ref, 0, 0};
+        kbts_un ConsumedCount = 1;
         kbts_u32 NextIndex = kbts__NextGlyphSlot(Storage, GlyphIndex);
-
-        kbts_un L = 0;
-        kbts_un V = 0;
-        kbts_un T = 0;
-        kbts_un LvtGlyphCount = 0;
-        kbts_glyph LvtGlyphs[4];
-
-        kbts__hangul_syllable_info LInfo = kbts__HangulSyllableInfo(CurrentGlyph->Codepoint);
-        if(LInfo.Type >= KBTS__HANGUL_SYLLABLE_TYPE_LV)
+        kbts_un L = 0, V = 0, T = 0;
+        kbts__hangul_syllable_info Info = kbts__HangulSyllableInfo(Source[0]->Codepoint);
+        if(Info.Type >= KBTS__HANGUL_SYLLABLE_TYPE_LV)
         {
-          kbts_un SIndex = (CurrentGlyph->Codepoint - 0xAC00);
-
+          kbts_un SIndex = Source[0]->Codepoint - 0xAC00;
           L = 0x1100 + SIndex / 588;
           V = 0x1161 + (SIndex % 588) / 28;
-
-          kbts_un TIndex = SIndex % 28;
-          if(TIndex)
-          {
-            T = 0x11A7 + TIndex;
-          }
+          if(SIndex % 28) T = 0x11A7 + SIndex % 28;
         }
-        else if(LInfo.Type == KBTS__HANGUL_SYLLABLE_TYPE_L)
+        else if(Info.Type == KBTS__HANGUL_SYLLABLE_TYPE_L)
+          L = Source[0]->Codepoint;
+
+        if(L && !V && NextIndex != Storage->End &&
+           kbts__HangulSyllableInfo(Storage->Glyphs[NextIndex].Codepoint).Type == KBTS__HANGUL_SYLLABLE_TYPE_V)
         {
-          L = CurrentGlyph->Codepoint;
+          Source[1] = &Storage->Glyphs[NextIndex];
+          V = Source[1]->Codepoint;
+          Consumed[ConsumedCount++] = Source[1]->Ref;
+          NextIndex = kbts__NextGlyphSlot(Storage, NextIndex);
         }
-
-        if(L)
+        if(L && V && !T && NextIndex != Storage->End &&
+           kbts__HangulSyllableInfo(Storage->Glyphs[NextIndex].Codepoint).Type == KBTS__HANGUL_SYLLABLE_TYPE_T)
         {
-          kbts__hangul_syllable_info VInfo = KBTS__ZERO;
-
-          if(!V && NextIndex != Storage->End)
-          {
-            kbts_u32 VCodepoint = Storage->Glyphs[NextIndex].Codepoint;
-
-            VInfo = kbts__HangulSyllableInfo(VCodepoint);
-
-            if(VInfo.Type == KBTS__HANGUL_SYLLABLE_TYPE_V)
-            {
-              V = VCodepoint;
-
-              NextIndex = kbts__NextGlyphSlot(Storage, NextIndex);
-            }
-          }
-
-          if(V)
-          {
-            kbts__hangul_syllable_info TInfo = KBTS__ZERO;
-
-            if(!T && NextIndex != Storage->End)
-            {
-              kbts_u32 TCodepoint = Storage->Glyphs[NextIndex].Codepoint;
-
-              TInfo = kbts__HangulSyllableInfo(TCodepoint);
-
-              if(TInfo.Type == KBTS__HANGUL_SYLLABLE_TYPE_T)
-              {
-                T = TCodepoint;
-
-                NextIndex = kbts__NextGlyphSlot(Storage, NextIndex);
-              }
-            }
-
-            // Check for any tone marks that we need to swap to the front of the syllable.
-            // The OpenType shaping documents say that we need to do this after applying GSUB features, but
-            // harfbuzz does it before, so it's probably fine to do it here?
-            // It's also basically free to do here, which is nice.
-            if(NextIndex != Storage->End)
-            {
-              kbts_u32 ToneMarkCodepoint = Storage->Glyphs[NextIndex].Codepoint;
-
-              if((ToneMarkCodepoint >= 0x302E) && (ToneMarkCodepoint <= 0x302F))
-              {
-                LvtGlyphs[LvtGlyphCount++] = kbts_CodepointToGlyph(Font, (int)ToneMarkCodepoint, 0, 0);
-
-                NextIndex = kbts__NextGlyphSlot(Storage, NextIndex);
-              }
-            }
-
-            if(LInfo.Composable & VInfo.Composable & TInfo.Composable)
-            {
-              // Try LVT.
-              kbts_un LvtCodepoint = 0xAC00 + (L - 0x1100) * 588 + (V - 0x1161) * 28 + (T - 0x11A7);
-
-              kbts_glyph LvtGlyph = kbts_CodepointToGlyph(Font, (int)LvtCodepoint, 0, 0);
-              if(LvtGlyph.Id)
-              {
-                LvtGlyphs[LvtGlyphCount++] = LvtGlyph;
-              }
-            }
-
-            /* REVIEW[GLYPH4 SUSPECT]: LvtGlyphCount includes a prefixed tone mark,
-             * yet zero count also selects the LV/L-V fallback. For L+V+tone with
-             * no T, the tone makes this branch ineligible before any syllable is
-             * emitted. Unproved: trace that case through deletion below and separate
-             * prefix count from successful syllable construction if needed. */
-            if(!LvtGlyphCount)
-            {
-              kbts_glyph LvGlyph = KBTS__ZERO;
-              if(LInfo.Composable & VInfo.Composable)
-              {
-                // Try LV.
-                kbts_un LvCodepoint = 0xAC00 + (L - 0x1100) * 588 + (V - 0x1161) * 28;
-
-                LvGlyph = kbts_CodepointToGlyph(Font, (int)LvCodepoint, 0, 0);
-              }
-
-              if(LvGlyph.Id)
-              {
-                LvtGlyphs[LvtGlyphCount++] = LvGlyph;
-              }
-              else
-              {
-                // Do L-V.
-                kbts_glyph LGlyph = kbts_CodepointToGlyph(Font, (int)L, 0, 0);
-                LGlyph.Flags |= KBTS_GLYPH_FLAG_LJMO;
-
-                kbts_glyph VGlyph = kbts_CodepointToGlyph(Font, (int)V, 0, 0);
-                VGlyph.Flags |= KBTS_GLYPH_FLAG_VJMO;
-
-                LvtGlyphs[LvtGlyphCount++] = LGlyph;
-                LvtGlyphs[LvtGlyphCount++] = VGlyph;
-              }
-
-              if(T)
-              {
-                kbts_glyph TGlyph = kbts_CodepointToGlyph(Font, (int)T, 0, 0);
-                TGlyph.Flags |= KBTS_GLYPH_FLAG_TJMO;
-
-                LvtGlyphs[LvtGlyphCount++] = TGlyph;
-              }
-            }
-          }
+          Source[2] = &Storage->Glyphs[NextIndex];
+          T = Source[2]->Codepoint;
+          Consumed[ConsumedCount++] = Source[2]->Ref;
+          NextIndex = kbts__NextGlyphSlot(Storage, NextIndex);
         }
-
-        if(!LvtGlyphCount)
+        if(!L || !V)
         {
-          kbts_glyph NewGlyph = kbts_CodepointToGlyph(Font, (int)CurrentGlyph->Codepoint, 0, 0);
-
-          LvtGlyphs[LvtGlyphCount++] = NewGlyph;
+          GlyphIndex = NextIndex;
+          continue;
         }
-
-        /* REVIEW[GLYPH5 SUSPECT]: Every replacement above comes from
-         * CodepointToGlyph(..., 0, 0), including the unchanged-codepoint fallback;
-         * deleting the input therefore discards its source ID and feature Config.
-         * Unproved: check nonzero source IDs and per-glyph overrides through Hangul,
-         * and define which consumed source each output (including tone marks) owns. */
-        { // Insert the LVT glyphs.
-          kbts_glyph_ref Glyph = CurrentGlyph->Ref;
-          kbts_glyph_ref Next = NextIndex != Storage->End ? Storage->Glyphs[NextIndex].Ref : 0;
-          while(Glyph != Next)
+        if(Info.Type >= KBTS__HANGUL_SYLLABLE_TYPE_LV && Source[0]->Id && ConsumedCount == 1)
+        {
+          if(NextIndex != Storage->End &&
+             Storage->Glyphs[NextIndex].Codepoint >= 0x302E &&
+             Storage->Glyphs[NextIndex].Codepoint <= 0x302F)
           {
-            Glyph = kbts__FreeGlyph(Scratchpad, Storage, Glyph);
-          }
-
-          for(kbts_un LvtGlyphIndex = 0;
-              LvtGlyphIndex < LvtGlyphCount;
-              ++LvtGlyphIndex)
-          {
-            kbts_glyph *LvtGlyph = &LvtGlyphs[LvtGlyphIndex];
-            kbts_glyph_ref NewGlyph = kbts__InsertGlyphBefore(Storage, Next, LvtGlyph);
-
-            if(!NewGlyph)
-            {
-              goto OutOfMemory;
-            }
+            kbts_glyph_ref Tone = NextIndex + 1;
+            NextIndex = kbts__NextGlyphSlot(Storage, NextIndex);
+            kbts__MoveGlyphBefore(Storage, Tone, Source[0]->Ref);
           }
           GlyphIndex = NextIndex;
+          continue;
         }
+
+        /* Contractions belong to their first source; decomposed components
+         * inherit their own input, or the precomposed source they expand. */
+        kbts_glyph Syllable[3];
+        kbts_glyph_ref Owners[3];
+        kbts_un SyllableCount = 0;
+        kbts_b32 Composed = 0;
+        kbts_b32 ComposeLV = kbts__HangulSyllableInfo((kbts_u32)L).Composable &&
+                             kbts__HangulSyllableInfo((kbts_u32)V).Composable;
+        if(ComposeLV && T && kbts__HangulSyllableInfo((kbts_u32)T).Composable)
+        {
+          kbts_un Codepoint = 0xAC00 + (L - 0x1100) * 588 + (V - 0x1161) * 28 + T - 0x11A7;
+          Syllable[0] = kbts_CodepointToGlyph(Font, (int)Codepoint, Source[0]->Config, Source[0]->UserIdOrCodepointIndex);
+          if(Syllable[0].Id)
+          {
+            Owners[SyllableCount++] = Source[0]->Ref;
+            Composed = 1;
+          }
+        }
+        if(!Composed)
+        {
+          kbts_glyph LV = KBTS__ZERO;
+          if(ComposeLV)
+          {
+            kbts_un Codepoint = 0xAC00 + (L - 0x1100) * 588 + (V - 0x1161) * 28;
+            LV = Source[0]->Codepoint == Codepoint ? *Source[0] :
+              kbts_CodepointToGlyph(Font, (int)Codepoint, Source[0]->Config, Source[0]->UserIdOrCodepointIndex);
+          }
+          if(LV.Id)
+          {
+            Syllable[SyllableCount] = LV;
+            Owners[SyllableCount++] = Source[0]->Ref;
+          }
+          else
+          {
+            Syllable[SyllableCount] = Source[0]->Codepoint == L ? *Source[0] :
+              kbts_CodepointToGlyph(Font, (int)L, Source[0]->Config, Source[0]->UserIdOrCodepointIndex);
+            Syllable[SyllableCount].Flags |= KBTS_GLYPH_FLAG_LJMO;
+            Owners[SyllableCount++] = Source[0]->Ref;
+            Syllable[SyllableCount] = Source[1]->Codepoint == V ? *Source[1] :
+              kbts_CodepointToGlyph(Font, (int)V, Source[1]->Config, Source[1]->UserIdOrCodepointIndex);
+            Syllable[SyllableCount].Flags |= KBTS_GLYPH_FLAG_VJMO;
+            Owners[SyllableCount++] = Source[1]->Ref;
+          }
+          if(T)
+          {
+            Syllable[SyllableCount] = Source[2]->Codepoint == T ? *Source[2] :
+              kbts_CodepointToGlyph(Font, (int)T, Source[2]->Config, Source[2]->UserIdOrCodepointIndex);
+            Syllable[SyllableCount].Flags |= KBTS_GLYPH_FLAG_TJMO;
+            Owners[SyllableCount++] = Source[2]->Ref;
+          }
+        }
+
+        /* Tone movement is independent of successful syllable construction.
+         * Keep the tone record itself, including its source and configuration. */
+        kbts_glyph_ref Tone = 0;
+        if(NextIndex != Storage->End &&
+           Storage->Glyphs[NextIndex].Codepoint >= 0x302E &&
+           Storage->Glyphs[NextIndex].Codepoint <= 0x302F)
+        {
+          Tone = Storage->Glyphs[NextIndex].Ref;
+          NextIndex = kbts__NextGlyphSlot(Storage, NextIndex);
+        }
+        for(kbts_un Index = 0; Index < ConsumedCount; ++Index)
+        {
+          kbts_b32 Retained = 0;
+          for(kbts_un Output = 0; Output < SyllableCount; ++Output)
+            Retained |= Owners[Output] == Consumed[Index];
+          if(!Retained) kbts__FreeGlyph(Scratchpad, Storage, Consumed[Index]);
+        }
+        if(Tone) kbts__MoveGlyphBefore(Storage, Tone, Consumed[0]);
+        kbts_glyph_ref PreviousGlyph = kbts__PrevGlyphRef(Storage, Consumed[0]);
+        for(kbts_un Index = 0; Index < SyllableCount; ++Index)
+        {
+          kbts_b32 Reused = 0;
+          for(kbts_un Previous = 0; Previous < Index; ++Previous)
+            Reused |= Owners[Previous] == Owners[Index];
+          kbts_glyph_ref Ref = Owners[Index];
+          if(Reused)
+          {
+            Ref = kbts__InsertGlyphAfter(Storage, PreviousGlyph, &Syllable[Index]);
+            if(!Ref) goto OutOfMemory;
+          }
+          else
+          {
+            kbts_glyph *Glyph = kbts__Glyph(Storage, Ref);
+            if(Glyph->Codepoint != Syllable[Index].Codepoint)
+              kbts__SetGlyphPreserveIdentityAndUserId(Glyph, &Syllable[Index]);
+            else
+              Glyph->Flags |= Syllable[Index].Flags;
+            if(kbts__PrevGlyphRef(Storage, Ref) != PreviousGlyph)
+              kbts__MoveGlyphAfter(Storage, Ref, PreviousGlyph);
+          }
+          PreviousGlyph = Ref;
+        }
+        GlyphIndex = NextIndex;
       }
 
       KBTS_INSTRUMENT_BLOCK_END(NORMALIZE_HANGUL);
@@ -977,12 +955,11 @@ static void kbts__ExecuteOp(kbts_shape_scratchpad *Scratchpad, kbts_glyph_storag
         }
       }
 
-      Storage->AttachmentEnd = 0;
+      kbts__RebuildAttachmentLinks(Storage);
       for(kbts_u32 GlyphIndex = Storage->First; GlyphIndex != Storage->End; GlyphIndex = kbts__NextGlyphSlot(Storage, GlyphIndex))
       {
         kbts_glyph *Glyph = &Storage->Glyphs[GlyphIndex];
         kbts__SetCursiveFlags(Glyph, 0);
-        if(Glyph->AttachGlyph) Storage->AttachmentEnd = Glyph->SortKey;
 
         kbts__long_mtx Metric = DefaultMetric;
         if(LongMetrics)
@@ -1046,10 +1023,6 @@ static void kbts__ExecuteOp(kbts_shape_scratchpad *Scratchpad, kbts_glyph_storag
       KB_PROFILE_SCOPE(KBP_GPOS);
       KBTS_INSTRUMENT_BLOCK_BEGIN(GPOS_FEATURES);
 
-      kbts__gsub_gpos *Gpos = kbts__BlobTableDataType(Font->Blob, KBTS_BLOB_TABLE_ID_GPOS, kbts__gsub_gpos);
-      kbts__gdef *Gdef = kbts__BlobTableDataType(Font->Blob, KBTS_BLOB_TABLE_ID_GDEF, kbts__gdef);
-
-      kbts_lookup_list *LookupList = kbts__GetLookupList(Gpos);
       kbts_un FeatureStageIndex = kbts__CurrentBakedFeatureStageIndex(Scratchpad);
 
       kbts_un FirstSequentialLookupIndex = Config->FeatureStageFirstLookupIndices[FeatureStageIndex];
@@ -1060,56 +1033,34 @@ static void kbts__ExecuteOp(kbts_shape_scratchpad *Scratchpad, kbts_glyph_storag
         kbts_un LookupIndex = SequentialLookup->LookupIndex;
         kbts_u32 SkipFlags = SequentialLookup->SkipFlags;
 
-        kbts__bucketed_glyph_block_header *Sentinel = &Scratchpad->LookupGlyphBuckets[SequentialLookupIndex - Scratchpad->GposFirstLookup];
+        kbts__glyph_bucket *Queue = Scratchpad->LookupGlyphBuckets[SequentialLookupIndex - Scratchpad->GposFirstLookup];
 
-        if(Sentinel->Next != Sentinel)
+        if(Queue && Queue->Count)
         {
-          kbts__lookup *PackedLookup = kbts__GetLookup(LookupList, LookupIndex);
-          KB_PROFILE_LOOKUP_SCOPE(1, LookupIndex, PackedLookup->Type, KBL_TOTAL);
-          kbts__unpacked_lookup Lookup = kbts__UnpackLookup(Gdef, PackedLookup);
-          kbts_un SubtableCount = PackedLookup->SubtableCount;
+          const kbts__font_lookup *Lookup = kbts__FontLookup(Font, KBTS_SHAPING_TABLE_GPOS, LookupIndex);
+          KB_PROFILE_LOOKUP_SCOPE(1, LookupIndex, Lookup->Filter.Type, KBL_TOTAL);
 
           KBTS_INSTRUMENT_BLOCK_BEGIN(GposSortBucket);
 
-          if(PackedLookup->Type >= 2)
+          if(Lookup->Filter.Type >= 2)
           {
-            KB_PROFILE_LOOKUP_SCOPE(1, LookupIndex, PackedLookup->Type, KBL_SORT);
+            KB_PROFILE_LOOKUP_SCOPE(1, LookupIndex, Lookup->Filter.Type, KBL_SORT);
             kbts__SortGlyphBucket(Scratchpad, SequentialLookupIndex);
             if(Scratchpad->Error) return;
           }
 
           KBTS_INSTRUMENT_BLOCK_END(GposSortBucket);
 
-          KB_PROFILE_LOOKUP_SCOPE(1, LookupIndex, PackedLookup->Type, KBL_APPLY);
-          for(kbts__bucketed_glyph_block_header *BlockHeader = Sentinel->Next;
-              BlockHeader != Sentinel;
-              BlockHeader = BlockHeader->Next)
+          KB_PROFILE_LOOKUP_SCOPE(1, LookupIndex, Lookup->Filter.Type, KBL_APPLY);
+          for(kbts_un GlyphIndex = 0; GlyphIndex < Queue->Count; ++GlyphIndex)
           {
-            kbts__bucketed_glyph_block *Block = (kbts__bucketed_glyph_block *)BlockHeader;
-            kbts_un BlockGlyphCount = Block->Count;
-
-            KBTS__FOR(GlyphIndex, 0, BlockGlyphCount)
-            {
-              kbts__bucketed_glyph *Bucketed = &Block->Glyphs[GlyphIndex];
-
-              if(kbts__BucketedGlyphIsValid(Bucketed))
+              /* Actions can grow other queues; never retain an entry pointer. */
+              kbts__bucketed_glyph Bucketed = Queue->Glyphs[GlyphIndex];
+              if(kbts__BucketedGlyphIsValid(&Bucketed))
               {
-                kbts_glyph_ref Glyph = Bucketed->Glyph;
+                kbts_glyph_ref Glyph = Bucketed.Glyph;
                 kbts__BeginLookupApplication(Scratchpad, Glyph);
-
-                kbts_u16 *SubtableOffsets = KBTS__POINTER_AFTER(kbts_u16, PackedLookup);
-
-                KBTS__FOR(SubtableIndex, 0, SubtableCount)
-                {
-                  kbts_u16 *Subtable = KBTS__POINTER_OFFSET(kbts_u16, PackedLookup, SubtableOffsets[SubtableIndex]);
-
-                  if(kbts__DoSingleAdjustment(Scratchpad, Config, Storage,
-                                              LookupList, LookupIndex, SubtableIndex, &Lookup, Subtable,
-                                              Glyph, 0, SkipFlags))
-                  {
-                    break;
-                  }
-                }
+                kbts__DoAdjustment(Scratchpad, Config, Storage, LookupIndex, Glyph, 0, SkipFlags);
 
                 kbts_glyph_ref OnePastLast = kbts__EndLookupApplication(Scratchpad);
 
@@ -1133,7 +1084,6 @@ static void kbts__ExecuteOp(kbts_shape_scratchpad *Scratchpad, kbts_glyph_storag
 
                 KBTS_INSTRUMENT_BLOCK_END(GposRebucketTouchedGlyphs);
               }
-            }
           }
         }
 

@@ -90,3 +90,7 @@ shaping-verify isa="avx2" *args:
 # Deterministic multi-font/script differential diagnostics and JSONL report.
 shaping-stress isa="avx2" *args:
     @bash bench/shaping-build.sh stress {{quote(isa)}} {{args}}
+
+# Canonical KB-only language/font/length matrix, machine-readable results.
+shaping-suite command="list" *args:
+    @python3 bench/shaping-suite.py {{quote(command)}} {{args}}

@@ -266,7 +266,7 @@ static kbts_u32 kbts__SelectCompiledCandidate(const kbts__compiled_contexts *Cac
 }
 
 static kbts__sequence_lookup_result kbts__MatchCompiledContext(kbts_shape_scratchpad *Scratchpad,
-    kbts_glyph_storage *Storage, kbts__unpacked_lookup *Lookup, const kbts__compiled_program *Program,
+    kbts_glyph_storage *Storage, const kbts__unpacked_lookup *Lookup, const kbts__compiled_program *Program,
     kbts_glyph_ref AtGlyph, kbts__skip_flags SkipFlags, kbts_u32 SkipUnicodeFlags)
 {
   KB_PROFILE_SCOPE(KBP_SEQUENCE);
@@ -286,20 +286,9 @@ static kbts__sequence_lookup_result kbts__MatchCompiledContext(kbts_shape_scratc
   kbts_u32 Center = Program->MaxBacktrack;
   kbts_u32 AnchorPosition = AtGlyph - 1;
   kbts_u32 Position = AnchorPosition, Distance = 0;
-  /* REVIEW[RUN05 SUSPECT]: FirstFiltered can move the matched center beyond
-   * AtGlyph, but GSUB child frames retain AtGlyph and record index zero targets
-   * that original glyph. Passing the GDEF filter does not exclude a Unicode
-   * ignorable skipped here. Can admission guarantee Distance stays zero, or
-   * should matching and record targeting share the same filtered anchor? */
-  if(Program->FirstFiltered)
-  {
-    while(Position != Storage->End &&
-          kbts__SkipGlyph(&Storage->Glyphs[Position], Lookup, SkipFlags, SkipUnicodeFlags))
-    {
-      Position = kbts__NextGlyphSlot(Storage, Position);
-      ++Distance;
-    }
-  }
+  /* Traversal owns filtering the anchor. Matching never moves action index zero. */
+  KBTS_ASSERT(!Program->FirstFiltered ||
+              !kbts__SkipGlyph(&Storage->Glyphs[Position], Lookup, SkipFlags, SkipUnicodeFlags));
   kbts_u32 FirstSymbol = Position != Storage->End ? Storage->Glyphs[Position].CompiledSymbol : 0;
   Symbols[Center] = Program->LocalMasks ? kbts__CompiledLocalMask(Program, FirstSymbol) : FirstSymbol;
   Glyphs[Center] = Position != Storage->End ? Position + 1 : 0;
@@ -338,35 +327,25 @@ static kbts__sequence_lookup_result kbts__MatchCompiledContext(kbts_shape_scratc
   }
   {
     KB_PROFILE_SCOPE(KBP_BACKTRACK_GATHER);
-    /* REVIEW[RUN04 CLEANUP]: Only Symbols is read below Center: result
-     * consumption reads the last forward input, and ApplyCompiledFusion reads
-     * forward Glyphs. Backtrack nevertheless maintains Distance and writes
-     * Glyphs/Offsets for every probe. Can those unused writes and distance
-     * arithmetic go while retaining the same filtered symbol traversal? */
+    /* Only symbol predicates consume backtrack positions; action references and
+     * consumed distances belong exclusively to the forward input window. */
     Position = AnchorPosition;
-    Distance = 0;
     for(kbts_u32 Index = Center; Index > Center - Bucket.Backtrack;)
     {
       --Index;
       if(Position != KBTS__GLYPH_END)
       {
         Position = Position == Storage->First ? KBTS__GLYPH_END : kbts__PrevGlyphSlot(Storage, Position);
-        --Distance;
       }
       while(Position != KBTS__GLYPH_END)
       {
         KB_PROFILE_WORK(KBW_BACKTRACK_GLYPHS, 1);
         if(!kbts__SkipGlyph(&Storage->Glyphs[Position], Lookup, SkipFlags, SkipUnicodeFlags)) break;
         Position = Position == Storage->First ? KBTS__GLYPH_END : kbts__PrevGlyphSlot(Storage, Position);
-        --Distance;
       }
       kbts_b32 Valid = Position != KBTS__GLYPH_END;
       kbts_u32 Symbol = Valid ? Storage->Glyphs[Position].CompiledSymbol : 0;
       Symbols[Index] = Program->LocalMasks ? kbts__CompiledLocalMask(Program, Symbol) : Symbol;
-      Glyphs[Index] = Valid ? Position + 1 : 0;
-      /* Backtrack distances use unsigned two's complement. Actions consume
-       * only forward logical distances, never physical slot differences. */
-      Offsets[Index] = Distance;
     }
   }
 

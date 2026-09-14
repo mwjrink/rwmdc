@@ -20,17 +20,43 @@ typedef struct kbts__context_rule
   kbts__compiled_wide_test *Tests;
   kbts__compiled_outcome Outcome;
   kbts_u32 TestCount, OutcomeIndex;
+  struct kbts__context_program *Owner;
+  kbts_u32 *Symbols;
+  kbts_u16 *FusionGlyphs;
+  kbts_b32 Dispatched;
 } kbts__context_rule;
+
+typedef struct kbts__context_candidate
+{
+  struct kbts__context_candidate *Next;
+  kbts__context_rule *Rule;
+} kbts__context_candidate;
+
+typedef struct kbts__context_dispatch
+{
+  kbts__context_candidate *First, *Last;
+  kbts__compiled_bucket Bucket;
+} kbts__context_dispatch;
 
 typedef struct kbts__context_program
 {
   kbts__compiled_program Program;
   kbts__context_rule *First, *Last;
-  kbts_un TestsOffset, OutcomesOffset, BucketsOffset, SymbolsOffset;
-  kbts_un LocalMasksOffset, PredicateIdsOffset;
+  kbts__context_dispatch *Dispatch;
   kbts_u32 LocalPredicates[32];
-  kbts_u32 DenseIndex;
+  kbts_u32 DenseIndex, Parent;
 } kbts__context_program;
+
+typedef struct kbts__context_group
+{
+  struct kbts__context_group *Next;
+  kbts__coverage *Coverage;
+  kbts_u16 *Classes;
+  kbts_u32 Kind, ValueCount;
+  kbts_u32 *Heads, *NextGlyph;
+  kbts_u32 *Bits;
+  kbts_u16 *CoverageGlyphs;
+} kbts__context_group;
 
 typedef struct kbts__context_builder
 {
@@ -41,6 +67,7 @@ typedef struct kbts__context_builder
   kbts_u32 HashCount, SourceCount, PredicateCount, OutcomeCount;
   kbts_u32 GlyphCount, GlyphWords;
   kbts_u32 *Bits;
+  kbts__context_group *Groups;
   int Error;
 } kbts__context_builder;
 
@@ -124,6 +151,84 @@ static int kbts__ContextGrowHash(kbts__context_builder *Builder)
   return 1;
 }
 
+/* Coverage indices borrow format 1 or normalize format 2 once. Materialize a
+ * membership set only for whole-coverage/intersection consumers, not index-only
+ * rules. Class families include implicit zero independently of intersections. */
+static kbts__context_group *kbts__ContextGroup(kbts__context_builder *Builder,
+    kbts_u32 Kind, kbts__coverage *Coverage, kbts_u16 *Classes)
+{
+  kbts__context_group *Group = Builder->Groups;
+  while(Group && (Group->Kind != Kind || Group->Coverage != Coverage || Group->Classes != Classes)) Group = Group->Next;
+  if(Group || Builder->Error) return Group;
+  Group = kbts__ContextArray(Builder, kbts__context_group, 1);
+  if(Builder->Error) return 0;
+  Group->Kind = Kind;
+  Group->Coverage = Coverage;
+  Group->Classes = Classes;
+  if(Coverage)
+  {
+    const kbts_u16 *Table = (const kbts_u16 *)Coverage;
+    if(Table[0] == 1)
+    {
+      Group->ValueCount = Table[1];
+      Group->CoverageGlyphs = (kbts_u16 *)(Table + 2);
+    }
+    else
+    {
+      for(kbts_u32 R = 0; R < Table[1]; ++R)
+        Group->ValueCount += (kbts_u32)Table[2 + R * 3 + 1] - Table[2 + R * 3] + 1;
+      Group->CoverageGlyphs = kbts__ContextArray(Builder, kbts_u16, Group->ValueCount);
+      if(Builder->Error) return 0;
+      for(kbts_u32 R = 0; R < Table[1]; ++R)
+      {
+        const kbts_u16 *Range = Table + 2 + R * 3;
+        for(kbts_u32 Glyph = Range[0]; Glyph <= Range[1]; ++Glyph)
+          Group->CoverageGlyphs[Range[2] + Glyph - Range[0]] = (kbts_u16)Glyph;
+      }
+    }
+  }
+  else
+  {
+    kbts_u32 *Next = kbts__ContextArray(Builder, kbts_u32, Builder->GlyphCount);
+    if(Builder->Error) return 0;
+    Group->ValueCount = 1;
+    for(kbts_u32 Glyph = 0; Glyph < Builder->GlyphCount; ++Glyph)
+    {
+      kbts_u32 Class = Classes ? kbts__GlyphClassFromTable(Classes, Glyph).Class : 0;
+      Next[Glyph] = Class;
+      Group->ValueCount = KBTS__MAX(Group->ValueCount, Class + 1);
+    }
+    Group->Heads = kbts__ContextArray(Builder, kbts_u32, Group->ValueCount);
+    if(Builder->Error) return 0;
+    KBTS_MEMSET(Group->Heads, 0xff, Group->ValueCount * sizeof(kbts_u32));
+    for(kbts_u32 Glyph = 0; Glyph < Builder->GlyphCount; ++Glyph)
+    {
+      kbts_u32 Class = Next[Glyph];
+      Next[Glyph] = Group->Heads[Class];
+      Group->Heads[Class] = Glyph;
+    }
+    Group->NextGlyph = Next;
+  }
+  Group->Next = Builder->Groups;
+  Builder->Groups = Group;
+  return Group;
+}
+
+static kbts_u32 *kbts__ContextCoverageBits(kbts__context_builder *Builder, kbts__context_group *Group)
+{
+  if(!Group->Bits)
+  {
+    Group->Bits = kbts__ContextArray(Builder, kbts_u32, Builder->GlyphWords);
+    if(Builder->Error) return 0;
+    for(kbts_u32 I = 0; I < Group->ValueCount; ++I)
+    {
+      kbts_u32 Glyph = Group->CoverageGlyphs[I];
+      Group->Bits[Glyph >> 5] |= 1u << (Glyph & 31);
+    }
+  }
+  return Group->Bits;
+}
+
 /* Kind: singleton, coverage, class (optionally intersected with coverage), coverage index. */
 static kbts_u32 kbts__ContextPredicate(kbts__context_builder *Builder, kbts_u32 Kind, kbts_u32 Value,
                                       kbts__coverage *Coverage, kbts_u16 *Classes)
@@ -136,29 +241,39 @@ static kbts_u32 kbts__ContextPredicate(kbts__context_builder *Builder, kbts_u32 
     if(Source->Kind == Kind && Source->Value == Value && Source->Coverage == Coverage && Source->Classes == Classes)
       return Source->Predicate;
 
-  KBTS_MEMSET(Builder->Bits, 0, Builder->GlyphWords * sizeof(kbts_u32));
+  kbts_b32 WholeCoverage = Kind == 1 || (Kind == 3 && !Coverage);
+  if(!WholeCoverage) KBTS_MEMSET(Builder->Bits, 0, Builder->GlyphWords * sizeof(kbts_u32));
   if(Kind == 0)
   {
     if(Value < Builder->GlyphCount) Builder->Bits[Value >> 5] |= 1u << (Value & 31);
   }
   else
   {
-    /* REVIEW[COLD1 PERF]: Each new coverage-index/class source scans every glyph;
-     * format-1 sets therefore revisit the same coverage once per SetIndex before
-     * bitset interning can help. Measure this separately from symbol refinement:
-     * can one coverage/class walk populate these source predicates together? */
-    for(kbts_u32 Glyph = 0; Glyph < Builder->GlyphCount; ++Glyph)
+    kbts__context_group *Covered = Coverage ? kbts__ContextGroup(Builder, 3, Coverage, 0) : 0;
+    kbts__context_group *Classed = Kind == 2 ? kbts__ContextGroup(Builder, 2, 0, Classes) : 0;
+    kbts_u32 *CoverageBits = Covered && Kind != 3 ? kbts__ContextCoverageBits(Builder, Covered) : 0;
+    if(Builder->Error) return 0;
+    if(WholeCoverage)
     {
-      int Member = 1;
-      if(Coverage)
+      if(Covered) KBTS_MEMCPY(Builder->Bits, CoverageBits, Builder->GlyphWords * sizeof(kbts_u32));
+      else
       {
-        kbts__cover_glyph_result Cover = kbts__CoverGlyph(Coverage, (kbts_u16)Glyph);
-        Member = Cover.Valid && (Kind != 3 || Cover.Index == Value);
+        KBTS_MEMSET(Builder->Bits, 0xff, Builder->GlyphWords * sizeof(kbts_u32));
+        if(Builder->GlyphCount & 31) Builder->Bits[Builder->GlyphWords - 1] &= (1u << (Builder->GlyphCount & 31)) - 1;
       }
-      if(Member && Kind == 2)
-        Member = (Classes ? kbts__GlyphClassFromTable(Classes, Glyph).Class : 0) == Value;
-      if(Member) Builder->Bits[Glyph >> 5] |= 1u << (Glyph & 31);
     }
+    else if(Kind == 3)
+    {
+      if(Value < Covered->ValueCount)
+      {
+        kbts_u32 Glyph = Covered->CoverageGlyphs[Value];
+        Builder->Bits[Glyph >> 5] |= 1u << (Glyph & 31);
+      }
+    }
+    else if(Value < Classed->ValueCount)
+      for(kbts_u32 Glyph = Classed->Heads[Value]; Glyph != (kbts_u32)-1; Glyph = Classed->NextGlyph[Glyph])
+        if(!Covered || (CoverageBits[Glyph >> 5] & (1u << (Glyph & 31))))
+          Builder->Bits[Glyph >> 5] |= 1u << (Glyph & 31);
   }
   kbts_u32 Hash = 2166136261u;
   for(kbts_u32 I = 0; I < Builder->GlyphWords; ++I) Hash = (Hash ^ Builder->Bits[I]) * 16777619u;
@@ -218,6 +333,7 @@ static kbts__context_rule *kbts__ContextRule(kbts__context_builder *Builder, kbt
   kbts__context_rule *Rule = kbts__ContextArray(Builder, kbts__context_rule, 1);
   kbts__compiled_wide_test *Tests = kbts__ContextArray(Builder, kbts__compiled_wide_test, Count);
   if(Builder->Error) return 0;
+  Rule->Owner = Program;
   Rule->Tests = Tests;
   Rule->TestCount = Count;
   Rule->Outcome.Records = Records;
@@ -368,81 +484,73 @@ static int kbts__ContextMember(kbts__context_predicate **Predicates, kbts_u32 Pr
   return (Predicates[Predicate]->Bits[Glyph >> 5] >> (Glyph & 31)) & 1;
 }
 
-static kbts__compiled_contexts *kbts__CompileContexts(kbts_font *Font, kbts_allocator_function *Allocator, void *AllocatorData,
-                                                    kbts_allocator_function *ScratchAllocator, void *ScratchAllocatorData)
+/* One scratch model survives collection, proofs, and final-byte emission.
+ * Logical rules retain their global predicates, parent, outcome, and priority;
+ * dispatch nodes are non-owning views, never serialized runtime candidates. */
+typedef struct kbts__context_model
 {
-  kbts__context_builder Builder = KBTS__ZERO;
-  Builder.Arena.Allocator = ScratchAllocator;
-  Builder.Arena.AllocatorData = ScratchAllocatorData;
-  Builder.GlyphCount = Font->Blob->GlyphCount;
-  Builder.GlyphWords = (Builder.GlyphCount + 31) / 32;
-  Builder.PredicateCount = 1; /* Padding is not interned with a real all-glyph predicate. */
-  kbts__compiled_contexts *Result = 0;
-  if(Builder.GlyphCount > 65535) {Font->Error = KBTS_LOAD_FONT_ERROR_INVALID_FONT; return 0;}
-  kbts_u32 ProgramCount = Font->Blob->LookupSubtableCount;
-  kbts__context_program *Programs = kbts__ContextArray(&Builder, kbts__context_program, ProgramCount);
-  Builder.Bits = kbts__ContextArray(&Builder, kbts_u32, Builder.GlyphWords);
-  if(!Builder.Error)
+  kbts_font *Font;
+  kbts__context_program *Programs;
+  kbts__context_rule **Rules;
+  kbts__compiled_lookup *Lookups;
+  kbts_u32 ProgramCount, DenseCount, SymbolCount, SymbolWordCount;
+  kbts_u32 *Symbols, *PredicateMasks, *GlyphHeads, *GlyphNext;
+  kbts_u16 *Pages, PageDirectory[256];
+  kbts_u32 PageCount;
+} kbts__context_model;
+
+static int kbts__ContextMaskMember(const kbts__context_model *Model, kbts_u32 Predicate, kbts_u32 Symbol)
+{
+  return !!(Model->PredicateMasks[(kbts_un)Predicate * Model->SymbolWordCount + (Symbol >> 5)] & (1u << (Symbol & 31)));
+}
+
+static void kbts__CollectContexts(kbts__context_builder *Builder, kbts__context_model *Model, kbts_font *Font)
+{
+  Model->Font = Font;
+  Builder->GlyphCount = Font->Blob->GlyphCount;
+  Builder->GlyphWords = (Builder->GlyphCount + 31) / 32;
+  Builder->PredicateCount = 1; /* Tautological padding is not a real glyph set. */
+  if(Builder->GlyphCount > 65535 || !Font->Tables) {Builder->Error = 2; return;}
+  Model->ProgramCount = Font->Tables->SubtableCount;
+  Model->Programs = kbts__ContextArray(Builder, kbts__context_program, Model->ProgramCount);
+  Model->Lookups = kbts__ContextArray(Builder, kbts__compiled_lookup, Font->Tables->LookupCount);
+  Builder->Bits = kbts__ContextArray(Builder, kbts_u32, Builder->GlyphWords);
+  if(Builder->Error) return;
+  for(kbts_u32 L = 0; L < Font->Tables->LookupCount && !Builder->Error; ++L)
   {
-    kbts_u32 *FlatOffsets = KBTS__POINTER_OFFSET(kbts_u32, Font->Blob, Font->Blob->LookupSubtableIndexOffsetsOffsetFromStartOfFile);
-    kbts_blob_table_id TableIds[2] = {KBTS_BLOB_TABLE_ID_GSUB, KBTS_BLOB_TABLE_ID_GPOS};
-    for(kbts_u32 TableIndex = 0; TableIndex < 2 && !Builder.Error; ++TableIndex)
+    const kbts__font_lookup *Lookup = &Font->Tables->Lookups[L];
+    kbts_u32 ContextType = L < Font->Blob->GposLookupIndexOffset ? 5 : 7;
+    Model->Lookups[L].WindowCapacity = 9;
+    for(kbts_u32 S = 0; S < Lookup->Packed->SubtableCount && !Builder->Error; ++S)
     {
-      kbts__gsub_gpos *Table = kbts__BlobTableDataType(Font->Blob, TableIds[TableIndex], kbts__gsub_gpos);
-      kbts_lookup_list *List = kbts__GetLookupList(Table);
-      if(!List) continue;
-      kbts_u32 LookupBase = TableIndex ? Font->Blob->GposLookupIndexOffset : 0;
-      for(kbts_u32 LookupIndex = 0; LookupIndex < List->Count && !Builder.Error; ++LookupIndex)
-      {
-        kbts__lookup *Lookup = kbts__GetLookup(List, LookupIndex);
-        kbts_u16 *Offsets = KBTS__POINTER_AFTER(kbts_u16, Lookup);
-        for(kbts_u32 Subtable = 0; Subtable < Lookup->SubtableCount && !Builder.Error; ++Subtable)
-        {
-          kbts_u32 Type = Lookup->Type;
-          kbts_u16 *Base = KBTS__POINTER_OFFSET(kbts_u16, Lookup, Offsets[Subtable]);
-          /* REVIEW[COLD2 SUSPECT]: Native-blob loading checks the version, not
-           * extension targets; this walk has neither bounds nor a progress guard.
-           * A surviving type-7/9 extension with zero offset would loop here.
-           * Where is the validated-table invariant established before compilation,
-           * including the equivalent fusion and admission-plan walks? */
-          // ANSWER Does this run before everything? Either way, a 4 way nested loop is a smell.
-          // What is the source and result here? we loop through all tables in teh font, then all lists in each table then subtables? then lookup types within those?
-          while(Type == (TableIndex ? 9u : 7u))
-          {
-            kbts__extension *Extension = (kbts__extension *)Base;
-            Type = Extension->LookupType;
-            Base = KBTS__POINTER_OFFSET(kbts_u16, Extension, kbts__ReadU32Unaligned(&Extension->Offset));
-          }
-          kbts_u32 ContextType = TableIndex ? 7 : 5;
-          if(Type == ContextType || Type == ContextType + 1)
-          {
-            kbts_u32 Flat = FlatOffsets[LookupBase + LookupIndex];
-            if(Flat >= ProgramCount || Subtable >= ProgramCount - Flat) {Builder.Error = 2; break;}
-            kbts__ContextCompileSubtable(&Builder, &Programs[Flat + Subtable], Base, Type != ContextType);
-          }
-        }
-      }
+      const kbts__font_subtable *Subtable = &Font->Tables->Subtables[Lookup->FirstSubtable + S];
+      kbts__context_program *Program = &Model->Programs[Lookup->FirstSubtable + S];
+      Program->Parent = L;
+      // ANSWER Does this run before everything? Either way, a 4 way nested loop is a smell.
+      // What is the source and result here? we loop through all tables in teh font, then all lists in each table then subtables? then lookup types within those?
+      // Font compilation only: flat checked lookup/subtable views become retained logical rules.
+      if(Subtable->Type == ContextType || Subtable->Type == ContextType + 1)
+        kbts__ContextCompileSubtable(Builder, Program, (kbts_u16 *)Subtable->Data, Subtable->Type != ContextType);
     }
   }
-
-  kbts_u32 Domain = Builder.GlyphCount + 1;
-  kbts_u32 *Symbols = kbts__ContextArray(&Builder, kbts_u32, Builder.GlyphCount);
-  kbts_u32 *FalseSymbols = kbts__ContextArray(&Builder, kbts_u32, Domain);
-  kbts_u32 *TrueSymbols = kbts__ContextArray(&Builder, kbts_u32, Domain);
-  kbts_u32 *Representatives = kbts__ContextArray(&Builder, kbts_u32, Domain);
-  kbts__context_predicate **Predicates = kbts__ContextArray(&Builder, kbts__context_predicate *, Builder.PredicateCount);
+  kbts_u32 Domain = Builder->GlyphCount + 1;
+  kbts_u32 *Symbols = kbts__ContextArray(Builder, kbts_u32, Builder->GlyphCount);
+  kbts_u32 *FalseSymbols = kbts__ContextArray(Builder, kbts_u32, Domain);
+  kbts_u32 *TrueSymbols = kbts__ContextArray(Builder, kbts_u32, Domain);
+  kbts_u32 *Representatives = kbts__ContextArray(Builder, kbts_u32, Domain);
+  kbts__context_predicate **Predicates = kbts__ContextArray(Builder, kbts__context_predicate *, Builder->PredicateCount);
   kbts_u32 SymbolCount = 1;
-  if(!Builder.Error)
+  if(!Builder->Error)
   {
     /* Refine exact membership classes; keep the all-false boundary class at zero. */
-    for(kbts__context_predicate *Predicate = Builder.Predicates; Predicate; Predicate = Predicate->Next)
+    for(kbts__context_predicate *Predicate = Builder->Predicates; Predicate; Predicate = Predicate->Next)
     {
       Predicates[Predicate->Id] = Predicate;
       KBTS_MEMSET(FalseSymbols, 0xff, SymbolCount * sizeof(kbts_u32));
       KBTS_MEMSET(TrueSymbols, 0xff, SymbolCount * sizeof(kbts_u32));
       FalseSymbols[0] = 0;
       kbts_u32 NextCount = 1;
-      for(kbts_u32 Glyph = 0; Glyph < Builder.GlyphCount; ++Glyph)
+      for(kbts_u32 Glyph = 0; Glyph < Builder->GlyphCount; ++Glyph)
       {
         kbts_u32 *Map = ((Predicate->Bits[Glyph >> 5] >> (Glyph & 31)) & 1) ? TrueSymbols : FalseSymbols;
         kbts_u32 Old = Symbols[Glyph];
@@ -451,13 +559,13 @@ static kbts__compiled_contexts *kbts__CompileContexts(kbts_font *Font, kbts_allo
       }
       SymbolCount = NextCount;
     }
-    for(kbts_u32 Glyph = 0; Glyph < Builder.GlyphCount; ++Glyph) Representatives[Symbols[Glyph]] = Glyph;
+    for(kbts_u32 Glyph = 0; Glyph < Builder->GlyphCount; ++Glyph) Representatives[Symbols[Glyph]] = Glyph;
   }
 
-  kbts_u16 *Pages = kbts__ContextArray(&Builder, kbts_u16, 257 * 256);
+  kbts_u16 *Pages = kbts__ContextArray(Builder, kbts_u16, 257 * 256);
   kbts_u16 PageDirectory[256] = {0};
   kbts_u32 PageCount = 1;
-  if(!Builder.Error)
+  if(!Builder->Error)
   {
     for(kbts_u32 Page = 0; Page < 256; ++Page)
     {
@@ -465,7 +573,7 @@ static kbts__compiled_contexts *kbts__CompileContexts(kbts_font *Font, kbts_allo
       for(kbts_u32 Low = 0; Low < 256; ++Low)
       {
         kbts_u32 Glyph = Page * 256 + Low;
-        Values[Low] = Glyph < Builder.GlyphCount ? (kbts_u16)Symbols[Glyph] : 0;
+        Values[Low] = Glyph < Builder->GlyphCount ? (kbts_u16)Symbols[Glyph] : 0;
       }
       kbts_u32 Match = 0;
       for(; Match < PageCount; ++Match)
@@ -479,47 +587,93 @@ static kbts__compiled_contexts *kbts__CompileContexts(kbts_font *Font, kbts_allo
     }
   }
 
-  kbts_u32 DenseCount = 1; /* Every noncontext/empty native subtable shares slot zero. */
-  for(kbts_u32 P = 0; P < ProgramCount && !Builder.Error; ++P)
-    if(Programs[P].First) Programs[P].DenseIndex = DenseCount++;
-  kbts_u32 ProgramIndexWidth = DenseCount <= 256 ? 1 : DenseCount <= 65536 ? 2 : 4;
-  kbts_un Total = sizeof(kbts__compiled_contexts);
-  kbts_u32 SymbolWidth = SymbolCount <= 256 ? 1 : 2;
-  kbts_u32 SymbolWords = (SymbolCount + 31) / 32;
-  kbts_un GlyphOffset = kbts__ContextReserve(&Builder, &Total, PageCount * 256, SymbolWidth, SymbolWidth);
-  kbts_un MaskOffset = kbts__ContextReserve(&Builder, &Total, Builder.PredicateCount, (kbts_un)SymbolWords * sizeof(kbts_u32), KBTS_ALIGNOF(kbts_u32));
-  kbts_un ProgramOffset = kbts__ContextReserve(&Builder, &Total, DenseCount, sizeof(kbts__compiled_program), KBTS_ALIGNOF(kbts__compiled_program));
-  kbts_un ProgramIndexOffset = kbts__ContextReserve(&Builder, &Total, ProgramCount, ProgramIndexWidth, ProgramIndexWidth);
-  kbts_un ProofOffset = kbts__ContextReserve(&Builder, &Total, DenseCount, sizeof(kbts_u32 *), KBTS_ALIGNOF(kbts_u32 *));
-  kbts_un OutcomeOffset = kbts__ContextReserve(&Builder, &Total, Builder.OutcomeCount, sizeof(kbts__compiled_outcome), KBTS_ALIGNOF(kbts__compiled_outcome));
-  kbts_un TestBytes = 0, BucketBytes = 0, OutcomeBytes = (kbts_un)Builder.OutcomeCount * sizeof(kbts__compiled_outcome);
-  kbts_un LocalPredicateBytes = 0;
-  for(kbts_u32 P = 0; P < ProgramCount && !Builder.Error; ++P)
+  if(Builder->Error) return;
+  Model->SymbolCount = SymbolCount;
+  Model->SymbolWordCount = (SymbolCount + 31) / 32;
+  Model->Symbols = Symbols;
+  Model->Pages = Pages;
+  Model->PageCount = PageCount;
+  KBTS_MEMCPY(Model->PageDirectory, PageDirectory, sizeof(PageDirectory));
+  Model->Rules = kbts__ContextArray(Builder, kbts__context_rule *, Builder->OutcomeCount);
+  Model->PredicateMasks = kbts__ContextArray(Builder, kbts_u32, (kbts_un)Builder->PredicateCount * Model->SymbolWordCount);
+  Model->GlyphHeads = kbts__ContextArray(Builder, kbts_u32, SymbolCount);
+  Model->GlyphNext = kbts__ContextArray(Builder, kbts_u32, Builder->GlyphCount);
+  if(Builder->Error) return;
+  for(kbts_u32 W = 0; W < Model->SymbolWordCount; ++W) Model->PredicateMasks[W] = (kbts_u32)-1;
+  for(kbts_u32 P = 1; P < Builder->PredicateCount; ++P)
+    for(kbts_u32 S = 1; S < SymbolCount; ++S)
+      if(kbts__ContextMember(Predicates, P, S, Representatives))
+        Model->PredicateMasks[(kbts_un)P * Model->SymbolWordCount + (S >> 5)] |= 1u << (S & 31);
+  KBTS_MEMSET(Model->GlyphHeads, 0xff, SymbolCount * sizeof(kbts_u32));
+  for(kbts_u32 G = 0; G < Builder->GlyphCount; ++G)
   {
-    kbts__context_program *Temp = &Programs[P];
+    Model->GlyphNext[G] = Model->GlyphHeads[Symbols[G]];
+    Model->GlyphHeads[Symbols[G]] = G;
+  }
+  Model->DenseCount = 1;
+  kbts_u32 *TautologySymbols = 0;
+  for(kbts_u32 P = 0; P < Model->ProgramCount && !Builder->Error; ++P)
+  {
+    kbts__context_program *Temp = &Model->Programs[P];
     kbts__compiled_program *Program = &Temp->Program;
     if(!Temp->First) continue;
-    /* The bucket dispatch has already proved the first input predicate.
-     * Remaining columns still execute a uniform number of stages. */
+    Temp->DenseIndex = Model->DenseCount++;
+    Temp->Dispatch = kbts__ContextArray(Builder, kbts__context_dispatch, SymbolCount);
+    if(Builder->Error) return;
     if(Program->StageCount > 1) --Program->StageCount;
-    kbts_u32 Candidates = 0, Buckets = 1;
-    for(kbts_u32 Symbol = 0; Symbol < SymbolCount && !Builder.Error; ++Symbol)
+    for(kbts__context_rule *Rule = Temp->First; Rule; Rule = Rule->Next)
     {
-      kbts_u32 Count = 0;
-      for(kbts__context_rule *Rule = Temp->First; Rule; Rule = Rule->Next)
-        if(kbts__ContextMember(Predicates, Rule->Tests[0].Predicate, Symbol, Representatives))
+      Model->Rules[Rule->OutcomeIndex] = Rule;
+      /* Dispatch membership is exactly the first global predicate. Share its
+       * already-built domain instead of an outcome × symbol matrix. Padding
+       * predicate zero needs only one bounded, shared dispatch domain. */
+      kbts_u32 First = Rule->Tests[0].Predicate;
+      Rule->Symbols = Model->PredicateMasks + (kbts_un)First * Model->SymbolWordCount;
+      if(!First)
+      {
+        if(!TautologySymbols)
         {
-          if(Candidates == (kbts_u32)-1) {Builder.Error = 1; break;}
-          ++Candidates;
-          ++Count;
+          TautologySymbols = kbts__ContextArray(Builder, kbts_u32, Model->SymbolWordCount);
+          if(Builder->Error) return;
+          KBTS_MEMSET(TautologySymbols, 0xff, Model->SymbolWordCount * sizeof(kbts_u32));
+          if(SymbolCount & 31) TautologySymbols[Model->SymbolWordCount - 1] &= (1u << (SymbolCount & 31)) - 1;
         }
-      if(Count) ++Buckets;
+        Rule->Symbols = TautologySymbols;
+      }
     }
-    if(Candidates > (kbts_u32)-1 - 7) {Builder.Error = 1; break;}
+    if(Builder->Error) return;
+    kbts_u32 Candidates = 0, Buckets = 1;
+    for(kbts_u32 Symbol = 0; Symbol < SymbolCount && !Builder->Error; ++Symbol)
+    {
+      kbts__context_dispatch *Dispatch = &Temp->Dispatch[Symbol];
+      Dispatch->Bucket.First = Candidates;
+      for(kbts__context_rule *Rule = Temp->First; Rule; Rule = Rule->Next)
+      {
+        if(!kbts__ContextMaskMember(Model, Rule->Tests[0].Predicate, Symbol)) continue;
+        if(Candidates == (kbts_u32)-1) {Builder->Error = 1; break;}
+        kbts__context_candidate *Candidate = kbts__ContextArray(Builder, kbts__context_candidate, 1);
+        if(Builder->Error) return;
+        Candidate->Rule = Rule;
+        if(Dispatch->Last) Dispatch->Last->Next = Candidate;
+        else Dispatch->First = Candidate;
+        Dispatch->Last = Candidate;
+        Rule->Dispatched = 1;
+        ++Candidates;
+        ++Dispatch->Bucket.Count;
+        for(kbts_u32 T = 1; T < Rule->TestCount; ++T)
+        {
+          kbts_s32 Probe = Rule->Tests[T].Probe;
+          if(Probe < 0) Dispatch->Bucket.Backtrack = KBTS__MAX(Dispatch->Bucket.Backtrack, (kbts_u32)-Probe);
+          else Dispatch->Bucket.Ahead = KBTS__MAX(Dispatch->Bucket.Ahead, (kbts_u32)Probe);
+        }
+      }
+      if(Dispatch->Bucket.Count) ++Buckets;
+    }
+    if(Candidates > (kbts_u32)-1 - 7) {Builder->Error = 1; return;}
     Program->CandidateCount = (Candidates + 7) & ~7u;
     Program->BucketCount = Buckets;
     Program->SymbolBucketWidth = Buckets <= 256 ? 1 : Buckets <= 65536 ? 2 : 4;
-    Program->OutcomeWidth = Builder.OutcomeCount <= 65535 ? 2 : 4;
+    Program->OutcomeWidth = Builder->OutcomeCount <= 65535 ? 2 : 4;
     kbts_u32 LocalCount = 1;
     int LocalFits = 1;
     for(kbts__context_rule *Rule = Temp->First; Rule && LocalFits; Rule = Rule->Next)
@@ -534,155 +688,12 @@ static kbts__compiled_contexts *kbts__CompileContexts(kbts_font *Font, kbts_allo
         }
       }
     Program->LocalPredicateCount = (kbts_u8)(LocalFits ? LocalCount : 0);
-    Program->LocalMaskWidth = (kbts_u8)(LocalFits ? (LocalCount <= 8 ? 1 : LocalCount <= 16 ? 2 : 4) : 0);
+    Program->LocalMaskWidth = (kbts_u8)(LocalFits ? (LocalCount <= 4 ? 0 : LocalCount <= 8 ? 1 : LocalCount <= 16 ? 2 : 4) : 0);
     for(kbts__context_rule *Rule = Temp->First; Rule; Rule = Rule->Next)
       for(kbts_u32 T = 1; T < Rule->TestCount; ++T)
         if((!LocalFits && Rule->Tests[T].Predicate > 255) || Rule->Tests[T].Probe < -128 || Rule->Tests[T].Probe > 127) Program->Wide = 1;
-    kbts_un TestSize = Program->Wide ? sizeof(kbts__compiled_wide_test) : sizeof(kbts__compiled_test);
-    /* Reserve one stage at a time arithmetically, without overflowing the product. */
-    if(Program->CandidateCount > (kbts_u32)-1 / TestSize) {Builder.Error = 1; break;}
-    kbts_un StageBytes = (kbts_un)Program->CandidateCount * TestSize;
-    Temp->TestsOffset = kbts__ContextReserve(&Builder, &Total, StageBytes ? Program->StageCount : 0,
-                                           StageBytes ? StageBytes : 1, KBTS_ALIGNOF(kbts__compiled_wide_test));
-    if(Builder.Error) break;
-    TestBytes += Program->StageCount * StageBytes;
-    if(!Program->Wide && Program->CandidateCount)
-    {
-      /* A 32-bit gather of the final compact test may read its padding neighbor. */
-      kbts__ContextReserve(&Builder, &Total, 1, sizeof(kbts__compiled_test), KBTS_ALIGNOF(kbts__compiled_test));
-      TestBytes += sizeof(kbts__compiled_test);
-    }
-    Temp->OutcomesOffset = kbts__ContextReserve(&Builder, &Total, Program->CandidateCount, Program->OutcomeWidth, Program->OutcomeWidth);
-    Temp->BucketsOffset = kbts__ContextReserve(&Builder, &Total, Buckets, sizeof(kbts__compiled_bucket), KBTS_ALIGNOF(kbts__compiled_bucket));
-    Temp->SymbolsOffset = kbts__ContextReserve(&Builder, &Total, SymbolCount, Program->SymbolBucketWidth, Program->SymbolBucketWidth);
-    if(LocalFits)
-    {
-      Temp->LocalMasksOffset = kbts__ContextReserve(&Builder, &Total, SymbolCount, Program->LocalMaskWidth, Program->LocalMaskWidth);
-      Temp->PredicateIdsOffset = kbts__ContextReserve(&Builder, &Total, LocalCount, sizeof(kbts_u32), KBTS_ALIGNOF(kbts_u32));
-      LocalPredicateBytes += (kbts_un)SymbolCount * Program->LocalMaskWidth + (kbts_un)LocalCount * sizeof(kbts_u32);
-    }
-    BucketBytes += (kbts_un)Buckets * sizeof(kbts__compiled_bucket) + (kbts_un)SymbolCount * Program->SymbolBucketWidth;
-    OutcomeBytes += (kbts_un)Program->CandidateCount * Program->OutcomeWidth;
+    kbts_un Window = (kbts_un)Program->MaxBacktrack + Program->MaxAhead + 9;
+    if(Window > (kbts_u32)-1) {Builder->Error = 1; return;}
+    Model->Lookups[Temp->Parent].WindowCapacity = KBTS__MAX(Model->Lookups[Temp->Parent].WindowCapacity, (kbts_u32)Window);
   }
-
-  kbts_un AllocationSize = Total;
-  kbts__ContextReserve(&Builder, &AllocationSize, KBTS_ALIGNOF(kbts__compiled_contexts) - 1, 1, 1);
-  if(!Builder.Error)
-  {
-    void *Allocation = kbts__AllocatorAllocate(Allocator, AllocatorData, AllocationSize);
-    if(Allocation)
-    {
-      Result = KBTS__ALIGN_POINTER(kbts__compiled_contexts, Allocation, KBTS_ALIGNOF(kbts__compiled_contexts));
-      KBTS_MEMSET(Result, 0, Total);
-      Result->BaseAllocation = Allocation;
-      Result->Allocator = Allocator;
-      Result->AllocatorData = AllocatorData;
-      Result->GlyphCount = Builder.GlyphCount;
-      Result->SymbolCount = SymbolCount;
-      Result->SymbolWordCount = SymbolWords;
-      Result->PredicateCount = Builder.PredicateCount;
-      Result->ProgramCount = DenseCount;
-      Result->FlatProgramCount = ProgramCount;
-      Result->ProgramIndexWidth = (kbts_u8)ProgramIndexWidth;
-      Result->ProgramIndices = KBTS__POINTER_OFFSET(void, Result, ProgramIndexOffset);
-      Result->PredicateIds = KBTS__POINTER_OFFSET(kbts_u32 *, Result, ProofOffset);
-      Result->ProgramBytes = (kbts_un)DenseCount * sizeof(kbts__compiled_program) + (kbts_un)ProgramCount * ProgramIndexWidth;
-      Result->OutcomeCount = Builder.OutcomeCount;
-      Result->SymbolWidth = (kbts_u8)SymbolWidth;
-      Result->AllocationSize = AllocationSize;
-      Result->TestBytes = TestBytes;
-      Result->ClassifierBytes = sizeof(Result->GlyphPages) + PageCount * 256 * SymbolWidth;
-      Result->PredicateBytes = (kbts_un)Builder.PredicateCount * SymbolWords * sizeof(kbts_u32) + LocalPredicateBytes;
-      Result->BucketBytes = BucketBytes;
-      Result->OutcomeBytes = OutcomeBytes;
-      KBTS_MEMCPY(Result->GlyphPages, PageDirectory, sizeof(PageDirectory));
-      Result->GlyphSymbols = KBTS__POINTER_OFFSET(void, Result, GlyphOffset);
-      for(kbts_u32 I = 0; I < PageCount * 256; ++I)
-      {
-        if(SymbolWidth == 1) ((kbts_u8 *)Result->GlyphSymbols)[I] = (kbts_u8)Pages[I];
-        else ((kbts_u16 *)Result->GlyphSymbols)[I] = Pages[I];
-      }
-      Result->PredicateMasks = KBTS__POINTER_OFFSET(kbts_u32, Result, MaskOffset);
-      for(kbts_u32 I = 0; I < SymbolWords; ++I) Result->PredicateMasks[I] = (kbts_u32)-1;
-      for(kbts_u32 Predicate = 1; Predicate < Builder.PredicateCount; ++Predicate)
-        for(kbts_u32 Symbol = 1; Symbol < SymbolCount; ++Symbol)
-          if(kbts__ContextMember(Predicates, Predicate, Symbol, Representatives))
-            Result->PredicateMasks[(kbts_un)Predicate * SymbolWords + (Symbol >> 5)] |= 1u << (Symbol & 31);
-      Result->Programs = KBTS__POINTER_OFFSET(kbts__compiled_program, Result, ProgramOffset);
-      Result->Outcomes = KBTS__POINTER_OFFSET(kbts__compiled_outcome, Result, OutcomeOffset);
-      for(kbts_u32 P = 0; P < ProgramCount; ++P)
-      {
-        kbts__context_program *Temp = &Programs[P];
-        kbts__SetCompiledIndex(Result->ProgramIndices, ProgramIndexWidth, P, Temp->DenseIndex);
-        if(!Temp->First) continue;
-        kbts__compiled_program *Program = &Result->Programs[Temp->DenseIndex];
-        *Program = Temp->Program;
-        Program->Tests = KBTS__POINTER_OFFSET(void, Result, Temp->TestsOffset);
-        Program->Outcomes = KBTS__POINTER_OFFSET(void, Result, Temp->OutcomesOffset);
-        Program->Buckets = KBTS__POINTER_OFFSET(kbts__compiled_bucket, Result, Temp->BucketsOffset);
-        Program->SymbolBuckets = KBTS__POINTER_OFFSET(void, Result, Temp->SymbolsOffset);
-        if(Program->LocalPredicateCount)
-        {
-          Program->LocalMasks = KBTS__POINTER_OFFSET(void, Result, Temp->LocalMasksOffset);
-          kbts_u32 *Ids = KBTS__POINTER_OFFSET(kbts_u32, Result, Temp->PredicateIdsOffset);
-          Result->PredicateIds[Temp->DenseIndex] = Ids;
-          KBTS_MEMCPY(Ids, Temp->LocalPredicates, Program->LocalPredicateCount * sizeof(kbts_u32));
-          for(kbts_u32 Symbol = 0; Symbol < SymbolCount; ++Symbol)
-          {
-            kbts_u32 Mask = 1;
-            for(kbts_u32 Local = 1; Local < Program->LocalPredicateCount; ++Local)
-              Mask |= (kbts_u32)kbts__ContextMember(Predicates, Temp->LocalPredicates[Local], Symbol, Representatives) << Local;
-            kbts__SetCompiledIndex(Program->LocalMasks, Program->LocalMaskWidth, Symbol, Mask);
-          }
-        }
-        KBTS_MEMSET(Program->Outcomes, 0xff, Program->CandidateCount * Program->OutcomeWidth);
-        for(kbts__context_rule *Rule = Temp->First; Rule; Rule = Rule->Next) Result->Outcomes[Rule->OutcomeIndex] = Rule->Outcome;
-        kbts_u32 Candidate = 0, Bucket = 1;
-        for(kbts_u32 Symbol = 0; Symbol < SymbolCount; ++Symbol)
-        {
-          kbts_u32 First = Candidate;
-          for(kbts__context_rule *Rule = Temp->First; Rule; Rule = Rule->Next)
-          {
-            if(!kbts__ContextMember(Predicates, Rule->Tests[0].Predicate, Symbol, Representatives)) continue;
-            kbts__SetCompiledOutcomeIndex(Program, Candidate, Rule->OutcomeIndex);
-            for(kbts_u32 Stage = 1; Stage < Rule->TestCount; ++Stage)
-            {
-              kbts_un Index = (kbts_un)(Stage - 1) * Program->CandidateCount + Candidate;
-              kbts__compiled_wide_test Test = Rule->Tests[Stage];
-              if(Test.Probe < 0)
-                Program->Buckets[Bucket].Backtrack = KBTS__MAX(Program->Buckets[Bucket].Backtrack, (kbts_u32)-Test.Probe);
-              else
-                Program->Buckets[Bucket].Ahead = KBTS__MAX(Program->Buckets[Bucket].Ahead, (kbts_u32)Test.Probe);
-              if(Program->LocalPredicateCount)
-              {
-                kbts_u32 Local = 0;
-                while(Temp->LocalPredicates[Local] != Test.Predicate) ++Local;
-                Test.Predicate = Local;
-              }
-              if(Program->Wide) ((kbts__compiled_wide_test *)Program->Tests)[Index] = Test;
-              else
-              {
-                kbts__compiled_test *Packed = &((kbts__compiled_test *)Program->Tests)[Index];
-                Packed->Probe = (kbts_s8)Test.Probe;
-                Packed->Predicate = (kbts_u8)Test.Predicate;
-              }
-            }
-            ++Candidate;
-          }
-          if(Candidate != First)
-          {
-            kbts__SetCompiledBucketIndex(Program, Symbol, Bucket);
-            Program->Buckets[Bucket].First = First;
-            Program->Buckets[Bucket].Count = Candidate - First;
-            ++Bucket;
-          }
-        }
-      }
-    }
-  }
-  kbts__FreeArena(&Builder.Arena);
-  if(!Result) Font->Error = Builder.Error == 2 ? KBTS_LOAD_FONT_ERROR_INVALID_FONT : KBTS_LOAD_FONT_ERROR_OUT_OF_MEMORY;
-  return Result;
 }
-
-#undef kbts__ContextArray
