@@ -46,6 +46,7 @@ benchmark *args: build
 check:
     @just _test config_test
     @just _test kb_profile_test
+    @just _test kb_context_test
     @just _test document
     @just _test parser_test
     @just _test layout_test
@@ -78,6 +79,14 @@ shaping-bench isa="avx2" *args:
 shaping-profile isa="avx2" *args:
     @bash bench/shaping-build.sh profile {{quote(isa)}} {{args}}
 
+
+# RDTSCP stage/lookup scopes only; micro-helper hooks compile out.
+shaping-core isa="avx2" *args:
+    @bash bench/shaping-build.sh core {{quote(isa)}} {{args}}
 # Exact owned/upstream equality; HarfBuzz differences remain diagnostic.
 shaping-verify isa="avx2" *args:
     @bash bench/shaping-build.sh verify {{quote(isa)}} {{args}}
+
+# Deterministic multi-font/script differential diagnostics and JSONL report.
+shaping-stress isa="avx2" *args:
+    @bash bench/shaping-build.sh stress {{quote(isa)}} {{args}}
