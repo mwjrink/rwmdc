@@ -209,18 +209,71 @@ Do not compare sanitizer builds or overlapping GPU workloads with release timing
 `src/lib/kb/kb_text_shape.h` is an isolated performance fork of KB 2.25.
 `bench/vendor/kb_text_shape.h` preserves upstream commit
 `b07373ded395b61d33a290181b957994db8edcfb`. Neither is wired into the editor yet.
-HarfBuzz development files are required only for these benchmark commands:
+
+### Caller-owned KB memory
+
+KB takes ordinary writable pointers. The caller allocates and releases memory;
+KB has no heap calls, allocator callbacks, or public memory descriptor. Each
+placement function documents the size query its buffer must satisfy. Writable
+buffers must not overlap and must remain valid while their objects are in use.
+
+Font setup uses `kbts_LoadFont` to query native-blob sizes and, when needed,
+`kbts_PlaceBlob` to write that blob. Query `kbts_SizeOfCompiledFont` and
+`kbts_SizeOfFontCompileScratch`, then call `kbts_CompileFont`. The font borrows its
+native blob and compiled output; compilation scratch can be reused immediately.
+File loading belongs to the caller.
+
+For an already compiled font, query `kbts_SizeOfShapeConfig` and
+`kbts_SizeOfShapeConfigScratch`, then place the configuration into separate output
+and construction-scratch pointers. Font and config compilation optionally return
+the actual retained byte count through `OutputUsed`; their size queries are
+construction upper bounds, not resident-memory measurements.
+
+For direct shaping, the caller chooses a maximum **intermediate glyph count**:
+
+```c
+kbts_un output_bytes = kbts_SizeOfGlyphStorage(glyph_capacity);
+kbts_un scratch_bytes = kbts_SizeOfShapeScratchpad(config, glyph_capacity);
+/* Caller obtains output_memory[output_bytes] and scratch_memory[scratch_bytes].
+ * Check nonzero bounds and allocation success before placement. */
+kbts_glyph_storage storage;
+int initialized = kbts_InitializeGlyphStorage(&storage, output_memory,
+                                             glyph_capacity);
+kbts_shape_scratchpad *workspace =
+    kbts_PlaceShapeScratchpad(config, scratch_memory, glyph_capacity);
+/* Check initialized/workspace; push glyphs and call kbts_ShapeDirect.
+ * Reset storage to shape another input using the same buffers. */
+```
+
+The scratch query covers the complete operation within that glyph limit,
+including repeated shapes; it is not merely an initial bookkeeping size.
+Normalization and substitution can expand intermediate data, so input length
+is not itself a safe glyph limit. Exceeding the glyph limit returns a shaping
+error, never a heap fallback. Supplying fewer bytes than the published bound
+violates the pointer API's precondition.
+
+For automatic segmentation or manual runs, place a context into
+`kbts_SizeOfShapeContext()` bytes and push already compiled fonts. Query
+`kbts_SizeOfContextScratch(context, language, codepoint_capacity, glyph_capacity)`.
+Pass the resulting scratch pointer, a destination fitting
+`kbts_SizeOfGlyphStorage(glyph_capacity)`, and both semantic capacities to
+`kbts_ShapeBegin`. Re-query after changing the font set. Per-pass input,
+configuration caches, runs and runtime workspace live in scratch; the next begin
+invalidates previous output. Font and feature stack values remain context state.
+`kbts_ResetGlyphStorage` reuses direct storage without releasing backing memory.
+Release caller buffers only after their objects are no longer needed.
 
 ### Canonical correctness and performance suite
 
-`bench/shaping-suite.json` defines 104 named cases: English/Latin, Arabic,
-Hebrew, Hindi/Devanagari, Bengali and Thai; eight fonts; code, prose and
-combining-heavy text; and 64, 512, 4,096 and 65,536-byte input budgets.
-Arabic and Hebrew run RTL. Default features cover every length; the four
-override modes cover short and 4 KiB cases in the eight primary workloads.
-Inputs are presegmented script runs, not paragraph-bidi or layout tests.
+`bench/shaping-suite.json` defines 152 named cases: English/Latin, Arabic,
+Hebrew, Hindi/Devanagari, Bengali and Thai; eight fonts; code, prose, programming
+and text ligatures, literal Markdown source, and combining-heavy text; and 64,
+512, 4,096 and 65,536-byte input budgets. Arabic and Hebrew run RTL. Default
+features cover every length. Feature overrides cover short and 4 KiB cases;
+the six dedicated ligature/Markdown workloads exercise default/off/explicit.
+Inputs are presegmented script runs, not paragraph-bidi or Markdown layout tests.
 
-The driver uses Python 3's standard library, Clang, `pkg-config`, HarfBuzz
+The driver uses Python 3.9+'s standard library, Clang, `pkg-config`, HarfBuzz
 development files, the bundled JetBrains Mono font and seven Noto regular TTFs
 under `/usr/share/fonts/noto`. Change the Noto location with `--font-dir`.
 Missing selected fonts fail explicitly; `--allow-missing-fonts` is an explicit,
@@ -245,20 +298,38 @@ just shaping-suite profile --case arabic-default-65536 \
 ```
 
 `check` compares every output glyph's ID, source offset, two advances and two
-offsets over 16 changing variants and two passes per case. Owned/original KB
-differences fail; HarfBuzz equality is reported separately and is not a
-conformance assumption. Existing `shaping-verify` and `shaping-stress` add their
-broader feature, mutation and API coverage.
-The legacy mutation-stress CLI still stops at its pre-existing Arabic joiner
-warmup discrepancy (seed 1801614451, joiners ordinal 2). Its failure output is
-identical before and after the direct-child attachment fix; a canonical `check`
-pass is not a claim that the broader legacy stress suite passes.
+offsets over 16 changing variants and two passes per case. The 92 English/code,
+ligature, Markdown and combining cases require exact HarfBuzz equality
+(`harfbuzz_required: true`). The remaining 60 complex-script cases require
+original KB equality and retain HarfBuzz differences as diagnostics. The
+nonselected reference remains visible; neither glyph nor source differences
+are discarded. `bench` also gates equivalence against the case's selected reference.
+
+HarfBuzz uses `HB_BUFFER_CLUSTER_LEVEL_CHARACTERS` to match KB's per-character
+source provenance, rather than its default grapheme-cluster grouping. This
+setting is recorded in metadata. Glyph IDs and all four geometry fields remain
+exact comparisons; matching a short script sample is not general conformance.
+
+The owned normalizer preserves nominal mappings instead of substituting
+canonical singleton aliases (`;`/Greek question mark and `K`/Kelvin sign).
+It orders marks before recomposition, refreshes the composed base, respects
+canonical blocking, and ends fraction digit runs at intervening text. Original
+KB retains these bugs, so equality with it is not the Latin correctness oracle.
+The synthetic normalization regression also preserves missing-glyph fallback.
+The GSUB gate also honors explicit feature enables such as `frac=1` outside
+automatically detected ranges; per-character disables retain precedence.
+
+The legacy `shaping-verify` and `shaping-stress` tools retain broader feature,
+mutation and API diagnostics. Their original-reference mode can now reject
+intentional normalization corrections. Legacy stress also has a pre-existing
+Arabic joiner warmup discrepancy (seed 1801614451, joiners ordinal 2); a canonical
+`check` pass is not a claim that the broader legacy stress suite passes.
 
 `bench` runs all three engines serially, rotating engine order across three
 repetitions and reversing case order on alternating repetitions. Each invocation
-warms all 16 variants twice and records five batch means. Two passes avoid the
-first-measured-pass scratch growth observed with combining-heavy text after only
-one pass. Default iterations per
+warms all 16 variants twice and records five batch means. This warmup protocol
+is retained from the allocator-based baseline, where one pass left additional
+workspace growth in the first measured combining-heavy pass. Default iterations per
 batch are 1,000 / 200 / 30 / 1 for the four lengths; `--iterations`, `--batches`,
 `--repetitions` and `--warmup-passes` override them. Repeat `--isa` to measure
 both SSE2 and AVX2. The default selects AVX2 when available, otherwise SSE2;
@@ -268,9 +339,28 @@ Each new result directory contains the manifest/selection, source and font
 SHA-256 hashes, CPU/affinity and compiler metadata, exact build/run commands,
 raw stdout/stderr and incremental JSONL records. Final `results.json`,
 `summary.csv` and `comparisons.csv` retain phases, repeat distributions, setup,
-allocation deltas and checksum-qualified ratios. Unequal-output timings never
-become equivalent-work speedups. Batch-mean percentiles are not individual-shape
-latency percentiles. HarfBuzz allocation counts are unknown, not zero.
+memory usage and checksum-qualified ratios. Unequal-output timings never become
+equivalent-work speedups. Batch-mean percentiles are not individual-shape latency
+percentiles. HarfBuzz memory accounting is unknown, not zero.
+
+`RESULT` records use schema 3 (`CHECK` and `SAMPLE` remain schema 1). Their typed
+`memory` object distinguishes:
+
+- `caller_buffers`: owned KB reports native-blob bytes; compiled-font and
+  shape-config output bounds, actual retained bytes and construction-scratch
+  bounds; glyph-config bytes; and destination and shaping-scratch bounds.
+- `legacy_allocator_requests`: original KB's setup/warmup cumulative requests and
+  requested bytes, plus measured request/byte/free deltas. These are allocation
+  traffic, not retained memory.
+- `not_instrumented`: HarfBuzz; no invented zero values.
+
+The Linux benchmark caller obtains buffers from the library's size queries
+during setup, using virtual mappings without resizing during shaping. Its glyph
+limit is `max(256, codepoint_count * 8)`, a corpus policy rather than a theorem
+about arbitrary font expansion. Scratch size is calculated from that limit and
+the config, not guessed in bytes. Bounds are not RSS; accounting excludes the
+host adapter, comparison-output arrays and profile bookkeeping. CSV columns
+retain the buffer fields and prefix reference-allocator fields with `legacy_`.
 
 Timings include input preparation, shaping and consumer output copying; setup,
 file I/O and output hashing are outside those timers. Setup is engine
@@ -311,14 +401,15 @@ The two KB adapters use identical `-O3 -march=x86-64` flags; AVX2 adds only
 `-mavx2`. No AVX-512 requirement is introduced. The installed HarfBuzz library
 retains its own build and runtime dispatch. Benchmarks pin a permitted CPU, reuse
 objects and buffers, rotate engine order, and shape sixteen changing-input
-variants. Input, shaping, output, checksums and allocator calls are reported.
+variants. Input, shaping, output, checksums and typed memory usage are reported.
 Percentiles describe batch means, not individual input latency.
 
 Default means no redundant feature overrides. `off` disables `calt/liga/clig`;
 `explicit` enables them. `optional` enables `frac/ss01/cv01`, while `alternate`
-requests `aalt=2`. Verification compares the owned/upstream glyph IDs, byte source
-offsets, advances and offsets exactly. HarfBuzz differences remain diagnostic,
-including the existing semicolon/Greek-question-mark discrepancy.
+requests `aalt=2`. One-off verification defaults to original KB;
+`--reference harfbuzz` selects HarfBuzz instead. The selected reference gates
+glyph IDs, per-character byte sources, advances and offsets exactly, while the
+other reference is diagnostic. Use the canonical suite for its per-case policy.
 
 The stress suite requires the bundled font and Noto Sans/Serif, Arabic, Hebrew,
 Devanagari, Bengali and Thai regular TTFs. `--font-dir DIR` changes the default
@@ -410,17 +501,22 @@ The exact classifier remains font-global. Configurations accumulate ordered root
 per semantic stage and derive their reachable closure, admission rows and window
 bounds from required/default/optional/nested consumers. Stage boundaries use
 `u32`; a selected language is not restricted to 32 font features. Temporary proof
-storage, advertised fixed placement size and heap-resident size are distinct.
+storage, conservative construction bounds and packed resident size are distinct.
 
 Normalization, compiled/native GSUB, GPOS and output share one stable-slot
 `kbts_glyph` array. Deletion leaves tombstones; insertions recycle slots; logical
-links carry order. Only allocation growth moves surviving records. There is no
-prepared-glyph mirror, span translation or cold synchronization. On this target
-the record is 96 bytes, plus 8-byte links and 4-byte free-slot metadata.
+links carry order. Placement fixes the slot capacity; neither records nor metadata
+move afterward. There is no prepared-glyph mirror, span translation or cold
+synchronization. Links also carry the direct-child attachment index; the public
+glyph-storage sizing query includes records, links, free slots and alignment.
 
-Native and symbol-position index families are independently allocated for actual
-interval consumers. A bounded active-range probe—not total storage size—selects
-the small native path. Readable word extent is separate from retained capacity.
+Native and symbol-position indexes have independent workspace partitions. A
+bounded active-range probe—not total storage size—selects the small native path.
+Readable word extent is separate from reserved capacity.
+Consecutive GSUB feature operations share one indexed interval without merging
+baked stages or changing lookup order; every non-GSUB opcode remains a barrier.
+Bulk construction hoists interval masks and shares admission rules with live
+mutation updates, directly over the existing glyph records.
 Mutations repair live consumers, not completed native rows. Compiled matching
 retains its fixed-depth all-stage SIMD contract and original lookup priority.
 
@@ -434,15 +530,18 @@ Prepared runs retain **`u32 boundaries[n+1]`** and separate metadata. The sentin
 equals the prepared-input count, including empty input. Immutable sorted,
 last-wins feature sets retain explicit zero and nonbinary values. Preparation
 resolves shape/glyph configurations and carries exact font mapping in the existing
-input record; execution does not compile configurations. One context-owned
-scratchpad rebinds and reuses capacity across runs and `ShapeBegin` cycles.
+input record; execution does not compile configurations. Context execution uses
+the destination and scratch pointers supplied for the current `ShapeBegin` cycle.
 
 Fonts retain the 256-byte ASCII cmap and existing dense/sparse cmap layouts.
 Iterators borrow canonical records in logical order; the benchmark's final
 consumer projection remains explicit. This library is still isolated from the
 editor's renderer.
 
-### Simplification cutover: work and ownership
+### Historical simplification cutover: work and ownership
+
+This section predates the caller-owned memory interface above. Allocation counts,
+heap ownership and placement signatures below describe that earlier revision.
 
 The implementation and acceptance ledger are in
 [`docs/plans/shaping-simplification.md`](docs/plans/shaping-simplification.md).
@@ -479,9 +578,10 @@ can still grow the workspace. No overall speed or memory reduction is claimed.
 
 The completion audit found and fixed an arena-growth failure that lost ownership
 of earlier allocations. Public fail-each input/preparation/execution scenarios
-now preserve sticky errors and balance destruction. `kbts_PlaceShapeConfig`
-also now requires a fifth `MemorySize` argument; short buffers are rejected
-before writes. The active caller is migrated; the upstream vendor is unchanged.
+preserved sticky errors and balanced destruction. At that revision,
+`kbts_PlaceShapeConfig` gained a fifth `MemorySize` argument and rejected short
+buffers before writes. The current API instead takes bounded region descriptors;
+the upstream vendor remains unchanged.
 
 Coverage now discovers normalization alternatives only when nominal mapping is
 missing. The single-font decomposition count above removes the pre-audit doubling.

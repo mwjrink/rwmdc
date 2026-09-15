@@ -3,4 +3,5 @@ omp*
 examples/*
 tests/*
 bench/*
-*.spv
+docs/*
+assets/**/*.spv

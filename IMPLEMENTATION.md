@@ -39,30 +39,49 @@ Font construction establishes actual blob extents and immutable lookup/subtable
 descriptors, including extension type/direction and filtering data. Font-owned
 glyph-class tables preserve 16-bit attachment classes and the distinction between
 Unicode fallback initialization and post-substitution classes without GDEF.
-Native blob placement produces complete serialized bytes before compilation;
-owning constructors retain independent blob storage, while manual native loading
-borrows it.
+`kbts_LoadFont` queries native-blob requirements and `kbts_PlaceBlob` writes the
+blob when conversion is needed. The font borrows that blob and separately placed
+compiled data. KB performs no file I/O or heap allocation.
 
 Context compilation groups coverage/class sources, retains logical rules and
 ordered dispatch through fusion, then emits one interned resident cache. The
 classifier remains font-global. Per-lookup summaries retain only facts consumed
 by configuration construction; configurations derive their reachable closure and
 window bounds from selected required/default/optional/nested roots. Construction
-scratch, advertised placement capacity and heap-resident size are distinct.
-Public `kbts_PlaceShapeConfig` takes the available `MemorySize` and rejects a
-null, invalid or undersized request before writing; callers must pass the
-advertised construction capacity, not merely the resident payload size.
+scratch, conservative construction bounds and packed resident size are distinct.
+`kbts_PlaceShapeConfig` takes separate raw output/scratch pointers sized by
+`kbts_SizeOfShapeConfig` and `kbts_SizeOfShapeConfigScratch`. It packs resident
+data into output and optionally returns its actual byte count; construction
+scratch can be reused immediately.
 
 Effective feature sets are immutable, sorted and last-wins, including explicit
 zero and nonbinary values. Preparation resolves configurations and retains exact
 font mapping in the existing input records; execution does not compile configs.
+Explicit GSUB enables bypass automatic glyph-feature masks on the selected
+source range; disabled lookup bits still take precedence. Native, contextual
+and fused actions use the same eligibility gate.
 Nominal coverage does not eagerly enumerate normalization parents. Missing-only
 coverage resolves aliases/compositions in one parent walk, preserving singleton
 priority; no second parent-list representation or general grapheme cache remains.
-One context-owned scratchpad rebinds and reuses capacity across runs. Reset and
-destruction cannot dereference storage from a previous run.
-Allocation failure leaves arena block links intact. Context errors remain sticky;
-destruction releases earlier blocks, and recovery uses a fresh context.
+Normalization orders decomposed marks before selective recomposition and checks
+canonical blocking. Each successful composition invalidates the cached parent
+set, so subsequent marks cannot overwrite accents already absorbed by the base.
+Canonical singleton parents are missing-glyph fallbacks only, not replacements
+for supported nominal mappings. Fraction digit runs end at intervening text.
+Contexts bind caller-supplied destination and scratch pointers at `ShapeBegin`;
+previous output is invalidated there. Per-pass inputs, runs and configuration
+caches share the supplied scratch lifetime; the font and feature stacks remain
+context state. Input/glyph limits are explicit, not allocator byte budgets.
+
+Writable buffers are ordinary pointers, not public memory descriptors.
+Declarations identify the size query each buffer must satisfy. Bounds include
+alignment and construction workspace; callers keep referenced buffers stable
+and nonoverlapping. There are no allocator callbacks or library-owned
+destructors. `kbts_SizeOfShapeScratchpad(config, glyph_capacity)` covers the
+whole operation and repeated reuse within the intermediate glyph limit.
+`kbts_SizeOfContextScratch` additionally covers per-pass preparation using the
+font set, language and input/glyph limits. Font/config placement reports actual
+retained output bytes separately from its conservative construction bounds.
 
 The canonical glyph array uses stable slots, logical links and a free-slot list.
 There is no prepared-glyph mirror. Native and symbol index families have separate
@@ -278,12 +297,12 @@ The owned changes preserve the exercised glyph/source/position outputs:
   links and a recycled-slot stack. Ref minus one directly names the record;
   deletion leaves a tombstone, and reordering changes links rather than records.
   Native action frames, GPOS attachments/buckets, and context windows retain
-  surviving identities. Borrowed surviving records remain at the same address
-  until backing allocation growth. Fixed buffers never fall back to allocation;
-  full clears retain capacity without scanning the array.
+  surviving identities. Placement fixes the canonical slot capacity and partitions
+  records, links and free slots once; neither records nor metadata move afterward.
+  Full clears retain capacity without scanning the array.
   `kb_glyph_storage.inc`, `kb_glyph_actions.inc`, `kb_execute_op.inc`, and
   `kb_script_shape.inc` separate storage, native actions, phase execution and
-  script reordering. x64 records are 104 bytes; no GSUB row representation remains.
+  script reordering. x64 records are 96 bytes; no GSUB row representation remains.
 - Reserve for the maximum bounded nonbinary lookup expansion, not merely the
   number of feature overrides. This fixes an ASan-reproduced upstream overflow.
 
@@ -395,9 +414,20 @@ Immutable default/possible glyph-to-stage rows belong to the configuration;
 whole-stage exclusions belong to the glyph configuration. Runtime only combines
 these rows with live occurrences. Native and symbol rows clear lazily on first
 admission. Native-only plans allocate no symbol-position matrix; short native-only
-operations scan their live range instead of building indexes.
+intervals scan their live range instead of building indexes.
 Hot admission rows use the actual merged-stage word count, not the conservative
 lookup-count upper bound reserved by the caller-owned sizing API.
+
+Consecutive GSUB feature opcodes execute one indexed interval. The interpreter
+advances both opcode and baked-feature cursors, without merging plan stages or
+changing lookup order. Every non-GSUB opcode ends the interval; script operations,
+cluster/range changes and public returns do not inherit live indexes.
+
+Initial construction hoists interval masks and native-stage masks per stage word,
+with a separate symbol pass when needed. Ordinary-inline admission-word and
+row-update helpers are shared with incremental mutation admission. No translated
+glyph representation, new workspace, persistent cache or forced-inlining policy
+is introduced.
 
 Same-length writes, insertion and deletion repair affected slots locally. No
 structural mutation triggers a full-run index rebuild. Forward/reverse native
@@ -423,15 +453,15 @@ search without changing `NO_BREAK` interval propagation, RTL compensation or
 attachment-time offset semantics. GPOS is nonstructural; slot reuse clears the
 links and a later positioning pass reconstructs them from canonical parents.
 
-Config sizing includes immutable plans and proof workspace. Scratch growth is
-checked and uses the existing allocator, including fixed arenas; destruction
-releases the reusable indexes. The canonical output is borrowed through existing
+Config sizing includes immutable plans and proof workspace. Runtime indexes
+suballocate within bounded caller scratch; reusable internal workspace does not
+obtain memory from the heap. The canonical output is borrowed through existing
 iterators, with no producer packing pass. The benchmark's consumer projection
 remains separately timed.
 The font caches the immutable maximum matcher window once during compilation.
-Derived index/cmap allocations align typed data while retaining the original
-allocator pointer; self-owned configurations and scratchpads likewise free their
-original allocation rather than an aligned interior pointer.
+Typed data is aligned within supplied regions, including when the caller's
+base address or preexisting prefix is unaligned. Descriptors report consumed
+prefixes rather than pretending the entire maximum buffer is resident.
 
 ### Prepared input and font mapping
 
@@ -451,23 +481,22 @@ with optional features and cannot be disabled by an explicit zero override.
 
 Every font has a 256-byte ASCII cmap. Dense, valid format-12 maps with at least
 4,096 groups can additionally use deduplicated 32-codepoint pages, bounded by
-the selected raw cmap's size; sparse maps keep range lookup. Page storage and its
-allocator are font-owned, while language/script plans remain config-owned.
+the selected raw cmap's size; sparse maps keep range lookup. Page storage
+is caller-owned persistent data, while language/script plans remain config-owned.
 The raw selected cmap is retained. Compilation validates ordering and exact
-glyph IDs, and allocation failures release temporary/resident storage.
+glyph IDs; construction scratch is reclaimed on success and failure.
 Format-2 lead-byte aliases and format-4 zero-entry delta handling are corrected.
 The scalar UTF-8 decoder is retained because the classification-LUT experiment
 was slower. No experimental decoder mode remains.
 
 ### Compilation and scratch lifetime
 
-`kb_compiled_context.h` defines internal shared types. Compilation owns one
-aligned persistent allocation and releases temporary arena storage. Constructors
-compile automatically; manually loaded/placed blobs require `kbts_CompileFont`
-before any shape-config sizing or construction. Compilation is idempotent after
-success and must finish before sharing the font. `kbts_FreeFont` releases the
-compiled-context and optional cmap caches through their retained allocators,
-independently of raw blob ownership.
+`kb_compiled_context.h` defines internal shared types. Compilation packs resident
+data into caller output memory and does not retain construction scratch.
+After loading/placing a native blob, query `kbts_SizeOfCompiledFont` and
+`kbts_SizeOfFontCompileScratch`, then call `kbts_CompileFont` before shape-config
+sizing or construction. Compilation must finish before sharing the font. The
+caller owns the lifetime of the blob and compiled caches; no destructor is needed.
 
 Scratchpad sizing includes the largest contextual window plus SIMD guards.
 Config-time Indic virama localization also needs compiled scratch state: sizing
@@ -476,16 +505,16 @@ the not-yet-filled config tail, then reuses it for permanent matrices. A context
 `locl` fixture reproduces the former null-scratch failure under ASan/UBSan.
 `kb_context_test.c` also covers priority/blockers, class-zero boundaries, SIMD
 bucket tails, wide probes/predicates, ignored marks, fusion guards, sparse native
-indices, empty contextual dispatch, and mask-width boundaries. Allocation failure
-injection includes every raw-cache, proof and final-repacking allocation. Tests
-exercise final resident caches, not just intermediate compiler output, and run in
-`just check` without HarfBuzz.
+indices, empty contextual dispatch, and mask-width boundaries. Capacity tests
+exercise caller prefixes, canaries, transactional construction failures, distinct
+region lifetimes and workspace reuse. They test final resident caches, not merely
+intermediate compiler output, and run in `just check` without HarfBuzz.
 Stream regressions additionally cover writes distinct from read extents,
 self/cross-lookup dependencies, blockers, overwritten compound-output interiors,
 resizing followed by dependent actions, nested inserted outputs, ignored-mark
-ligature metadata and reverse read-after-write behavior. A real-font sanitized smoke
-run checked allocation/growth failure, fixed arenas, warm reuse, empty GSUB/GPOS
-tables and balanced destruction.
+ligature metadata and reverse read-after-write behavior. Earlier allocator-based
+sanitized smoke results describe the historical interface, not the bounded-memory
+contract or a requirement for library-owned allocation/destruction.
 
 Initial compiled-LUT alternating AVX2 4 KiB controls measured 410.7–410.9 µs shaping core before
 compilation versus 360.8–364.7 µs after; total input/core/output fell from
@@ -523,24 +552,29 @@ The verifier exercises five feature modes, ASCII including controls/NUL,
 Unicode/combining cases, bucket-boundary lengths and deterministic repeated edits.
 Adapters accept explicit script/language/direction. `shaping-stress` adds an
 eight-font, six-script matrix with correctly tagged runs and UTF-8-safe edits.
-The default matrix covers 9,760 cases and checks exact owned/upstream output.
+The default stress matrix covers 9,760 cases and checks exact owned/upstream
+output; intentional normalization corrections now differ from that reference.
 It does not test paragraph bidi, font fallback or every possible shaping context.
 
 The JSONL report records inputs before execution, font identities, run properties,
 feature modes, output/coverage summaries and complete representative mismatches.
-HarfBuzz differences are overlapping positional diagnostics, not correctness
-verdicts or a suppression list. Missing nominal non-joiner glyphs are reported
-separately from missing joiners. The reference adapter's nonbinary mode uses
-caller-owned storage to avoid upstream's size-calculation defect; its header is
-unchanged. Existing HarfBuzz behavior differences remain deferred.
+Stress-report HarfBuzz differences are overlapping positional diagnostics, not
+correctness verdicts or a suppression list. Missing nominal non-joiner glyphs
+are reported separately from missing joiners. The reference adapter's nonbinary
+mode uses caller-owned storage to avoid upstream's size-calculation defect;
+its header is unchanged. The canonical suite instead requires exact HarfBuzz
+output for English/code, ligatures, literal Markdown and combining-heavy Latin.
+All six consumer fields are compared. HarfBuzz character-level clusters align
+its source provenance with KB rather than conflating bytes with grapheme groups.
+Other complex-script cases retain original-reference gates and HB diagnostics.
 
 File mapping/hash-prefaulting and font/config creation are reported independently
 from warm shaping; these are not cold-disk measurements. No disk LUT persistence
 or exhaustive all-font-shapes test is implemented in this pass.
 
-### Canonical cutover verification and remaining gate
+### Historical canonical cutover verification and remaining gate
 
-The current cutover passes `just check`, 555 exact owned/upstream cases on each
+Before the normalization corrections, that cutover passed `just check`, 555 exact owned/upstream cases on each
 of SSE2 and AVX2, and 9,760 multi-font/script stress cases under SSE2 ASan/UBSan.
 Additional sanitized smokes cover prepared empty/grapheme-safe runs, covered
 Hangul/Lao behavior, range mutation/reuse/error unwind and dense-cmap ownership.

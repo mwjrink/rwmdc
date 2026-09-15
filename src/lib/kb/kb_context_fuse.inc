@@ -512,7 +512,7 @@ static kbts_u32 kbts__ContextLocalMask(const kbts__context_model *Model,
 }
 
 static kbts__compiled_contexts *kbts__PackCompiledContexts(kbts__context_builder *Builder,
-    kbts__context_model *Model, kbts_allocator_function *Allocator, void *AllocatorData,
+    kbts__context_model *Model, kbts__memory *Persistent,
     kbts_u32 FusionCount, kbts_u32 FusedOutcomes, kbts_u32 FusedChains)
 {
   kbts__packed_program *Layout = kbts__ContextArray(Builder, kbts__packed_program, Model->DenseCount);
@@ -663,14 +663,12 @@ static kbts__compiled_contexts *kbts__PackCompiledContexts(kbts__context_builder
   kbts_un AllocationSize = Total;
   kbts__ContextReserve(Builder, &AllocationSize, KBTS_ALIGNOF(kbts__compiled_contexts) - 1, 1, 1);
   if(Builder->Error) return 0;
-  void *Allocation = kbts__AllocatorAllocate(Allocator, AllocatorData, AllocationSize);
+  void *Allocation = kbts__MemoryPush(Persistent, AllocationSize, 1);
   if(!Allocation) {Builder->Error = 1; return 0;}
   kbts__compiled_contexts *Result = KBTS__ALIGN_POINTER(kbts__compiled_contexts, Allocation, KBTS_ALIGNOF(kbts__compiled_contexts));
   KBTS_MEMSET(Result, 0, Total);
-  Result->Allocator = Allocator;
-  Result->AllocatorData = AllocatorData;
-  Result->BaseAllocation = Allocation;
-  Result->AllocationSize = AllocationSize;
+  Result->AllocationSize = (kbts_un)((kbts_uptr)Result - (kbts_uptr)Allocation) + Total;
+  Persistent->Used -= AllocationSize - Result->AllocationSize;
   Result->GlyphCount = Builder->GlyphCount;
   Result->SymbolCount = Model->SymbolCount;
   Result->SymbolWordCount = Model->SymbolWordCount;
@@ -760,22 +758,21 @@ static kbts__compiled_contexts *kbts__PackCompiledContexts(kbts__context_builder
 }
 
 static kbts__compiled_contexts *kbts__CompileFontData(kbts_font *Font,
-    kbts_allocator_function *Allocator, void *AllocatorData,
-    kbts_allocator_function *ScratchAllocator, void *ScratchAllocatorData)
+    kbts__memory *Persistent, kbts__memory *Scratch)
 {
   kbts__context_builder Builder = KBTS__ZERO;
   kbts__context_model Model = KBTS__ZERO;
-  Builder.Arena.Allocator = ScratchAllocator;
-  Builder.Arena.AllocatorData = ScratchAllocatorData;
+  kbts_un ScratchMark = Scratch->Used;
+  Builder.Arena.Memory = Scratch;
   kbts_u32 FusionCount = 0, FusedOutcomes = 0, FusedChains = 0;
   kbts__compiled_contexts *Result = 0;
   kbts__CollectContexts(&Builder, &Model, Font);
   if(!Builder.Error) kbts__FuseContexts(&Builder, &Model, &FusionCount, &FusedOutcomes, &FusedChains);
   if(!Builder.Error) kbts__AnalyzeLookups(&Builder, &Model);
   if(!Builder.Error) kbts__AnalyzeExpansion(&Builder, &Model);
-  if(!Builder.Error) Result = kbts__PackCompiledContexts(&Builder, &Model, Allocator, AllocatorData,
+  if(!Builder.Error) Result = kbts__PackCompiledContexts(&Builder, &Model, Persistent,
       FusionCount, FusedOutcomes, FusedChains);
-  kbts__FreeArena(&Builder.Arena);
+  Scratch->Used = ScratchMark;
   if(!Result) Font->Error = Builder.Error == 2 ? KBTS_LOAD_FONT_ERROR_INVALID_FONT : KBTS_LOAD_FONT_ERROR_OUT_OF_MEMORY;
   return Result;
 }

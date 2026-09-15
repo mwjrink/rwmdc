@@ -27,1499 +27,59 @@
 #define KB_PROFILE_ONLY(...)
 #endif
 
-/*  kb_text_shape - v2.25 - text segmentation and shaping
-    by Jimmy Lefevre
-
-    SECURITY
-      This library provides NO SECURITY GUARANTEE whatsoever.
-      DO NOT use it on untrusted font files.
-
-    WHAT DOES THIS LIBRARY DO?
-      Before computers had monitors, the main way of inspecting the output of a command
-      was to print it out on real paper. When monitors appeared, most computer graphics
-      were text-based, meaning the display was arranged in a hardcoded grid in which each
-      cell could hold one of several hardcoded characters. As simple as it is, this kind
-      of text handling is sufficient for displaying almost any document written in the
-      Latin alphabet and a few other writing systems that happen to fit particularly well
-      on a grid, like Chinese and Japanese.
-      Handwritten Latin characters do not all have the same width, however. As computers
-      became more powerful, glyphs started having different widths to fit better together.
-      After that came kerning, which allows for packing glyphs closer together in pairs.
-      This is, of course, N-squared in the number of glyphs you want to handle, but this
-      is fine for the Latin alphabet, because there really aren't that many glyphs.
-      This is where TrueType stops: it is a good and simple, format for displaying text
-      using the Latin alphabet or writing systems that happen to work similarly to it.
-      All is well and good.
-
-      What about the rest of the writing systems?
-
-      Arabic is a cursive writing system. Much like when we write cursive ourselves, the
-      letters need to join together visually. Furthermore, a given letter in Arabic has
-      a different appearance depending on whether it is the first letter of a word, the
-      last letter of a word, or in the middle, and Unicode does not differenciate between
-      any of these. Also, Arabic features a beautiful set of marks that attach to letters,
-      much like accents in the Latin alphabet. You would usually want to align these marks
-      in some way depending on which other marks are present in the immediate vicinity.
-
-      Indic scripts, like Devanagari, have even less in common with Latin than Arabic does.
-
-      To try to support the plethora of writing systems out there, OpenType was introduced.
-      OpenType fonts contain rules that allow modifying a sequence of glyphs through pattern
-      matching. These rules can modify both the content of the sequence (ligatures replace
-      multiple glyphs with a single one, for instance) and its visual appearance by e.g.
-      attaching marks to letters. This is the meat of text shaping.
-
-      OpenType rules have limitations, though. They don't work with mixed direction text,
-      because, when going from one text direction to the other, there is a visual jump that
-      breaks pattern matching.
-
-      To illustrate, the logical string "0123456789" might have a display order like this:
-
-      01234  765  89
-      ^LTR   ^RTL ^LTR continued
-
-      As you can see, there is a visual jump from 4 all the way to 5, and similarly from
-      7 to 8.
-      This kind of discontinuity cannot work with OpenType rules, which want to work with
-      "neighboring" glyphs in the visual sense.
-
-      OpenType rules don't work with mixed script text, either. They are designed to work with
-      a single writing system, and ideally a single language. A typographic rule that is correct
-      in writing system A might not be in writing system B, and vice versa.
-
-      So, for all of these reasons, we need to split our text before sending it to the shaper.
-      This is what the text processing pipeline looks like:
-
-       Your text       A        Text runs with         B       Sequence of glyphs      C
-       (Probably ------------> uniform direction ------------> ready to rasterize ------------> Pixels
-        UTF-8)                    and script
-
-      We call arrow A text segmentation, arrow B text shaping, and arrow C rasterization.
-      This library does A and B.
-
-    FEATURE OVERVIEW
-      This library provides:
-      - Unicode segmentation
-          LTR/RTL breaking
-          Script breaking
-          Line breaking
-          Word breaking
-          Grapheme breaking
-      - OpenType text shaping
-          Open and parse TTF and OTF fonts
-          Apply OpenType features such as ligatures and contextual typographic rules
-          All OpenType shapers are supported, which means most languages in the world are supported
-            (see LANGUAGE_SUPPORT for known non-supported cases)
-
-    COMPILING & LINKING
-      This library uses declare-anywhere, so it will not compile as C89/VC6 C.
-
-      In one C/C++ file that #includes this file, do this:
-        #define KB_TEXT_SHAPE_IMPLEMENTATION
-      before the #include. That will create the implementation in that file.
-
-      If you also do this:
-        #define KB_TEXT_SHAPE_STATIC
-      then all functions will be declared as static.
-
-      If you do this:
-        #define KB_TEXT_SHAPE_NO_CRT
-      then we do not use the C runtime library.
-      In that case, these functions are compiled out:
-        kbts_ShapePushFontFromFile()
-        kbts_FontFromFile()
-      Additionally, there are some functions that you will want to #define yourself:
-        KBTS_MEMSET
-          defaults to memset otherwise.
-        KBTS_MEMCPY
-          defaults to memcpy otherwise.
-        KBTS_MEMMOVE
-          defaults to memmove otherwise.
-      You can redefine the default allocator by redefining these:
-        KBTS_MALLOC(AllocatorData, Size)
-          defaults to 0 if KB_TEXT_SHAPE_NO_CRT is defined,
-          defaults to malloc(Size) otherwise.
-        KBTS_FREE(AllocatorData, Pointer)
-          defaults to a no-op if KB_TEXT_SHAPE_NO_CRT is defined,
-          defaults to free(Pointer) otherwise.
-      In other words,
-      if you do not redefine the default allocator, and you #define KB_TEXT_SHAPE_NO_CRT,
-      then the default allocator always returns 0.
-
-    EXAMPLES
-      Basic
-        kbts_shape_context *Context = kbts_CreateShapeContext(0, 0);
-        kbts_ShapePushFontFromFile(Context, "myfont.ttf", 0);
-
-        kbts_ShapeBegin(Context, KBTS_DIRECTION_DONT_KNOW, KBTS_LANGUAGE_DONT_KNOW);
-        kbts_ShapeUtf8(Context, "Let's shape something!", sizeof("Let's shape something!") - 1, KBTS_USER_ID_GENERATION_MODE_CODEPOINT_INDEX);
-        kbts_ShapeEnd(Context);
-
-        // Layout runs naively left to right.
-        kbts_run Run;
-        int CursorX = 0, CursorY = 0;
-        while(kbts_ShapeRun(Context, &Run))
-        {
-          kbts_glyph *Glyph;
-          while(kbts_GlyphIteratorNext(&Run.Glyphs, &Glyph))
-          {
-            int GlyphX = CursorX + Glyph->OffsetX;
-            int GlyphY = CursorY + Glyph->OffsetY;
-
-            DisplayGlyph(Glyph->Id, GlyphX, GlyphY);
-
-            CursorX += Glyph->AdvanceX;
-            CursorY += Glyph->AdvanceY;
-          }
-        }
-
-      Font collections
-        void *FontData;
-        int FontSize;
-        kbts_font Font = kbts_FontFromFile("myfonts.ttc", 0, 0, 0, &FontData, &FontSize);
-
-        kbts_ShapePushFont(Context, &Font);
-
-        int FontCount = kbts_FontCount(FontData, FontSize);
-        for(int FontIndex = 1; FontIndex < FontCount; ++FontIndex)
-        {
-          kbts_ShapePushFontFromMemory(Context, FontData, FontSize, FontIndex);
-        }
-
-      Feature control
-        kbts_ShapeBegin(Context, KBTS_DIRECTION_DONT_KNOW, KBTS_LANGUAGE_DONT_KNOW);
-
-        kbts_ShapePushFeature(Context, KBTS_FEATURE_TAG_kern, 0);
-        kbts_ShapeUtf8(Context, "Without kerning", sizeof("Without kerning") - 1, KBTS_USER_ID_GENERATION_MODE_CODEPOINT_INDEX);
-        kbts_ShapePopFeature(Context, KBTS_FEATURE_TAG_kern);
-
-        kbts_ShapeUtf8(Context, "With kerning", sizeof("With kerning") - 1, KBTS_USER_ID_GENERATION_MODE_CODEPOINT_INDEX);
-
-        kbts_ShapeEnd(Context);
-
-      @Todo: Write more examples
-
-    API
-      The shaping API is broken down into two parts: the context API and the direct API.
-
-      The context API is the higher-level API of the two and is meant to be the default
-      API.
-      It exposes an immediate-mode, procedural interface somewhat inspired by Dear Imgui
-      and covers most of the functionality present in the library. It notably includes
-      automatic segmentation into paragraphs and runs, shaping, and font fallback.
-
-      The direct API, in contrast, is all of the tools you can use to directly manage and
-      manipulate shaping data. With it, you can interact directly with the lower-level
-      parts of the library, giving you very granular control. It is also very explicit
-      about memory. As a result, it is also a lot more verbose than the context API.
-
-      The library also contains several miscellaneous utility functions that are not
-      obviously part of any of the two aforementioned APIs.
-
-
-      In the documentation below, all functions (as well as some structs/enums) are
-      marked with "search tags".
-      As an example, this hypothetical function:
-
-        int kbts_Foo(int X);
-
-      Will be presented like this:
-
-        :kbts_Foo
-        :Foo
-        int kbts_Foo(int X);
-
-      Allowing you to easily search for its documentation by searching for either ":Foo"
-      or ":kbts_Foo".
-
-      MEMORY MANAGEMENT
-        kb_text_shape takes manual memory management seriously, and tries to give the user as much
-        control over memory as possible.
-
-        Whenever it is possible for you to pass your own buffer into a function, we allow it.
-        Whenever it is not possible, we allow specifying a custom allocator.
-        An allocator is simply a function that manages memory:
-
-          :kbts_allocator_function
-          :allocator_function
-          typedef void kbts_allocator_function(void *Data, kbts_allocator_op *Op);
-            [Data] the custom data pointer you passed in along with your allocator.
-            [Op]   the memory request. It is of this type:
-
-              :kbts_allocator_op
-              :allocator_op
-              typedef struct kbts_allocator_op
-              {
-                kbts_allocator_op_kind Kind;
-
-                union
-                {
-                  kbts_allocator_op_allocate Allocate;
-                  kbts_allocator_op_free Free;
-                };
-              } kbts_allocator_op;
-
-            And the possible op kinds are:
-              KBTS_ALLOCATOR_OP_KIND_ALLOCATE
-              KBTS_ALLOCATOR_OP_KIND_FREE
-
-            ALLOCATE expects you to fill in Op->Allocate.Pointer.
-              The allocation does not need to be aligned.
-            FREE expects you to free Op->Free.Pointer.
-
-      THE CONTEXT API
-        CONTEXT:CREATION
-          :kbts_SizeOfShapeContext
-          :SizeOfShapeContext
-          int kbts_SizeOfShapeContext()
-            Gives the ordinary context-placement buffer size, including alignment slack.
-            A fixed-memory context also needs space for its working allocations; this
-            size alone is not a bound for shaping arbitrary input.
-
-          :kbts_PlaceShapeContext2
-          :PlaceShapeContext2
-          kbts_shape_context *kbts_PlaceShapeContext2(kbts_allocator_function *Allocator, void *AllocatorData, void *Memory, kbts_shape_context_flags Flags)
-            Places a context at Memory and initializes it.
-            [Allocator] will be used for subsequent allocations.
-
-            [Flags] can be any combination of:
-              KBTS_SHAPE_CONTEXT_FLAG_NONE
-                No-op; default behavior.
-              KBTS_SHAPE_CONTEXT_FLAG_FONT_PRIORITY_BOTTOM_TO_TOP = (1 << 0)
-                The default priority order for the font stack is top-to-bottom, i.e.
-                fonts that were pushed later have higher priority.
-                If this flag is set, then this priority is reversed: fonts that are
-                pushed earlier, and are thus closer to the bottom of the stack, have
-                higher priority.
-                For more details on the font stack, see CONTEXT:FONT HANDLING.
-
-          :kbts_PlaceShapeContext
-          :PlaceShapeContext
-          kbts_shape_context *kbts_PlaceShapeContext(kbts_allocator_function *Allocator, void *AllocatorData, void *Memory)
-            Equivalent to calling kbts_PlaceShapeContext2 with Flags = KBTS_SHAPE_CONTEXT_FLAG_NONE.
-
-          :kbts_PlaceShapeContextFixedMemory2
-          :PlaceShapeContextFixedMemory2
-          kbts_shape_context *kbts_PlaceShapeContextFixedMemory(void *Memory, int Size, kbts_shape_context_flags Flags)
-            Places a context at Memory and initializes it.
-            This context will only use the [Size] bytes located at [Memory] for its allocations.
-            No allocation falls back to the heap. Runtime errors remain sticky;
-            kbts_ShapeBegin does not reset an errored context.
-
-            For more details on [Flags], see :kbts_PlaceShapeContext2.
-
-          :kbts_PlaceShapeContextFixedMemory
-          :PlaceShapeContextFixedMemory
-          kbts_shape_context *kbts_PlaceShapeContextFixedMemory(void *Memory, int Size)
-            Equivalent to calling kbts_PlaceShapeContextFixedMemory2 with
-            Flags = KBTS_SHAPE_CONTEXT_FLAG_NONE.
-
-          :kbts_CreateShapeContext2
-          :CreateShapeContext2
-          kbts_shape_context *kbts_CreateShapeContext2(kbts_allocator_function *Allocator, void *AllocatorData, kbts_shape_context_flags Flags)
-            Allocates a context using [Allocator] and initializes it.
-
-            For more information on [Flags], see :kbts_PlaceShapeContext2.
-
-          :kbts_CreateShapeContext
-          :CreateShapeContext
-          kbts_shape_context *kbts_CreateShapeContext(kbts_allocator_function *Allocator, void *AllocatorData)
-            Equivalent to calling kbts_CreateShapeContext2 with Flags = KBTS_SHAPE_CONTEXT_FLAG_NONE.
-
-          :kbts_DestroyShapeContext
-          :DestroyShapeContext
-          void kbts_DestroyShapeContext(kbts_shape_context *Context)
-            Frees all context memory.
-            If the Context was allocated by kbts_CreateShapeContext, then it is also freed.
-
-        CONTEXT:FONT HANDLING
-          The context is capable of managing multiple fonts through a font stack.
-          The font stack will hold references to all fonts in use by the context. Whenever
-          you try to shape some text, the context will check to see if it is supported by
-          the font at the top of the stack. If it is not, it will try the next font down,
-          and so on, until all fonts have been tried. As such, you should push your fallback
-          fonts first, and your preferred fonts last.
-
-          :kbts_ShapePushFontFromFile
-          :ShapePushFontFromFile
-          kbts_font *kbts_ShapePushFontFromFile(kbts_shape_context *Context, const char *FileName, int FontIndex)
-            (This function is not available if KB_TEXT_SHAPE_NO_CRT is defined.)
-
-            Opens the file corresponding to [FileName], parses the [FontIndex]th font
-            within it, and, if successful, pushes the result onto the stack.
-
-            A [return value] of 0 could mean that the stack is out of space (see
-            KBTS_CONTEXT_MAX_FONT_COUNT), that the file could not be found or opened,
-            or that the parse has failed.
-
-          :kbts_ShapePushFontFromMemory
-          :ShapePushFontFromMemory
-          kbts_font *kbts_ShapePushFontFromMemory(kbts_shape_context *Context, void *Memory, int Size, int FontIndex)
-            Parses the [FontIndex]th font in [Memory] and pushes the result to the font
-            stack.
-
-            A [return value] of 0 could mean that the stack is out of space (see
-            KBTS_CONTEXT_MAX_FONT_COUNT) or that the font could not be parsed.
-
-          :kbts_ShapePushFont
-          :ShapePushFont
-          kbts_font *kbts_ShapePushFont(kbts_shape_context *Context, kbts_font *Font)
-            Pushes the pre-parsed [Font] onto the stack.
-
-            A [return value] of 0 means that the stack has run out of space (see
-            KBTS_CONTEXT_MAX_FONT_COUNT).
-
-          :kbts_ShapePopFont
-          :ShapePopFont
-          kbts_font *kbts_ShapePopFont(kbts_shape_context *Context)
-            Removes the topmost font from the stack.
-
-            A [return value] of 0 means that there is no font to remove.
-            A non-null [return value] is the original font pointer that was pushed.
-
-            If the context allocated the font itself, using kbts_ShapePushFontFromFile or
-            kbts_ShapePushFontFromMemory, then the pointer is still returned, but it points to
-            freed memory.
-
-        CONTEXT:SHAPING
-          :kbts_ShapeBegin
-          :ShapeBegin
-          void kbts_ShapeBegin(kbts_shape_context *Context, kbts_direction ParagraphDirection, kbts_language Language)
-            Begins a shaping pass.
-
-            [ParagraphDirection] is sometimes called the "document direction". It can significantly
-            affect segmentation. Bidirectionality in text works like a stack: the default direction
-            is at the bottom of the stack, and, sometimes, text can _temporarily_ take a different
-            direction. In the end, though, it will always go back to the document direction.
-
-            To illustrate, a period followed by a space ". " typically ends up resetting the current
-            direction to the paragraph direction. This means that, if my paragraph direction is
-            left-to-right, and I am shaping Arabic text, then each Arabic sentence will be
-            right-to-left, but the sentences themselves will be sequenced left-to-right. If
-            [ParagraphDirection] is KBTS_DIRECTION_DONT_KNOW, then the context takes the first
-            directional hint in the text as the paragraph direction.
-
-            [Language] is used to select which font rules are used. Knowing this allows access to
-            language-specific typographical features. If [Language] is KBTS_LANGUAGE_DONT_KNOW, then
-            the default, language-agnostic font rules are used.
-
-          :kbts_ShapeEnd
-          :ShapeEnd
-          void kbts_ShapeEnd(kbts_shape_context *Context)
-            Ends a shaping pass.
-
-            This means you are done providing input to the context, and, in turn, that
-            you can start getting results from it with kbts_ShapeRun().
-
-          :kbts_ShapeRun
-          :ShapeRun
-          int kbts_ShapeRun(kbts_shape_context *Context, kbts_run *Run)
-            Once you've called kbts_ShapeEnd, you can get the resulting runs by calling this
-            function repeatedly.
-
-            !!! CAREFUL !!! Memory is reused from one run to the next, so you cannot
-            trivially store [Run] and reuse it later. Instead, you should traverse the
-            glyphs using the iterator provided in Run.Glyphs and extract whatever data
-            you need before calling kbts_ShapeRun again.
-
-            The [return value] is non-zero if a run was shaped.
-            When there is no text left to shape, the [return value] is 0.
-
-              kbts_ShapeEnd(Context);
-              kbts_run Run;
-              while(kbts_ShapeRun(Context, &Run))
-              {
-                // Handle Run
-              }
-
-          :kbts_ShapePushFeature
-          :ShapePushFeature
-          void kbts_ShapePushFeature(kbts_shape_context *Context, kbts_u32 FeatureTag, int Value)
-            The context has a feature stack that allows you to manipulate font features hierarchically.
-            When you give text to the context, it will apply all feature overrides that are on the
-            stack at the time.
-            If two feature overrides use the same tag, then only the latest one, i.e. the one higher
-            in the stack, is applied.
-            Explicit zero and nonbinary selectors are retained. The stack persists
-            across kbts_ShapeBegin calls. Push/pop affects subsequent input only;
-            previously supplied text retains its immutable effective feature set.
-
-          :kbts_ShapePopFeature
-          :ShapePopFeature
-          int kbts_ShapePopFeature(kbts_shape_context *Context, kbts_u32 FeatureTag)
-            Removes the latest feature override with tag [FeatureTag].
-            The [return value] is non-zero if an override was found and removed, 0 if not.
-
-          :kbts_ShapeCodepointWithUserId
-          :ShapeCodepointWithUserId
-          void kbts_ShapeCodepointWithUserId(kbts_shape_context *Context, int Codepoint, int UserId)
-            Inputs a codepoint to shape.
-            [Codepoint] is a Unicode codepoint.
-            [UserId] is an arbitrary identifier that you will get back when reading the results.
-            This is often some kind of index into the input text so that you can perform hit-testing.
-            If an automatic codepoint index is fine for you, consider using kbts_ShapeCodepoint.
-
-          :kbts_ShapeCodepoint
-          :ShapeCodepoint
-          void kbts_ShapeCodepoint(kbts_shape_context *Context, int Codepoint)
-            Inputs a codepoint to shape.
-
-            The codepoint's user ID will be an implicit codepoint index assigned by the
-            context.
-
-          :kbts_ShapeUtf32WithUserId
-          :ShapeUtf32WithUserId
-          void kbts_ShapeUtf32WithUserId(kbts_shape_context *Context,
-                                         int *Utf32, int Length,
-                                         int UserId, int UserIdIncrement);
-            Inputs a block of UTF-32 text to shape.
-
-            User IDs for each codepoint start at [UserId] and increment by [UserIdIncrement]
-            for every codepoint.
-
-          :kbts_ShapeUtf32
-          :ShapeUtf32
-          void kbts_ShapeUtf32(kbts_shape_context *Context, int *Utf32, int Length)
-            Same as kbts_ShapeUtf8WithUserId, but using the context's implicit user ID counter.
-
-          :kbts_ShapeUtf8WithUserId
-          :ShapeUtf8WithUserId
-          void kbts_ShapeUtf8WithUserId(kbts_shape_context *Context,
-                                        const char *Utf8, int Length,
-                                        int UserId, kbts_user_id_generation_mode UserIdGenerationMode);
-            Inputs a block of UTF-8 text to shape.
-
-            User IDs for the corresponding codepoints start at [UserId].
-            If [UserIdGenerationMode] is KBTS_USER_ID_GENERATION_MODE_CODEPOINT_INDEX,
-            each codepoint will increment the user ID by 1.
-            If [UserIdGenerationMode] is KBTS_USER_ID_GENERATION_MODE_SOURCE_INDEX,
-            each codepoint will increment the user ID by the length of its encoding in
-            UTF-8.
-
-          :kbts_ShapeUtf8
-          :ShapeUtf8
-          void kbts_ShapeUtf8(kbts_shape_context *Context,
-                              const char *Utf8, int Length,
-                              kbts_user_id_generation_mode UserIdGenerationMode)
-            Same as kbts_ShapeUtf8WithUserId, but using the context's implicit user ID
-            counter.
-
-            User IDs for the corresponding codepoints start at the context's implicit
-            user ID counter.
-            If [UserIdGenerationMode] is KBTS_USER_ID_GENERATION_MODE_CODEPOINT_INDEX,
-            each codepoint will increment the user ID by 1.
-            If [UserIdGenerationMode] is KBTS_USER_ID_GENERATION_MODE_SOURCE_INDEX,
-            each codepoint will increment the user ID by the length of its encoding in
-            bytes in UTF-8.
-
-          :kbts_ShapeCurrentCodepointsIterator
-          :ShapeCurrentCodepointsIterator
-          kbts_shape_codepoint_iterator kbts_ShapeCurrentCodepointsIterator(kbts_shape_context *Context)
-            The [return value] is an iterator that goes over all of the codepoints fed to
-            [Context] so far.
-
-            These codepoints are tagged with user IDs, segmentation info and more. See
-            the definition of kbts_shape_codepoint for details.
-
-            !!! WARNING !!!
-              Remember that segmentation is buffered, so, until you call kbts_ShapeEnd,
-              some codepoints might not be completely filled in yet!
-
-            Call kbts_ShapeCodepointIteratorNext repeatedly to loop through the
-            corresponding codepoints.
-  
-          :kbts_ShapeCodepointIteratorIsValid
-          :ShapeCodepointIteratorIsValid
-          int kbts_ShapeCodepointIteratorIsValid(kbts_shape_codepoint_iterator *It)
-            The [return value] is non-zero if there is still a codepoint to iterate,
-            zero if not.
-
-          :kbts_ShapeCodepointIteratorNext
-          :ShapeCodepointIteratorNext
-          int kbts_ShapeCodepointIteratorNext(kbts_shape_codepoint_iterator *It, kbts_shape_codepoint *Codepoint, int *CodepointIndex)
-            Gets the next codepoint from the context [It] was initialized from and writes
-            it to [Codepoint].
-
-            If [CodepointIndex] is non-zero, then it is filled with [Codepoint]'s index.
-
-            The [return value] is non-zero if a codepoint was found, 0 if not.
-
-          :kbts_ShapeGetShapeCodepoint
-          :ShapeGetShapeCodepoint
-          int kbts_ShapeGetShapeCodepoint(kbts_shape_context *Context, int CodepointIndex, kbts_shape_codepoint *Codepoint)
-            Gets the [CodepointIndex]th codepoint from [Context] and writes it to
-            [Codepoint].
-
-            If you are reading glyphs back from the context, then you can use the
-            UserIdOrCodepointIndex field of kbts_glyph here.
-
-            !!! WARNING !!!
-            When using the context API, UserIdOrCodepointIndex will _always_ be a
-            codepoint index. To get your original user ID, you need to do:
-
-              kbts_shape_codepoint ShapeCodepoint;
-              kbts_ShapeGetShapeCodepoint(Context, Glyph->UserIdOrCodepointIndex, &ShapeCodepoint);
-              int MyUserId = ShapeCodepoint.UserId;
-
-            The [return value] is non-zero if [CodepointIndex] is in-bounds, 0 if not.
-
-        CONTEXT:MISCELLANEOUS
-          :kbts_ShapeError
-          :ShapeError
-          kbts_shape_error kbts_ShapeError(kbts_shape_context *Context);
-            Get the first error that occurred on [Context].
-
-            Once a context is tagged with an error, most operations on it will do nothing.
-            Obviously, you can always destroy it.
-
-          :kbts_ShapeManualBreak
-          :ShapeManualBreak
-          void kbts_ShapeManualBreak(kbts_shape_context *Context);
-            Forces a run break at the current position in the Context.
-
-            This will flush the current segmentation state just like an end-of-text would,
-            and restart it as if it was at a start-of-text.
-
-            This will also generate a KBTS_BREAK_FLAG_MANUAL at the current position.
-
-            You do not need to be in manual break mode for this function to work.
-
-          :kbts_ShapeBeginManualRuns
-          :ShapeBeginManualRuns
-          void kbts_ShapeBeginManualRuns(kbts_shape_context *Context);
-            Disables the context's automatic segmentation, and enters a manual break mode.
-
-          :kbts_ShapeNextManualRun
-          :ShapeNextManualRun
-          void kbts_ShapeNextManualRun(kbts_shape_context *Context, kbts_direction Direction, kbts_script Script);
-            Add a run break at the current place in the input stream.
-
-            Since the context's segmentation is disabled, it cannot know which direction
-            and script to use, so you need to provide them with [Direction] and [Script].
-
-            Outside of manual break mode, this function is a no-op.
-
-          :kbts_ShapeEndManualRuns
-          :ShapeEndManualRuns
-          void kbts_ShapeEndManualRuns(kbts_shape_context *Context);
-            Ends manual break mode and re-enables the context's automatic segmentation.
-
-            Note that this will force natural break barriers too, just like an end-of-text
-            would.
-
-            Outside of manual break mode, this function is a no-op.
-
-      DIRECT SHAPING API
-        When trying to shape things yourself, there are four main pieces of state you will need:
-        - Font data (kbts_font)
-        - A shaping configuration (kbts_shape_config)
-            A shaping configuration holds a bunch of precomputed data for a given combination of
-            font, script and language.
-            You can think of it as a pipeline state in a modern graphics API.
-            In practice, you are only ever shaping text with a single active configuration.
-        - Glyph storage (kbts_glyph_storage)
-            Glyph storage fills two roles: it allocates and holds glyph data, and it also manages
-            a set of active glyphs.
-            The active glyph set part is used by the library. As a user, you only need to care
-            about the memory allocation part.
-        - Scratch memory (kbts_shape_scratchpad)
-            Unfortunately, shaping can have a very unpredictable memory footprint, so all shaping
-            operations require some amount of scratch space that we cannot compute beforehand.
-
-        The central function to call is this:
-
-          :kbts_ShapeDirect
-          :ShapeDirect
-          kbts_shape_error kbts_ShapeDirect(kbts_shape_scratchpad *Scratchpad, kbts_glyph_storage *Storage,
-                                            kbts_direction RunDirection, kbts_glyph_iterator *Output)
-            [RunDirection] is the direction of the specific run being shaped.
-            If the [return value] is KBTS_SHAPE_ERROR_NONE, then the shaping operation
-            completed successfully.
-
-            Shaping output is returned in [Output]. You can go through the resulting glyphs
-            with kbts_GlyphIteratorNext.
-
-            Note that kbts_ShapeDirect does not care about the paragraph direction.
-            Glyphs are always returned in left-to-right order. In other words, RTL runs
-            are flipped so that visual order is consistent.
-
-        The rest of the direct API is more or less about preparing the data you need to call
-        kbts_ShapeDirect.
-
-        DIRECT:FONT HANDLING
-          :kbts_FontCount
-          :FontCount
-          int kbts_FontCount(void *Data, int Size)
-            Parses the beginning of the file and returns the number of fonts contained
-            within the file data.
-
-            While most font files contain single fonts, font collections contain
-            several. This function will return 0 if [Data] is invalid, 1 if it represents
-            a single font, and possibly more if it represents a collection.
-
-            For all functions that require a font index, passing 0 is always safe no
-            matter the kind of file.
-
-          :kbts_FontFromFile
-          :FontFromFile
-          kbts_font kbts_FontFromFile(const char *FileName, int FontIndex,
-                                      kbts_allocator_function *Allocator, void *AllocatorData,
-                                      void **FileData, int *FileSize)
-            (This function is not available if KB_TEXT_SHAPE_NO_CRT is defined.)
-            Opens the file at [FileName], parses it and returns the [FontIndex]th font.
-            You can call kbts_FontIsValid to check if the [return value] is usable.
-
-            If [FileData] is non-zero, it is filled with a pointer to the file's contents.
-            This pointer is allocated using [Allocator]. If [FileData] is 0, it is freed
-            before the function returns.
-            If [FileSize] is non-zero, it is filled with the size of the file's contents.
-
-            If [FontIndex] is out of range, the [return value] is invalid.
-
-          :kbts_FontFromMemory
-          :FontFromMemory
-          kbts_font kbts_FontFromMemory(void *FileData, int FileSize, int FontIndex,
-                                        kbts_allocator_function *Allocator, void *AllocatorData)
-            Parses the [FontIndex]th font in [FileData], retaining an owned copy of the
-            shaping blob even when the input is already a native blob. Input bytes may
-            be released after this call. Also compiles immutable lookup/filter views,
-            GDEF glyph classes and contextual matching data using [Allocator].
-            kbts_FontFromFile and kbts_ShapePushFontFromMemory do this automatically too.
-            You can call kbts_FontIsValid to check if the [return value] is usable.
-
-          :kbts_FontIsValid
-          :FontIsValid
-          int kbts_FontIsValid(kbts_font *Font)
-            Returns whether a font is usable.
-
-          :kbts_LoadFont
-          :LoadFont
-          kbts_load_font_error kbts_LoadFont(kbts_font *Font, kbts_load_font_state *State,
-                                             void *FontData, int FontDataSize, int FontIndex,
-                                             int *ScratchSize, int *OutputSize)
-            Parses the [FontIndex]th font in [FontData] and puts the result into [Font] and [State].
-
-            [State] is initialized by this function and retains the actual supplied byte
-            extent. Keep the input bytes and returned state unchanged until placement.
-
-            If the data represents a TrueType/OpenType font, we need to extract the data
-            we need and create some additional data structures. In this case, the [return
-            value] is KBTS_LOAD_FONT_ERROR_NEED_TO_CREATE_BLOB, and [ScratchSize] and
-            [OutputSize] are filled with the amount of memory we need to create our
-            blob. You can then initialize this blob with kbts_PlaceBlob.
-
-            An aligned native kbts blob is borrowed and immediately usable for font
-            queries; its bytes must outlive [Font]. An unaligned native blob requests
-            placement into aligned caller storage instead. Call kbts_CompileFont
-            before creating shape configs or shaping.
-
-            Any value of [FontIndex] less than kbts_FontCount(FontData, FontDataSize) is
-            acceptable.
-
-            If we could not find any useful font data, the [return value] is
-            KBTS_LOAD_FONT_ERROR_INVALID_FONT.
-
-          :kbts_PlaceBlob
-          :PlaceBlob
-          kbts_load_font_error kbts_PlaceBlob(kbts_font *Font, kbts_load_font_state *State,
-                                              void *ScratchMemory, void *OutputMemory)
-            Creates a kbts blob from font data, and places it in [OutputMemory].
-            [Font] is the resulting font.
-            [State] is the state you passed into kbts_LoadFont.
-            [ScratchMemory] needs to be as big as the [ScratchSize] returned by kbts_LoadFont.
-            Scratch includes byte-swap tracking and temporary descriptor/matrix-build
-            workspace; none is retained after return. You can then free this buffer.
-            [OutputMemory] needs to be as big as the [OutputSize] returned by kbts_LoadFont.
-            This caller-owned buffer must remain alive until after kbts_FreeFont.
-            Call kbts_CompileFont after successful placement and before creating shape configs.
-
-          :kbts_CompileFont
-          :CompileFont
-          kbts_load_font_error kbts_CompileFont(kbts_font *Font,
-                                                kbts_allocator_function *Allocator, void *AllocatorData)
-            Compiles contextual rules and proven local rewrites into font-owned runtime data.
-            Required after manually loading or placing a blob. Complete this call before
-            sharing [Font] between threads. Repeated calls on an already compiled font succeed
-            without allocating. A null [Allocator] selects the default allocator.
-            Returns KBTS_LOAD_FONT_ERROR_NONE on success; invalid data or allocation failure
-            sets [Font]'s error and returns the corresponding load error.
-            Temporary compilation allocations are released before returning. Persistent data
-            retains its allocator and is released by kbts_FreeFont, independently of blob ownership.
-
-          :kbts_FreeFont
-          :FreeFont
-          void kbts_FreeFont(kbts_font *Font)
-            Releases compiled runtime data through its retained allocator, and releases the
-            blob if [Font] owns it (for instance, when returned by kbts_FontFromFile).
-            Caller-owned blob storage is not freed. Destroy dependent configs, scratchpads
-            and glyph storage before freeing the font.
-
-          :kbts_GetFontInfo2
-          :GetFontInfo2
-          void kbts_GetFontInfo2(kbts_font *Font, kbts_font_info2 *Info)
-            Writes a bunch of useful metadata about [Font] into [Info].
-
-            Before calling this function, you must fill out [Info].Size to be
-            sizeof([Info]).
-
-            [Info] can be one of several types:
-            - kbts_font_info2 describes styling, name and licensing information.
-              We use a simplified representation for font weight and width that is fine for
-              classic font selection, e.g. "I need a bold font". OpenType fonts may feature
-              finer-grained metrics, and we currently do not expose/support those.
-            - kbts_font_info2_1 also includes metrics and bounding box information.
-            - kbts_font_info2_2 also includes capital height.
-
-            :kbts_font_style_flags
-            :font_style_flags
-            [Info]->StyleFlags can be:
-              KBTS_FONT_STYLE_FLAG_NONE (no useful style flags have been found)
-              KBTS_FONT_STYLE_FLAG_REGULAR
-              KBTS_FONT_STYLE_FLAG_BOLD
-              KBTS_FONT_STYLE_FLAG_ITALIC
-            A given font can be bold and italic at the same time, but probably not regular
-            and bold and probably not regular and italic.
-
-            If [Font] is not a valid font, or some information could not be found in the
-            font, then the respective members will be zeroed (except Size).
-
-          :kbts_GetFontInfo
-          :GetFontInfo
-          void kbts_GetFontInfo(kbts_font *Font, kbts_font_info *Info)
-            Equivalent to calling kbts_GetFontInfo2 with an Info struct of type
-            kbts_font_info2.
-
-        DIRECT:SHAPE CONFIG
-          [Font] must have successfully completed kbts_CompileFont before any shape-config
-          size, placement or creation call. The allocating font constructors do this automatically.
-
-          :kbts_SizeOfShapeConfig
-          :SizeOfShapeConfig
-          int kbts_SizeOfShapeConfig(kbts_font *Font, kbts_script Script, kbts_language Language)
-            Returns a conservative construction-peak buffer capacity, including alignment slack.
-            This is not the heap-owned resident size. Sizing executes no shaping lookups.
-            Returns zero when the font/configuration is invalid or the capacity cannot fit int.
-
-          :kbts_PlaceShapeConfig
-          :PlaceShapeConfig
-          kbts_shape_config *kbts_PlaceShapeConfig(kbts_font *Font, kbts_script Script, kbts_language Language,
-                                                   void *Memory, kbts_un MemorySize)
-            Writes a shape config into [Memory] and returns a pointer to it.
-            [MemorySize] must be at least kbts_SizeOfShapeConfig([Font], [Script], [Language]).
-            Null, invalid and undersized requests return null without writing to [Memory].
-            Construction uses only this buffer, including any contextual localization probe.
-            No heap fallback is performed.
-
-          :kbts_CreateShapeConfig
-          :CreateShapeConfig
-          kbts_shape_config *kbts_CreateShapeConfig(kbts_font *Font, kbts_script Script, kbts_language Language,
-                                                    kbts_allocator_function *Allocator, void *AllocatorData)
-            Allocates and initializes a shape config.
-            Uses temporary construction storage, then retains only the final configuration
-            tables with their actual stage layout. Temporary storage is released before return.
-
-          :kbts_DestroyShapeConfig
-          :DestroyShapeConfig
-          void kbts_DestroyShapeConfig(kbts_shape_config *Config)
-            If [Config] was allocated in kbts_CreateShapeConfig, frees all of [Config]'s data.
-            Otherwise, nothing is done.
-
-        DIRECT:SHAPE SCRATCHPAD
-          :kbts_SizeOfShapeScratchpad
-          :SizeOfShapeScratchpad
-          kbts_un kbts_SizeOfShapeScratchpad(kbts_shape_config *Config)
-            Returns how large a scratchpad for [Config] will be initially.
-            This is the size of the initial memory footprint, used to hold basic bookkeeping data.
-            A scratchpad can always dynamically allocate memory during shaping.
-
-          :kbts_PlaceShapeScratchpad
-          :PlaceShapeScratchpad
-          kbts_shape_scratchpad *kbts_PlaceShapeScratchpad(kbts_shape_config *Config,
-                                                           void *Memory,
-                                                           kbts_allocator_function *Allocator, void *AllocatorData)
-            Initializes a scratchpad for [Config] at [Memory], and returns a pointer to it.
-            [Memory] should be kbts_SizeOfShapeScratchpad(Config) big.
-            [Allocator] will be used by the scratchpad during shaping.
-
-            If [Memory] is null, then the [return value] is null.
-
-          :kbts_PlaceShapeScratchpadFixedMemory
-          :PlaceShapeScratchpadFixedMemory
-          kbts_shape_scratchpad *kbts_PlaceShapeScratchpadFixedMemory(kbts_shape_config *Config,
-                                                                      void *Memory, int Size)
-            Same as kbts_PlaceShapeScratchpad, except the buffer [Memory] of size [Size]
-            is used for both initialization and dynamic allocation.
-
-            If [Size] is not large enough, then the [return value] is null.
-
-          :kbts_CreateShapeScratchpad
-          :CreateShapeScratchpad
-          kbts_shape_scratchpad *kbts_CreateShapeScratchpad(kbts_shape_config *Config,
-                                                            kbts_allocator_function *Allocator, void *AllocatorData)
-            Same as kbts_PlaceShapeScratchpad, except [Allocator] is used both for
-            initialization and for dynamic allocation.
-
-            If [Allocator] is null, then the default allocator is used.
-
-          :kbts_DestroyShapeScratchpad
-          :DestroyShapeScratchpad
-          void kbts_DestroyShapeScratchpad(kbts_shape_scratchpad *Scratchpad)
-            Frees all memory associated with [Scratchpad].
-
-            If [Scratchpad] itself was allocated with kbts_CreateShapeScratchpad, then
-            it will also free itself.
-
-        DIRECT:GLYPH STORAGE
-          kbts_glyph_storage is a public struct:
-
-            :kbts_glyph_storage
-            :glyph_storage
-          Glyphs[0..Count) contains stable slots, including tombstones (Ref == 0).
-          LiveCount counts live records; Ref - 1 directly names its slot. Links
-          stores logical next/previous order. First and End select the logical
-          active range; End is exclusive and may be KBTS__GLYPH_END.
-          Insertions, deletions and reordering never move surviving records.
-          Only backing-allocation growth invalidates their borrowed pointers.
-
-          A zeroed kbts_glyph_storage will auto-initialize itself when you try to use it.
-
-          Storage requires an allocator, defaulting to KBTS_MALLOC and KBTS_FREE.
-          Set Allocator and AllocatorData before first use, or call
-          kbts_InitializeGlyphStorage(). Growth preserves live glyph identities
-          but invalidates borrowed record pointers.
-
-          :kbts_InitializeGlyphStorage
-          :InitializeGlyphStorage
-          int kbts_InitializeGlyphStorage(kbts_glyph_storage *Storage, kbts_allocator_function *Allocator, void *AllocatorData)
-            Initializes [Storage] to use [Allocator] and [AllocatorData].
-
-            This sets [Storage]->Allocator and [Storage]->AllocatorData and
-            initializes empty-range sentinels and allocation state.
-
-            The [return value] is non-zero if [Storage] is non-null.
-
-          :kbts_InitializeGlyphStorageFixedMemory
-          :InitializeGlyphStorageFixedMemory
-          int kbts_InitializeGlyphStorageFixedMemory(kbts_glyph_storage *Storage, void *Memory, int MemorySize)
-            Initializes [Storage] to use a fixed-size buffer of size [MemorySize] located at [Memory].
-            If [Storage] needs more memory than [MemorySize], allocations will fail.
-
-            The [return value] is non-zero if [Storage] and [Memory] are non-null
-            and the buffer can hold at least one glyph, its identity-map entries,
-            and alignment padding. The fixed buffer never falls back to allocation.
-
-          :kbts_PushGlyph
-          :PushGlyph
-          kbts_glyph *kbts_PushGlyph(kbts_glyph_storage *Storage,
-                                     kbts_font *Font, int Codepoint, kbts_glyph_config *Config, int UserId)
-            Adds a glyph to [Storage]'s active glyph set and returns a pointer to it.
-            This pointer, and pointers yielded by glyph iterators, are borrowed
-            until the next storage mutation. Insertion, compaction, reordering,
-            clearing, or shaping may invalidate them.
-
-            [Font] is used to initialize the glyph's glyph ID. It is assumed that [Font] is
-            the same as the kbts_shape_config's Font field passed into kbts_ShapeDirect.
-
-            [Config] is the glyph's configuration and needs to stay live until kbts_ShapeDirect
-            completes. See DIRECT:GLYPH CONFIG for more details.
-
-            [UserId] is a user-provided unique identifier that you can get back once shaping
-            is done.
-
-            The [return value] might be zero if [Storage]'s allocator fails.
-
-          :kbts_ClearActiveGlyphs
-          :ClearActiveGlyphs
-          void kbts_ClearActiveGlyphs(kbts_glyph_storage *Storage)
-            Clears [Storage]'s active glyph set.
-            This does not free any memory; rather, it puts the active glyphs in a free list.
-
-          :kbts_FreeAllGlyphs
-          :FreeAllGlyphs
-          void kbts_FreeAllGlyphs(kbts_glyph_storage *Storage)
-            Frees all memory allocated by [Storage].
-
-          :kbts_CodepointToGlyph
-          :CodepointToGlyph
-          kbts_glyph kbts_CodepointToGlyph(kbts_font *Font, int Codepoint, kbts_glyph_config *Config, int UserId)
-            You can create glyphs without a glyph storage at all with this function.
-
-          :kbts_CodepointToGlyphId
-          :CodepointToGlyphId
-          int kbts_CodepointToGlyphId(kbts_font *Font, int Codepoint)
-            Gets the glyph ID corresponding to [Codepoint] from [Font].
-            A glyph ID of 0 means that the codepoint is not present in the font.
-            Note that this is not thorough enough to be a good font coverage test!
-            See OTHER:FONT COVERAGE TEST for this.
-
-          :kbts_ActiveGlyphIterator
-          :ActiveGlyphIterator
-          kbts_glyph_iterator kbts_ActiveGlyphIterator(kbts_glyph_storage *Storage)
-            Returns an iterator to traverse [Storage]'s active glyph set.
-
-            See OTHER:GLYPH ITERATION for more details on glyph iterators.
-
-        DIRECT:GLYPH CONFIG
-          The shaper figures out most of the work it needs to do based on the writing system
-          it is shaping.
-
-          However, some fonts support optional, toggleable features, like "make this text
-          smallcaps". For things like this, you will want to create a kbts_glyph_config.
-          You can then pass it to glyph creation functions or write it to the Config field
-          of a kbts_glyph.
-
-          A kbts_glyph_config can hold any number of feature overrides. A feature override
-          is a feature tag and a value. Most of the time, you only care whether the value
-          is 0 or 1, but a few features actually care about the exact value. (You can think
-          of a feature that is like "when I am enabled, change this letter to one of these
-          alternatives". In that case, the value you provide in the feature override is used
-          as a one-based index into the array of alternatives.)
-
-          :kbts_SizeOfGlyphConfig
-          :SizeOfGlyphConfig
-          int kbts_SizeOfGlyphConfig(kbts_shape_config *ShapeConfig, kbts_feature_override *Overrides, int OverrideCount)
-            Returns the buffer size needed to hold a kbts_glyph_config that describes [Overrides].
-            This size can vary a lot depending on the kind of feature overrides you specify.
-            Overrides with values of 0 or 1 are stored in a compact format, while other values
-            will be stored explicitly.
-
-          :kbts_PlaceGlyphConfig
-          :PlaceGlyphConfig
-          kbts_glyph_config *kbts_PlaceGlyphConfig(kbts_shape_config *ShapeConfig, kbts_feature_override *Overrides, int OverrideCount, void *Memory)
-            Writes a kbts_glyph_config that describes [Overrides] into [Memory], and returns a
-            pointer to it.
-            The kbts_glyph_config uses its own representation for overrides, so you can modify
-            [Overrides] once this function returns.
-
-          :kbts_CreateGlyphConfig
-          :CreateGlyphConfig
-          kbts_glyph_config *kbts_CreateGlyphConfig(kbts_shape_config *ShapeConfig, kbts_feature_override *Overrides, int OverrideCount, kbts_allocator_function *Allocator, void *AllocatorData)
-            Allocates a kbts_glyph_config that describes [Overrides] and returns a pointer to
-            it.
-            The kbts_glyph_config uses its own representation for overrides, so you can modify
-            [Overrides] once this function returns.
-
-          :kbts_DestroyGlyphConfig
-          :DestroyGlyphConfig
-          void kbts_DestroyGlyphConfig(kbts_glyph_config *Config)
-            If [Config] was allocated in kbts_CreateGlyphConfig, frees all of its data.
-            Otherwise, does nothing.
-
-        DIRECT:SEGMENTATION
-          kbts_break_state is the central struct used for segmentation. It contains all of the state
-          needed to perform fixed-memory segmentation of text.
-
-          :kbts_BreakBegin
-          :BreakBegin
-          void kbts_BreakBegin(kbts_break_state *State,
-                               kbts_direction ParagraphDirection,
-                               kbts_japanese_line_break_style JapaneseLineBreakStyle,
-                               kbts_break_config_flags ConfigFlags)
-            Initializes [State] for segmentation.
-
-            [ParagraphDirection] is the top-level flow direction of your document or layout.
-            If [ParagraphDirection] is KBTS_DIRECTION_DONT_KNOW, then [State]'s
-            ParagraphDirection will be initialized to the first direction we find
-            while segmenting.
-
-            :kbts_japanese_line_break_style
-            :japanese_line_break_style
-            [JapaneseLineBreakStyle] can be one of the following:
-
-              KBTS_JAPANESE_LINE_BREAK_STYLE_STRICT
-              KBTS_JAPANESE_LINE_BREAK_STYLE_NORMAL
-              KBTS_JAPANESE_LINE_BREAK_STYLE_LOOSE
-
-            Japanese text contains "kinsoku" characters, around which breaking a line is
-            forbidden. Exactly which characters are "kinsoku" or not depends on the context:
-
-            - Strict style has the largest amount of kinsoku characters, which leads to
-              longer lines.
-                The Unicode standard does not define what strict style is used for.
-                Supposedly, it is used for anything that does not fall into the other
-                two categories of text.
-
-            - Loose style has the smallest amount of kinsoku characters, which leads
-              to smaller lines.
-                According to the Unicode standard, loose style is used for newspapers.
-                I assume it is also used for any other narrow column format.
-
-            - Normal style is somewhere in the middle.
-                According to the Unicode standard, normal style is used for books and
-                documents.
-
-            Note that, while the Unicode standard mentions all three of these styles, it
-            does not mention any differences between the normal and loose styles. As such,
-            normal and loose styles currently behave the same.
-
-            :kbts_kbts_break_config_flags
-            :kbts_break_config_flags
-            [ConfigFlags] can be a combination of the following:
-
-              KBTS_BREAK_CONFIG_FLAG_END_OF_TEXT_GENERATES_HARD_LINE_BREAK
-                The Unicode standard specifies that the end of a text should generate a
-                hard line break. However, this is an awkward rule to uphold in practical
-                contexts, because it makes the case where the text ends in a newline
-                ambiguous. So, by default, we disable it.
-
-                Without this flag (default behavior):
-                  <start of text>\n<end of text> generates a hard line break at position 1
-                  <start of text>A<end of text> generates no hard line break
-
-                With this flag (Unicode behavior):
-                  <start of text>\n<end of text> generates a hard line break at position 1
-                  <start of text>A<end of text> generates a hard line break at position 1
-
-          :kbts_BreakAddCodepoint
-          :BreakAddCodepoint
-          void kbts_BreakAddCodepoint(kbts_break_state *State, int Codepoint, int PositionIncrement, int EndOfText)
-            Feeds [Codepoint] to [State].
-
-            [PositionIncrement] is used to update an internal cursor and fill out
-            kbts_break's Position field. If you only care about codepoint indices, pass
-            1. Maybe you want to pass in the number of bytes it took to decode the
-            codepoint, though, to be able to directly index UTF-8 text.
-
-            If [EndOfText] is non-zero, kbts_BreakEnd is called after adding [Codepoint].
-
-            Every time you call kbts_BreakAddCodepoint, you need to empty the break
-            buffer by calling kbts_Break repeatedly.
-
-          :kbts_BreakEnd
-          :BreakEnd
-          void kbts_BreakEnd(kbts_break_state *State)
-            Flushes all pending breaks and finishes segmentation.
-
-            You then obtain breaks by repeatedly calling kbts_Break, just as you would
-            after kbts_BreakAddCodepoint.
-
-          :kbts_Break
-          :Break
-          int kbts_Break(kbts_break_state *State, kbts_break *Break)
-            If any breaks have been found, writes one to [Break] and returns a non-zero
-            value. If not, returns 0.
-
-            kbts_break looks like this:
-            
-              typedef struct kbts_break
-              {
-                int Position;
-                kbts_break_flags Flags;
-                kbts_direction Direction; // Only valid if (Flags & KBTS_BREAK_FLAG_DIRECTION).
-                kbts_script Script;       // Only valid if (Flags & KBTS_BREAK_FLAG_SCRIPT).
-              } kbts_break;
-
-            Position is the position of the break, informed by the PositionIncrement
-            you passed to kbts_BreakAddCodepoint.
-
-            Flags can be any combination of:
-              KBTS_BREAK_FLAG_DIRECTION
-                Indicates a change of direction.
-
-              KBTS_BREAK_FLAG_SCRIPT
-                Indicates a change of script.
-
-              KBTS_BREAK_FLAG_GRAPHEME
-                Indicates the start of a grapheme.
-                Unicode describes a grapheme as a visual unit. In practice, you care about
-                graphemes for font coverage testing and caret positioning.
-
-                The way you do grapheme-aware font coverage testing is you split your text
-                into graphemes, then, for each grapheme, check if it is supported by your
-                font. Grapheme boundaries are nice because they group codepoints that may
-                want to combine together, but it separates codepoints that probably won't
-                recombine, so they work as an synchronization point for font coverage.
-
-                Caret positioning typically works in graphemes, too. When the user presses
-                the right arrow, you would go to the next grapheme boundary instead of
-                naively going to the next codepoint.
-
-              KBTS_BREAK_FLAG_WORD
-                Indicates the start of a word.
-
-              KBTS_BREAK_FLAG_LINE_SOFT
-                A soft line break tells you where you are able to break lines.
-                In Unicode land, you cannot break a line without one of these!
-
-              KBTS_BREAK_FLAG_LINE_HARD
-                A hard line break should always be respected.
-
-              KBTS_BREAK_FLAG_MANUAL
-                This is used internally by the kbts_shape_context for manual segmentation.
-                (See kbts_ShapeBeginManualRuns for more details.)
-
-            !CAREFUL! For a given break type, breaks are guaranteed to be returned in order.
-                      However, there is no such ordering guarantee between different types
-                      of breaks. Each type of break is processed separately, and the
-                      corresponding Unicode algorithms all require some kind of buffering
-                      scheme to work in fixed memory, so, while any given buffer is consistent
-                      with itself, we cannot order multiple buffers together.
-
-          :kbts_BreakEntireString
-          :BreakEntireString
-          void kbts_BreakEntireString(kbts_direction ParagraphDirection,
-                                      kbts_japanese_line_break_style JapaneseLineBreakStyle,
-                                      kbts_break_config_flags ConfigFlags,
-                                      void *Input, int InputSizeInBytes, kbts_text_format InputFormat,
-                                      kbts_break *Breaks, int BreakCapacity, int *BreakCount,
-                                      kbts_break_flags *BreakFlags, int BreakFlagCapacity, int *BreakFlagCount)
-            Goes through the entire buffer at [Input] and finds all breaks.
-            [Input] is of type [InputFormat], which can be one of:
-              KBTS_TEXT_FORMAT_UTF32
-              KBTS_TEXT_FORMAT_UTF8
-
-            Breaks will be written to [Breaks], up to [BreakCapacity]. Regardless of
-            whether [BreakCapacity] is large enough or not, the amount of breaks found
-            will be written to [BreakCount]. Unlike kbts_Break, here, [Breaks] are
-            guaranteed to be ordered.
-
-            [BreakFlags] is a parallel array to the input sequence. If a break is found
-            at position X, then BreakFlags[X] will be filled with the appropriate flags,
-            up to [BreakFlagCapacity]. Regardless of whether [BreakFlagCapacity] is large
-            enough or not, the required capacity is written to [BreakFlagCount].
-
-          :kbts_BreakEntireStringUtf32
-          :BreakEntireStringUtf32
-          void kbts_BreakEntireStringUtf32(kbts_direction ParagraphDirection,
-                                           kbts_japanese_line_break_style JapaneseLineBreakStyle,
-                                           kbts_break_config_flags ConfigFlags,
-                                           int *Utf32, int Utf32Count,
-                                           kbts_break *Breaks, int BreakCapacity, int *BreakCount,
-                                           kbts_break_flags *BreakFlags, int BreakFlagCapacity, int *BreakFlagCount)
-            Convenience wrapper for kbts_BreakEntireString for UTF-32 text.
-
-          :kbts_BreakEntireStringUtf8
-          :BreakEntireStringUtf8
-          void kbts_BreakEntireStringUtf8(kbts_direction ParagraphDirection,
-                                          kbts_japanese_line_break_style JapaneseLineBreakStyle,
-                                          kbts_break_config_flags ConfigFlags,
-                                          const char *Utf8, int Utf8Length,
-                                          kbts_break *Breaks, int BreakCapacity, int *BreakCount,
-                                          kbts_break_flags *BreakFlags, int BreakFlagCapacity, int *BreakFlagCount)
-            Convenience wrapper for kbts_BreakEntireString for UTF-8 text.
-
-            This wrapper passes the amount of bytes used to decode each codepoint into
-            kbts_BreakAddCodepoint's PositionIncrement argument. This means that break
-            positions written to [Breaks] point into the UTF-8 stream.
-
-          :kbts_GuessTextProperties
-          :GuessTextProperties
-          void kbts_GuessTextProperties(void *Text, int TextSizeInBytes, kbts_text_format Format,
-                                        kbts_direction *Direction, kbts_script *Script)
-            Goes through the input sequence at [Text], finds the first direction and
-            script, and writes them to [Direction] and [Script] respectively.
-
-            This is a quick-and-dirty way of finding out simple facts about your text.
-            However, the results only really make sense when you know [Input] is
-            mono-script and mono-direction.
-
-          :kbts_GuessTextPropertiesUtf32
-          :GuessTextPropertiesUtf32
-          void kbts_GuessTextPropertiesUtf32(const int *Utf32, int Utf32Count,
-                                             kbts_direction *Direction, kbts_script *Script)
-            Convenience wrapper for kbts_GuessTextProperties for UTF-32 text.
-
-          :kbts_GuessTextPropertiesUtf8
-          :GuessTextPropertiesUtf8
-          void kbts_GuessTextPropertiesUtf8(const char *Utf8, int Utf8Length,
-                                            kbts_direction *Direction, kbts_script *Script)
-            Convenience wrapper for kbts_GuessTextProperties for UTF-8 text.
-
-      OTHER APIS
-        OTHER:GLYPH ITERATION
-          :kbts_GlyphIteratorNext
-          :GlyphIteratorNext
-          int kbts_GlyphIteratorNext(kbts_glyph_iterator *It, kbts_glyph **Glyph)
-            Writes the next glyph to iterate over in [Glyph].
-
-            Once shaping is done, the interesting members of a glyph are:
-            - Id: the glyph index/id in the font.
-            - UserId: the user ID you passed in when creating the glyph.
-              This is typically some kind of codepoint index you can use to trace back
-              the glyph to your source text.
-            - AdvanceX/Y and OffsetX/Y: positioning data.
-              Here is how you might use them:
-
-                kbts_glyph *Glyph;
-                int CursorX = 0, CursorY = 0;
-                while(kbts_GlyphIteratorNext(&It, &Glyph))
-                {
-                  int GlyphX = CursorX + Glyph->OffsetX;
-                  int GlyphY = CursorY + Glyph->OffsetY;
-
-                  CursorX += Glyph->AdvanceX;
-                  CursorY += Glyph->AdvanceY;
-                }
-
-            You cannot assume that [Glyph] will stay valid if you free its glyph storage,
-            begin another shaping operation using the same glyph storage, or do any kind
-            of manipulation involving the glyph storage that holds this glyph. Likewise,
-            you should probably not assume that [Glyph] will stay valid after the next
-            call to kbts_GlyphIteratorNext.
-
-            The [return value] is 1 if we found a glyph to return, and 0 if we did not.
-            Once kbts_GlyphIteratorNext has returned 0, you can keep calling it and
-            it will keep returning 0.
-
-          :kbts_GlyphIteratorIsValid
-          :GlyphIteratorIsValid
-          int kbts_GlyphIteratorIsValid(kbts_glyph_iterator *It)
-            Returns whether there are still glyphs left to iterate over.
-
-            If this returns a non-zero value, then the next call to
-            kbts_GlyphIteratorNext will also return a non-zero value and write a valid
-            glyph.
-
-        OTHER:FONT COVERAGE TEST
-          To implement font fallback, you need to be able to know if a given span of text
-          is supported by a given font. However, this process is not as simple as it sounds.
-          Some Unicode codepoints have "canonical decompositions" and "canonical
-          recompositions" that are meant to describe different ways to represent the same
-          text, but with different codepoints. At the beginning of the shaping process,
-          shapers try all combinations until one is found that is fully supported by the
-          font. A font coverage test does this within a fixed memory footprint.
-
-          :kbts_FontCoverageTestBegin
-          :FontCoverageTestBegin
-          void kbts_FontCoverageTestBegin(kbts_font_coverage_test *Test, kbts_font *Font)
-            Initializes [Test] to test coverage with [Font].
-
-          :kbts_FontCoverageTestCodepoint
-          :FontCoverageTestCodepoint
-          void kbts_FontCoverageTestCodepoint(kbts_font_coverage_test *Test, int Codepoint)
-            Feeds [Codepoint] into [Test] and updates coverage information.
-
-          :kbts_FontCoverageTestEnd
-          :FontCoverageTestEnd
-          int kbts_FontCoverageTestEnd(kbts_font_coverage_test *Test)
-            Flushes the pending combinations not yet tested by [Test] and ends the coverage
-            test.
-            The [return value] is non-zero if the text is fully supported by the font,
-            whereas it is 0 if any glyph was not supported.
-            You can also check Test->Error to see if any glyph was unsupported.
-
-        OTHER:OTHER OTHER:MISC
-          :kbts_DecodeUtf8
-          :DecodeUtf8
-          kbts_decode kbts_DecodeUtf8(const char *Utf8, kbts_un Length)
-            Tries to decode a single codepoint from [Utf8].
-            kbts_decode looks like this:
-
-              typedef struct kbts_decode
-              {
-                int Codepoint;
-
-                int SourceCharactersConsumed;
-                int Valid;
-              } kbts_decode;
-
-            Codepoint is the decoded codepoint.
-            SourceCharactersConsumed is the amount of bytes that were read from [Utf8].
-            If decoding was successful, Valid is non-zero. Otherwise, it is zero.
-            Valid is zero if we run out of characters, or if the characters in [Utf8]
-            are invalid.
-
-          :kbts_EncodeUtf8
-          :EncodeUtf8
-          kbts_encode_utf8 kbts_EncodeUtf8(int Codepoint)
-            Tries to encode a single codepoint into a UTF-8 sequence of bytes.
-            kbts_encode looks like this:
-
-              typedef struct kbts_encode_utf8
-              {
-                  char Encoded[4];
-                  int EncodedLength;
-                  int Valid;
-              } kbts_encode_utf8;
-
-            Encoded is the encoded sequence.
-            EncodedLength is the number of bytes needed to encode [Codepoint].
-            Valid is whether or not [Codepoint] is a valid codepoint to encode.
-            (All codepoints up to 0x10FFFF inclusive can be encoded.)
-            When Valid is 0, EncodedLength is also 0.
-
-          :kbts_ScriptDirection
-          :ScriptDirection
-          kbts_direction kbts_ScriptDirection(kbts_script Script)
-            Returns the default direction for a given script.
-
-          :kbts_ScriptIsComplex
-          :ScriptIsComplex
-          int kbts_ScriptIsComplex(kbts_script Script)
-            Returns whether a script is complex, i.e. if it requires complex shaper
-            support.
-
-          :kbts_ScriptTagToScript
-          :ScriptTagToScript
-          kbts_script kbts_ScriptTagToScript(kbts_script_tag Tag)
-            Returns a given script from a four-character tag.
-            A kbts_script_tag can be obtained either through the KBTS_SCRIPT_TAG_*
-            constants, or through the KBTS_FOURCC() macro, which creates a tag from
-            four characters.
-
-   LANGUAGE SUPPORT
-     Shaping is NOT supported for the following scripts:
-       Zawgyi: some fonts exist, but no standardized OpenType feature set seems to exist as of writing.
-       Syriac: Syriac Abbreviation Mark (0x070F) is not supported.
-       Egyptian Hieroglyphs, I think, although example text is hard to come by.
-     Word breaking is NOT supported for languages that require word dictionaries, like CJK.
-
-   FONT SUPPORT
-     Indic fonts using the Indic1 shaping model are not supported.
-       e.g., 'bng2' will work, but 'beng' will not.
-       The Indic v2 shaping model was released with OpenType 1.5 in May 2008.
-     Traditional Arabic Windows 3.1 fonts are not supported.
-       https://github.com/harfbuzz/harfbuzz/issues/681
-     Thai/Lao PUA fonts are not supported.
-       These are old fonts that use OS-specific codepages (PUA stands for [Unicode] "Private Use Area") and
-       pre-OpenType shaping.
-       https://linux.thai.net/~thep/th-otf/shaping.html
-     More generally, we try to be compatible with most well-formed fonts, but we try less hard than Harfbuzz
-     to be compatible with every font under the sun.
-
-   OTHER LIMITATIONS
-     Explicit direction control characters are not supported. This includes:
-       0x202A Left-to-right embedding
-       0x202B Right-to-left embedding
-       0x202D Left-to-right override
-       0x202E Right-to-left override
-       0x202C Pop directional formatting
-       0x2066 Left-to-right isolate
-       0x2067 Right-to-left isolate
-       0x2068 First strong isolate
-       0x2069 Pop directional isolate
-     See https://unicode.org/reports/tr9 for more information.
-
-   VERSION HISTORY
-     2.25  - Check for empty input and context errors in segmentation updates.
-             Clean up mixed line endings.
-     2.24  - Improve cmap4 compatibility with old fonts.
-     2.23  - Improve direction inference at the end of paragraphs and for short paragraphs.
-     2.22  - Fix a segmentation bug where a line with an unknown script would inherit the next
-             line's script.
-     2.21  - Eliminate redundant typedefs for C99 compatibility.
-     2.20  - Properly check kbts__InputCodepoint return values.
-             Handle null shape configs in kbts_PlaceGlyphConfig.
-     2.19  - Fix the glyph config cache not taking shape_configs into account.
-     2.18  - Improved handling of default-ignorable codepoints.
-     2.17  - New function: kbts_PlaceShapeContextFixedMemory2.
-     2.16  - New type: kbts_shape_context_flags.
-             New functions: kbts_PlaceShapeContext2, kbts_CreateShapeContext2.
-             Fix a bug where ShapeCodepointIteratorNext() returned a null terminator when
-             the text ended on a block boundary.
-             Fix inconsistent break count/break flag count reporting in BreakEntireString.
-     2.15a - Fix GCC warnings
-     2.15  - Handle edge case when decomposing Thai/Lao Am vowels.
-     2.14  - Fix direction resolution for neutral characters surrounding digits.
-     2.13  - Extend NO_BREAK flag to include attached glyphs.
-     2.12  - Support fonts that use traditionally-GPOS features in GSUB.
-     2.11  - Reduce the size of Unicode lookup tables from ~577KiB to ~423KiB.
-             Fix a memory leak when recomposing glyphs in the shaper.
-             Remember shape and glyph configs in the shape context.
-     2.10  - Properly zero extended font_info2 types in GetFontInfo2.
-             Properly reset the glyph config cache in ShapeBegin.
-     2.09  - Fix use-after-free when a shape_scratchpad was freed after its respective shape_config.
-             Extended the GetFontInfo API to include metrics and bounding box information.
-               New types: kbts_font_info2, kbts_font_info2_1, kbts_font_info2_2.
-               New function: kbts_GetFontInfo2().
-     2.08  - Fix some UB.
-     2.07  - Performance improvements.
-             API CHANGES:
-             Struct layout changes for internal use: kbts_glyph, kbts_glyph_parent.
-
-             CONTEXT API
-             - kbts_shape_codepoint now holds bespoke feature overrides instead of a glyph config.
-               BEFORE:
-                 typedef struct kbts_shape_codepoint
-                 {
-                   kbts_font *Font; // Only set when (BreakFlags & KBTS_BREAK_FLAG_GRAPHEME) != 0.
-
-                   kbts_glyph_config *Config;
-   
-                   int Codepoint;
-                   int UserId;
-   
-                   kbts_break_flags BreakFlags;
-                   kbts_script Script; // Only set when (BreakFlags & KBTS_BREAK_FLAG_SCRIPT) != 0.
-                   kbts_direction Direction; // Only set when (BreakFlags & KBTS_BREAK_FLAG_DIRECTION) != 0.
-                   kbts_direction ParagraphDirection; // Only set when (BreakFlags & KBTS_BREAK_FLAG_PARAGRAPH_DIRECTION) != 0.
-                 } kbts_shape_codepoint;
-               AFTER:
-                 typedef struct kbts_shape_codepoint
-                 {
-                   kbts_font *Font; // Only set when (BreakFlags & KBTS_BREAK_FLAG_GRAPHEME) != 0.
-   
-                   kbts_feature_override *FeatureOverrides;
-                   int FeatureOverrideCount;
-   
-                   int Codepoint;
-                   int UserId;
-   
-                   kbts_break_flags BreakFlags;
-                   kbts_script Script; // Only set when (BreakFlags & KBTS_BREAK_FLAG_SCRIPT) != 0.
-                   kbts_direction Direction; // Only set when (BreakFlags & KBTS_BREAK_FLAG_DIRECTION) != 0.
-                   kbts_direction ParagraphDirection; // Only set when (BreakFlags & KBTS_BREAK_FLAG_PARAGRAPH_DIRECTION) != 0.
-                 } kbts_shape_codepoint;
-
-             DIRECT API
-             - Added a new (opaque pointer) type: kbts_shape_scratchpad.
-                 This type contains all the runtime data needed for shaping according to a specific kbts_shape_config.
-                 Unlike the kbts_shape_config, it is mutable, and so cannot be trivially shared across threads.
-                 It can be reused across different shaping calls as long as they all use the same shape_config.
-             - Added functions to manage scratchpads:
-                 kbts_un kbts_SizeOfShapeScratchpad(kbts_shape_config *Config)
-                 kbts_shape_scratchpad *kbts_PlaceShapeScratchpad(kbts_shape_config *Config, void *Memory, kbts_allocator_function *Allocator, void *AllocatorData)
-                 kbts_shape_scratchpad *kbts_PlaceShapeScratchpadFixedMemory(kbts_shape_config *Config, void *Memory, int Size)
-                 kbts_shape_scratchpad *kbts_CreateShapeScratchpad(kbts_shape_config *Config, kbts_allocator_function *Allocator, void *AllocatorData)
-                 void kbts_DestroyShapeScratchpad(kbts_shape_scratchpad *Scratchpad)
-             - kbts_ShapeDirect now takes a kbts_shape_scratchpad instead of a kbts_shape_config and an allocator.
-               BEFORE:
-                 kbts_shape_error kbts_ShapeDirect(kbts_shape_config *Config, kbts_glyph_storage *Storage,
-                                                   kbts_direction RunDirection,
-                                                   kbts_allocator_function *Allocator, void *AllocatorData,
-                                                   kbts_glyph_iterator *Output)
-               AFTER:
-                 kbts_shape_error kbts_ShapeDirect(kbts_shape_scratchpad *Scratchpad, kbts_glyph_storage *Storage,
-                                                   kbts_direction RunDirection, kbts_glyph_iterator *Output)
-             - Removed kbts_ShapeDirectFixedMemory. (Use kbts_PlaceShapeScratchpadFixedMemory instead.)
-             - Glyph configs now correspond to exactly one shape config.
-               BEFORE:
-                 int kbts_SizeOfGlyphConfig(kbts_feature_override *Overrides, int OverrideCount)
-                 kbts_glyph_config *kbts_PlaceGlyphConfig(kbts_feature_override *Overrides, int OverrideCount, void *Memory)
-                 kbts_glyph_config *kbts_CreateGlyphConfig(kbts_feature_override *Overrides, int OverrideCount, kbts_allocator_function *Allocator, void *AllocatorData)
-               AFTER:
-                 int kbts_SizeOfGlyphConfig(kbts_shape_config *ShapeConfig, kbts_feature_override *Overrides, int OverrideCount)
-                 kbts_glyph_config *kbts_PlaceGlyphConfig(kbts_shape_config *ShapeConfig, kbts_feature_override *Overrides, int OverrideCount, void *Memory)
-                 kbts_glyph_config *kbts_CreateGlyphConfig(kbts_shape_config *ShapeConfig, kbts_feature_override *Overrides, int OverrideCount, kbts_allocator_function *Allocator, void *AllocatorData)
-     2.06  - Faster GSUB and GPOS feature culling.
-     2.05  - Fix custom allocator initialization for kbts_shape_context.PermanentArena.
-     2.04  - Fix Indic syllable logic for small/single-character syllables.
-             Fix wrong indirection in pointer code in Indic syllable logic.
-     2.03  - Fix loading blobs directly, fix a parsing edge case in GPOS format 2 subtables.
-     2.02  - Improve globbing of cursive attachments.
-     2.01  - Add kbts_InitializeGlyphStorage and kbts_ScriptDirection.
-             Rename some private functions for better namespacing.
-             Delete some deprecated functions.
-             Bounds check in kbts_ScriptIsComplex.
-             Fix a couple pointer iteration bugs.
-             Fix some pedantic MSVC warnings.
-             Extend mirroring logic from brackets to any codepoint that has a Unicode mirror.
-     2.0   - Completely new API and implementation.
-     1.03  - New functions: kbts_FeatureTagToId(), kbts_FeatureOverrideFromTag(), kbts_EmptyGlyphConfig(), kbts_GlyphConfigOverrideFeature(), kbts_GlyphConfigOverrideFeatureFromTag(), kbts_ScriptTagToScript()
-             Unregistered features can now be overriden using their tags.
-               This is slower than overriding registered features, i.e. those that have a kbts_feature_id.
-             Compiler warning cleanup
-     1.02b - Feature control for GPOS features
-             Bounds checking in ReadFontHeader
-     1.02a - Positioning fix for format 2 GPOS pair adjustments
-     1.02  - Added per-glyph manual feature control through kbts_FeatureOverride(), kbts_GlyphConfig()
-             Added enum definitions for features cv01-cv99 and ss01-ss20
-     1.01  - Header cleanup and glyph output documentation
-     1.0   - Initial release
-
-   TODO
-     Word dictionaries for word breaking: CJK, etc.
-     'stch' feature.
+/* kb_text_shape - caller-owned bounded-memory edition, based on v2.25.
+   by Jimmy Lefevre; altered in rwmd.
+
+   Define KB_TEXT_SHAPE_IMPLEMENTATION in one translation unit. The nonallocating
+   Unicode, font-query, segmentation, glyph and iterator APIs are unchanged.
+   Fonts remain trusted input: this library offers no security guarantee.
+
+   MEMORY AND LIFETIMES
+     All placement APIs take ordinary writable byte pointers. Their size queries
+     allocate nothing and include alignment slack: unaligned pointers are valid.
+     Supply the complete queried size, using nonoverlapping buffers for live
+     objects and temporary construction. There is no heap allocation or file I/O.
+     Zero from a size query means invalid input or arithmetic overflow. Undersized
+     buffers violate the caller contract; semantic input/glyph limits report OOM.
+
+   FONT CONSTRUCTION
+     LoadFont borrows an already-native blob, or returns NEED_TO_CREATE_BLOB with
+     scratch/output sizes for PlaceBlob. The source survives until PlaceBlob
+     returns; the placed (or borrowed) native blob outlives every dependent object.
+     Query SizeOfCompiledFont and SizeOfFontCompileScratch on the loaded native
+     font, then CompileFont into a separate output buffer. Compilation scratch
+     is reusable immediately. OutputUsed optionally reports the retained prefix.
+     Complete compilation before sharing immutable font data among threads.
+     An already-compiled font is a no-op, retaining its original buffers.
+
+   DIRECT SHAPING
+     PlaceShapeConfig builds in its separately queried construction scratch and
+     packs immutable data into Output. Scratch is reusable immediately afterward;
+     Output, Font and the native blob outlive dependent glyph configs/scratchpads.
+     PlaceGlyphConfig copies the effective overrides into resident lookup controls.
+     InitializeGlyphStorage binds fixed canonical slots to Output. GlyphCapacity
+     bounds simultaneous/intermediate slots, not merely final glyph count.
+     Canonical records never move. ResetGlyphStorage clears content/errors and
+     reuses its buffer; ClearActiveGlyphs retains its active-range behavior.
+     SizeOfShapeScratchpad(Config, GlyphCapacity) bounds the entire operation,
+     including arbitrarily many repeated shapes of varying lengths within that
+     glyph limit. PlaceShapeScratchpad partitions exactly that buffer. Storage's
+     glyph capacity must not exceed the scratchpad's glyph capacity.
+     ShapeDirect empties the output iterator on failure. A scratchpad is exclusive
+     to one shaping thread; immutable configs can be shared.
+
+   CONTEXT SHAPING
+     SizeOfShapeContext/PlaceShapeContext describe fixed bookkeeping only. Push
+     already-compiled borrowed fonts, then query SizeOfContextScratch for the
+     language, input capacity and intermediate glyph capacity. Re-query after
+     changing the font stack. ShapeBegin takes destination glyph storage and this
+     per-pass scratch; previous pass pointers/output are invalidated at Begin.
+     Input, run, feature snapshots, config caches and execution workspace use
+     per-pass scratch; only the bounded font/feature stacks persist in the context.
+     UTF input, user IDs, manual/automatic runs, breaks and feature values retain
+     their existing semantics. Feature-stack values persist across Begin.
+     Context errors are sticky: reconstruct the fixed context to recover. No
+     destroy call is needed; callers release backing buffers after dependents end.
 
    LICENSE
      zlib License
@@ -2458,16 +1018,6 @@ enum kbts_shape_error_enum
   KBTS_SHAPE_ERROR_OUT_OF_MEMORY,
 
   KBTS_SHAPE_ERROR_COUNT,
-};
-
-typedef kbts_u32 kbts_allocator_op_kind;
-enum kbts_allocator_op_kind_enum
-{
-  KBTS_ALLOCATOR_OP_KIND_NONE,
-  KBTS_ALLOCATOR_OP_KIND_ALLOCATE,
-  KBTS_ALLOCATOR_OP_KIND_FREE,
-
-  KBTS_ALLOCATOR_OP_KIND_COUNT,
 };
 
 typedef kbts_u32 kbts_blob_table_id;
@@ -3471,29 +2021,6 @@ typedef struct kbts_shape_scratchpad kbts_shape_scratchpad;
 typedef struct kbts__compiled_contexts kbts__compiled_contexts;
 typedef struct kbts__font_tables kbts__font_tables;
 
-typedef struct kbts_allocator_op_allocate
-{
-  void *Pointer;
-  kbts_u32 Size;
-} kbts_allocator_op_allocate;
-
-typedef struct kbts_allocator_op_free
-{
-  void *Pointer;
-} kbts_allocator_op_free;
-
-typedef struct kbts_allocator_op
-{
-  kbts_allocator_op_kind Kind;
-
-  union
-  {
-    kbts_allocator_op_allocate Allocate;
-    kbts_allocator_op_free Free;
-  };
-} kbts_allocator_op;
-
-typedef void kbts_allocator_function(void *Data, kbts_allocator_op *Op);
 
 typedef struct kbts_blob_table
 {
@@ -3541,11 +2068,8 @@ typedef struct kbts__cmap_lookup kbts__cmap_lookup;
 
 typedef struct kbts_font
 {
-  kbts_allocator_function *Allocator;
-  void *AllocatorData;
 
   kbts_blob_header *Blob;
-  void *BlobAllocation;
   kbts_un BlobSize;
   kbts__font_tables *Tables;
   kbts_u16 *Cmap;
@@ -3850,22 +2374,6 @@ typedef struct kbts_glyph_iterator
   int Y;
 } kbts_glyph_iterator;
 
-typedef struct kbts_arena_block_header
-{
-  struct kbts_arena_block_header *Prev;
-  struct kbts_arena_block_header *Next;
-} kbts_arena_block_header;
-
-typedef struct kbts_arena
-{
-  kbts_allocator_function *Allocator;
-  void *AllocatorData;
-
-  kbts_arena_block_header BlockSentinel;
-  kbts_arena_block_header FreeBlockSentinel;
-
-  int Error;
-} kbts_arena;
 
 typedef struct kbts__glyph_link
 {
@@ -3877,8 +2385,6 @@ typedef struct kbts__glyph_link
 
 struct kbts_glyph_storage
 {
-  kbts_allocator_function *Allocator;
-  void *AllocatorData;
   void *Memory;
   kbts_glyph *Glyphs;
   kbts__glyph_link *Links;
@@ -3888,7 +2394,6 @@ struct kbts_glyph_storage
   kbts_u32 First, End; // Logical active range; End is an exclusive slot boundary.
   kbts_b32 RangeActive, Ordered;
   kbts_shape_scratchpad *IndexedScratchpad;
-  kbts_b32 FixedMemory;
   kbts_glyph Boundary;
 
   int Error;
@@ -3926,20 +2431,17 @@ typedef struct kbts_run
 //
 
 KBTS_EXPORT int kbts_SizeOfShapeContext(void);
-KBTS_EXPORT kbts_shape_context *kbts_PlaceShapeContext2(kbts_allocator_function *Allocator, void *AllocatorData, void *Memory, kbts_shape_context_flags Flags);
-KBTS_EXPORT kbts_shape_context *kbts_PlaceShapeContext(kbts_allocator_function *Allocator, void *AllocatorData, void *Memory);
-KBTS_EXPORT kbts_shape_context *kbts_PlaceShapeContextFixedMemory2(void *Memory, int Size, kbts_shape_context_flags Flags);
-KBTS_EXPORT kbts_shape_context *kbts_PlaceShapeContextFixedMemory(void *Memory, int Size);
-KBTS_EXPORT kbts_shape_context *kbts_CreateShapeContext2(kbts_allocator_function *Allocator, void *AllocatorData, kbts_shape_context_flags Flags);
-KBTS_EXPORT kbts_shape_context *kbts_CreateShapeContext(kbts_allocator_function *Allocator, void *AllocatorData);
-KBTS_EXPORT void kbts_DestroyShapeContext(kbts_shape_context *Context);
-#ifndef KB_TEXT_SHAPE_NO_CRT
-KBTS_EXPORT kbts_font *kbts_ShapePushFontFromFile(kbts_shape_context *Context, const char *FileName, int FontIndex);
-#endif
-KBTS_EXPORT kbts_font *kbts_ShapePushFontFromMemory(kbts_shape_context *Context, void *Memory, int Size, int FontIndex);
+// Memory fits SizeOfShapeContext(); it remains live until the context is retired.
+KBTS_EXPORT kbts_shape_context *kbts_PlaceShapeContext(void *Memory, kbts_shape_context_flags Flags);
+// Query after pushing compiled fonts; re-query if the font stack changes.
+KBTS_EXPORT kbts_un kbts_SizeOfContextScratch(kbts_shape_context *Context, kbts_language Language, kbts_un CodepointCapacity, kbts_un GlyphCapacity);
 KBTS_EXPORT kbts_font *kbts_ShapePushFont(kbts_shape_context *Context, kbts_font *Font);
 KBTS_EXPORT kbts_font *kbts_ShapePopFont(kbts_shape_context *Context);
-KBTS_EXPORT void kbts_ShapeBegin(kbts_shape_context *Context, kbts_direction ParagraphDirection, kbts_language Language);
+// Destination fits SizeOfGlyphStorage(GlyphCapacity). Scratch fits the context
+// query above; both are exclusive until the next Begin, which invalidates output.
+// CodepointCapacity bounds input; GlyphCapacity includes intermediate expansion.
+KBTS_EXPORT void kbts_ShapeBegin(kbts_shape_context *Context, kbts_direction ParagraphDirection, kbts_language Language,
+    void *Destination, void *Scratch, kbts_un CodepointCapacity, kbts_un GlyphCapacity);
 KBTS_EXPORT void kbts_ShapeEnd(kbts_shape_context *Context);
 KBTS_EXPORT int kbts_ShapeRun(kbts_shape_context *Context, kbts_run *Run);
 KBTS_EXPORT void kbts_ShapePushFeature(kbts_shape_context *Context, kbts_u32 FeatureTag, int Value);
@@ -3967,31 +2469,41 @@ KBTS_EXPORT int kbts_ShapeGetShapeCodepoint(kbts_shape_context *Context, int Cod
 KBTS_EXPORT kbts_shape_error kbts_ShapeDirect(kbts_shape_scratchpad *Scratchpad, kbts_glyph_storage *Storage, kbts_direction RunDirection, kbts_glyph_iterator *Output);
 
 // A font holds all data that corresponds to a given font file.
-#ifndef KB_TEXT_SHAPE_NO_CRT
-KBTS_EXPORT kbts_font kbts_FontFromFile(const char *FileName, int FontIndex, kbts_allocator_function *Allocator, void *AllocatorData, void **FileData, int *FileSize);
-#endif
 KBTS_EXPORT int kbts_FontCount(void *FileData, int FileSize);
-KBTS_EXPORT kbts_font kbts_FontFromMemory(void *FileData, int FileSize, int FontIndex, kbts_allocator_function *Allocator, void *AllocatorData);
-KBTS_EXPORT void kbts_FreeFont(kbts_font *Font);
-KBTS_EXPORT kbts_load_font_error kbts_CompileFont(kbts_font *Font, kbts_allocator_function *Allocator, void *AllocatorData);
+// Queries inspect a loaded native font without allocating; zero means invalid or
+// overflow. Output/Scratch fit their respective bounds, and must not overlap.
+KBTS_EXPORT kbts_un kbts_SizeOfCompiledFont(kbts_font *Font);
+KBTS_EXPORT kbts_un kbts_SizeOfFontCompileScratch(kbts_font *Font);
+// Output is retained by Font; Scratch is reusable on return. OutputUsed is optional,
+// zero on failure, otherwise the retained prefix. The native blob remains borrowed.
+KBTS_EXPORT kbts_load_font_error kbts_CompileFont(kbts_font *Font, void *Output, void *Scratch, kbts_un *OutputUsed);
 KBTS_EXPORT int kbts_FontIsValid(kbts_font *Font);
+// A successful native load borrows FontData for the lifetime of Font/dependents.
+// NEED_TO_CREATE_BLOB reports exact placement bounds through ScratchSize_/OutputSize_.
 KBTS_EXPORT kbts_load_font_error kbts_LoadFont(kbts_font *Font, kbts_load_font_state *State, void *FontData, int FontDataSize, int FontIndex, int *ScratchSize_, int *OutputSize_);
-KBTS_EXPORT kbts_load_font_error kbts_PlaceBlob(kbts_font *Font, kbts_load_font_state *State, void *ScratchMemory, void *OutputMemory);
+// Scratch/Output fit LoadFont's sizes; source survives until return, Output until
+// all font dependents are retired. Scratch is reusable immediately after return.
+KBTS_EXPORT kbts_load_font_error kbts_PlaceBlob(kbts_font *Font, kbts_load_font_state *State, void *Scratch, void *Output);
 KBTS_EXPORT void kbts_GetFontInfo(kbts_font *Font, kbts_font_info *Info);
 KBTS_EXPORT void kbts_GetFontInfo2(kbts_font *Font, kbts_font_info2 *Info);
 
 // A shape_config is a bag of pre-computed data for a specific shaping setup.
 KBTS_EXPORT int kbts_SizeOfShapeConfig(kbts_font *Font, kbts_script Script, kbts_language Language);
-KBTS_EXPORT kbts_shape_config *kbts_PlaceShapeConfig(kbts_font *Font, kbts_script Script, kbts_language Language, void *Memory, kbts_un MemorySize);
-KBTS_EXPORT kbts_shape_config *kbts_CreateShapeConfig(kbts_font *Font, kbts_script Script, kbts_language Language, kbts_allocator_function *Allocator, void *AllocatorData);
-KBTS_EXPORT void kbts_DestroyShapeConfig(kbts_shape_config *Config);
+KBTS_EXPORT kbts_un kbts_SizeOfShapeConfigScratch(kbts_font *Font, kbts_script Script, kbts_language Language);
+// Output/Scratch fit the matching queries and do not overlap. Output and Font
+// outlive all dependent glyph configs/scratchpads. Scratch is reusable on return.
+// OutputUsed optionally receives the retained prefix (zero on failure).
+KBTS_EXPORT kbts_shape_config *kbts_PlaceShapeConfig(kbts_font *Font, kbts_script Script, kbts_language Language,
+    void *Output, void *Scratch, kbts_un *OutputUsed);
 
 // A glyph_storage holds and recycles glyph data.
-KBTS_EXPORT int kbts_InitializeGlyphStorage(kbts_glyph_storage *Storage, kbts_allocator_function *Allocator, void *AllocatorData);
-KBTS_EXPORT int kbts_InitializeGlyphStorageFixedMemory(kbts_glyph_storage *Storage, void *Memory, int MemorySize);
+KBTS_EXPORT kbts_un kbts_SizeOfGlyphStorage(kbts_un GlyphCapacity);
+// Output fits the query above and remains exclusive while Storage is in use.
+// GlyphCapacity limits simultaneous/intermediate slots; canonical records never move.
+KBTS_EXPORT int kbts_InitializeGlyphStorage(kbts_glyph_storage *Storage, void *Output, kbts_un GlyphCapacity);
 KBTS_EXPORT kbts_glyph *kbts_PushGlyph(kbts_glyph_storage *Storage, kbts_font *Font, int Codepoint, kbts_glyph_config *Config, int UserId);
 KBTS_EXPORT void kbts_ClearActiveGlyphs(kbts_glyph_storage *Storage);
-KBTS_EXPORT void kbts_FreeAllGlyphs(kbts_glyph_storage *Storage);
+KBTS_EXPORT void kbts_ResetGlyphStorage(kbts_glyph_storage *Storage);
 KBTS_EXPORT kbts_glyph kbts_CodepointToGlyph(kbts_font *Font, int Codepoint, kbts_glyph_config *Config, int UserId);
 KBTS_EXPORT int kbts_CodepointToGlyphId(kbts_font *Font, int Codepoint);
 KBTS_EXPORT kbts_glyph_iterator kbts_ActiveGlyphIterator(kbts_glyph_storage *Storage);
@@ -3999,18 +2511,17 @@ KBTS_EXPORT kbts_glyph_iterator kbts_ActiveGlyphIterator(kbts_glyph_storage *Sto
 // A glyph_config specifies glyph-specific shaping parameters.
 // A single glyph_config can be shared by multiple glyphs.
 KBTS_EXPORT int kbts_SizeOfGlyphConfig(kbts_shape_config *ShapeConfig, kbts_feature_override *Overrides, int OverrideCount);
-KBTS_EXPORT kbts_glyph_config *kbts_PlaceGlyphConfig(kbts_shape_config *ShapeConfig, kbts_feature_override *Overrides, int OverrideCount, void *Memory);
-KBTS_EXPORT kbts_glyph_config *kbts_CreateGlyphConfig(kbts_shape_config *ShapeConfig, kbts_feature_override *Overrides, int OverrideCount, kbts_allocator_function *Allocator, void *AllocatorData);
-KBTS_EXPORT void kbts_DestroyGlyphConfig(kbts_glyph_config *Config);
+// Output fits SizeOfGlyphConfig and outlives its glyphs; Overrides is borrowed only
+// during this call, while ShapeConfig remains borrowed for the resulting config.
+KBTS_EXPORT kbts_glyph_config *kbts_PlaceGlyphConfig(kbts_shape_config *ShapeConfig, kbts_feature_override *Overrides, int OverrideCount, void *Output);
 
 // A shape_scratchpad holds all transient runtime shaping data.
 // While the shape_config is immutable and can be trivially shared among threads, a
 // shape_scratchpad is mutable and needs to be per-thread.
-KBTS_EXPORT kbts_un kbts_SizeOfShapeScratchpad(kbts_shape_config *Config);
-KBTS_EXPORT kbts_shape_scratchpad *kbts_PlaceShapeScratchpad(kbts_shape_config *Config, void *Memory, kbts_allocator_function *Allocator, void *AllocatorData);
-KBTS_EXPORT kbts_shape_scratchpad *kbts_PlaceShapeScratchpadFixedMemory(kbts_shape_config *Config, void *Memory, int Size);
-KBTS_EXPORT kbts_shape_scratchpad *kbts_CreateShapeScratchpad(kbts_shape_config *Config, kbts_allocator_function *Allocator, void *AllocatorData);
-KBTS_EXPORT void kbts_DestroyShapeScratchpad(kbts_shape_scratchpad *Scratchpad);
+// Whole-operation bound, including indefinitely repeated shapes of any length up
+// to GlyphCapacity. Scratch fits this bound; Config and Scratch outlive the pad.
+KBTS_EXPORT kbts_un kbts_SizeOfShapeScratchpad(kbts_shape_config *Config, kbts_un GlyphCapacity);
+KBTS_EXPORT kbts_shape_scratchpad *kbts_PlaceShapeScratchpad(kbts_shape_config *Config, void *Scratch, kbts_un GlyphCapacity);
 
 //
 // Glyph iterator
@@ -4112,9 +2623,6 @@ KBTS_EXPORT kbts_script kbts_ScriptTagToScript(kbts_script_tag Tag);
 #endif
 #  endif
 
-#ifndef KB_TEXT_SHAPE_NO_CRT
-#include <stdio.h>
-#endif
 
 #ifndef KBTS_MEMSET
 #include <string.h>
@@ -4129,20 +2637,6 @@ KBTS_EXPORT kbts_script kbts_ScriptTagToScript(kbts_script_tag Tag);
 #ifndef KBTS_MEMMOVE
 #include <string.h>
 #define KBTS_MEMMOVE memmove
-#endif
-
-#ifndef KB_TEXT_SHAPE_NO_CRT
-#ifndef KBTS_MALLOC
-#include <stdlib.h>
-#define KBTS_MALLOC(Data, Size) malloc((Size))
-#define KBTS_FREE(Data, Pointer) free((Pointer))
-#endif
-#else
-#ifndef KBTS_MALLOC
-// Nerf the default allocator to a null allocator.
-#define KBTS_MALLOC(Data, Size) 0
-#define KBTS_FREE(Data, Pointer)
-#endif
 #endif
 
 #ifndef kbts__ByteSwap16
@@ -13382,6 +11876,7 @@ static kbts_b32 kbts__FontCoverageResolveBase(kbts_font_coverage_test *Test, kbt
   }
 }
 
+
 static void kbts__FontCoverageTestMappedCodepoint(kbts_font_coverage_test *Test, int Codepoint, kbts_u16 MappedId)
 {
   if(Test->Error) return;
@@ -13424,9 +11919,6 @@ typedef struct kbts__enabled_lookup
 
 struct kbts_glyph_config
 {
-  kbts_allocator_function *Allocator;
-  void *AllocatorData;
-  void *BaseAllocation;
 
   kbts_u32 *EnabledLookupBits;
   kbts_u32 *DisabledLookupBits;
@@ -13437,23 +11929,23 @@ struct kbts_glyph_config
   kbts_u32 HasEnabledLookups;
 };
 
-typedef struct kbts__arena_block
+typedef struct kbts__memory
 {
-  kbts_arena_block_header Header;
-  void *BaseAllocation; // For freeing
-
-  kbts_un Size;
-  kbts_un Used;
-
-  // char Memory[Size]; // if Memory is NULL
-} kbts__arena_block;
-
+  void *Data;
+  kbts_un Capacity, Used;
+  int Error;
+} kbts__memory;
+typedef struct kbts__arena
+{
+  kbts__memory *Memory;
+  int Error;
+} kbts__arena;
 typedef struct kbts__arena_lifetime
 {
-  kbts_arena *Arena;
-  kbts_arena_block_header *BlockHeader;
+  kbts__arena *Arena;
   kbts_un Used;
 } kbts__arena_lifetime;
+
 
 typedef struct kbts__glyph_range
 {
@@ -13474,7 +11966,6 @@ typedef struct kbts__glyph_bucket
   kbts__bucketed_glyph *Glyphs;
   kbts_un Count, Capacity;
   void *Memory;
-  void *BaseAllocation;
   struct kbts__glyph_bucket *Next;
 } kbts__glyph_bucket;
 
@@ -13483,9 +11974,8 @@ typedef struct kbts__glyph_bucket
 
 struct kbts_shape_scratchpad
 {
-  kbts_allocator_function *Allocator;
-  void *AllocatorData;
-  void *BaseAllocation;
+  kbts_un GlyphCapacity, ProbeCapacity;
+  void *ProbeMemory;
   kbts_u32 BucketCapacity;
 
   void *ScratchMemory;
@@ -13500,6 +11990,8 @@ struct kbts_shape_scratchpad
   kbts_u32 GposLookupIndexOffset;
   kbts_u32 SequentialLookupCount;
   kbts_u32 GposFirstLookup;
+  // Valid only between final metrics and cleanup; zero is conservative.
+  kbts_b32 SkipPostGposCleanup;
   kbts__gsub_stream Stream;
 
   kbts__glyph_bucket **LookupGlyphBuckets;
@@ -13563,7 +12055,6 @@ enum kbts__context_flags_enum
 typedef struct kbts__context_font
 {
   kbts_font *Font;
-  kbts__arena_lifetime Lifetime;
 } kbts__context_font;
 
 typedef struct kbts__effective_features
@@ -13623,14 +12114,9 @@ typedef struct kbts__run_metadata
 
 struct kbts_shape_context
 {
-  kbts_arena PermanentArena;
-  kbts_arena FontArena;
-  kbts_arena ConfigArena;
-  kbts_arena ScratchArena;
-
-  kbts_allocator_function *SelfAllocator;
-  void *SelfAllocatorData;
-  void *BaseAllocation;
+  kbts__arena ScratchArena;
+  kbts__memory PassMemory;
+  kbts_un CodepointCapacity, GlyphCapacity, ExecutionMark;
 
   kbts_shape_codepoint *LastGraphemeBreak;
   kbts_u32 LastGraphemeBreakIndex;
@@ -13715,9 +12201,6 @@ typedef struct kbts__sequential_lookup
 
 struct kbts_shape_config
 {
-  kbts_allocator_function *Allocator;
-  void *AllocatorData;
-  void *BaseAllocation;
   kbts_un ResidentSize;
   kbts_un ConstructionSize;
 
@@ -15144,9 +13627,6 @@ typedef struct kbts__font_lookup
 
 struct kbts__font_tables
 {
-  kbts_allocator_function *Allocator;
-  void *AllocatorData;
-  void *BaseAllocation;
   kbts_un AllocationSize;
   kbts_u32 LookupCount, SubtableCount;
   kbts__font_lookup *Lookups;
@@ -15154,8 +13634,7 @@ struct kbts__font_tables
   kbts_glyph_classes *GlyphClasses;
 };
 
-static kbts_load_font_error kbts__CompileFontTables(kbts_font *Font,
-    kbts_allocator_function *Allocator, void *AllocatorData);
+static kbts_load_font_error kbts__CompileFontTables(kbts_font *Font, kbts__memory *Persistent);
 
 KBTS_INLINE const kbts__font_lookup *kbts__FontLookup(const kbts_font *Font,
     kbts_shaping_table Table, kbts_u32 Index)
@@ -17084,9 +15563,6 @@ static int kbts__ShaperRtl(kbts_shaper Shaper)
 
 struct kbts__cmap_lookup
 {
-  kbts_allocator_function *Allocator;
-  void *AllocatorData;
-  void *BaseAllocation;
   kbts_u32 CodepointLimit;
   kbts_u16 *Pages, *Glyphs;
 };
@@ -17683,70 +16159,54 @@ KBTS_INLINE kbts_un kbts__SequentialLookupCount(kbts_shape_config *Config)
   return Result;
 }
 
-static void kbts__NullAllocator(void *Data, kbts_allocator_op *Op)
+static kbts_b32 kbts__MemoryValid(kbts__memory *Memory)
 {
-  KBTS__UNUSED(Data);
-  KBTS__UNUSED(Op);
+  if(!Memory) return 0;
+  if(Memory->Used > Memory->Capacity || (!Memory->Data && Memory->Capacity) ||
+     (kbts_uptr)Memory->Data > (kbts_uptr)-1 - Memory->Capacity)
+  { Memory->Error = 1; return 0; }
+  return !Memory->Error;
 }
 
-static void kbts__DefaultAllocator(void *Data, kbts_allocator_op *Op)
+static kbts_b32 kbts__SeparateMemory(kbts__memory *A, kbts__memory *B)
 {
-  KBTS__UNUSED(Data);
-
-  switch(Op->Kind)
-  {
-  case KBTS_ALLOCATOR_OP_KIND_ALLOCATE:
-  {
-    Op->Allocate.Pointer = KBTS_MALLOC(Data, Op->Allocate.Size);
-  } break;
-
-  case KBTS_ALLOCATOR_OP_KIND_FREE:
-  {
-    KBTS_FREE(Data, Op->Free.Pointer);
-  } break;
-  }
+  kbts_b32 ValidA = kbts__MemoryValid(A), ValidB = kbts__MemoryValid(B);
+  if(!ValidA || !ValidB) return 0;
+  kbts_uptr X = (kbts_uptr)A->Data, Y = (kbts_uptr)B->Data;
+  if(A == B || (A->Capacity && B->Capacity && X < Y + B->Capacity && Y < X + A->Capacity))
+  { A->Error = B->Error = 1; return 0; }
+  return 1;
 }
 
-static void *kbts__AllocatorAllocate(kbts_allocator_function *Allocator, void *AllocatorData, kbts_un Size)
+static void *kbts__MemoryPush(kbts__memory *Memory, kbts_un Size, kbts_un Align)
 {
-  kbts_allocator_op AllocatorOp = KBTS__ZERO;
-  AllocatorOp.Kind = KBTS_ALLOCATOR_OP_KIND_ALLOCATE;
-  AllocatorOp.Allocate.Size = (kbts_u32)Size;
-
-  if(!Allocator)
-  {
-    Allocator = kbts__DefaultAllocator;
-  }
-  
-  Allocator(AllocatorData, &AllocatorOp);
-
-  void *Result = AllocatorOp.Allocate.Pointer;
-  return Result;
+  if(!kbts__MemoryValid(Memory)) return 0;
+  if(!Align || (Align & (Align - 1))) { Memory->Error = 1; return 0; }
+  kbts_uptr At = (kbts_uptr)Memory->Data + Memory->Used;
+  kbts_un Padding = (Align - (At & (Align - 1))) & (Align - 1);
+  kbts_un Left = Memory->Capacity - Memory->Used;
+  if(Padding > Left || Size > Left - Padding || (!Memory->Data && Size))
+  { Memory->Error = 1; return 0; }
+  Memory->Used += Padding + Size;
+  return (void *)(At + Padding);
 }
-#define kbts__AllocatorAllocateType(Allocator, AllocatorData, Type) (Type *)kbts_AllocatorAllocate((Allocator), (AllocatorData), sizeof(Type))
-#define kbts__AllocatorAllocateArray(Allocator, AllocatorData, Type, Count) (Type *)kbts_AllocatorAllocate((Allocator), (AllocatorData), sizeof(Type) * (Count))
 
-static void kbts__AllocatorFree(kbts_allocator_function *Allocator, void *AllocatorData, void *Pointer)
+/* Construction-only cursor bounds. Each reservation includes its own worst-case
+ * alignment slack, so every public placement accepts unaligned byte buffers. */
+static kbts_b32 kbts__BoundAdd(kbts_un *Total, kbts_un Count, kbts_un Width, kbts_un Align)
 {
-  if(Pointer)
-  {
-    kbts_allocator_op AllocatorOp = KBTS__ZERO;
-    AllocatorOp.Kind = KBTS_ALLOCATOR_OP_KIND_FREE;
-    AllocatorOp.Free.Pointer = Pointer;
-
-    if(!Allocator)
-    {
-      Allocator = kbts__DefaultAllocator;
-    }
-    
-    Allocator(AllocatorData, &AllocatorOp);
-  }
+  kbts_un Limit = (kbts_un)-1;
+  if(!Align || *Total > Limit - (Align - 1)) return 0;
+  kbts_un Remaining = Limit - *Total - (Align - 1);
+  if(Width && Count > Remaining / Width) return 0;
+  *Total += Count * Width + Align - 1;
+  return 1;
 }
 
 static kbts_load_font_error kbts__CompileCmap(kbts_font *Font,
-    kbts_allocator_function *Allocator, void *AllocatorData,
-    kbts_allocator_function *ScratchAllocator, void *ScratchAllocatorData)
+    kbts__memory *Persistent, kbts__memory *Scratch)
 {
+  if(!kbts__SeparateMemory(Persistent, Scratch)) return KBTS_LOAD_FONT_ERROR_OUT_OF_MEMORY;
   if(Font->CmapLookup || !Font->Cmap || kbts__ReadU16Unaligned(Font->Cmap) != 12)
     return KBTS_LOAD_FONT_ERROR_NONE;
   kbts__cmap_12_13 *Cmap = (kbts__cmap_12_13 *)Font->Cmap;
@@ -17770,8 +16230,8 @@ static kbts_load_font_error kbts__CompileCmap(kbts_font *Font,
   // Unicode bounds cap this one-time workspace below 3 MiB.
   kbts_un ScratchBytes = (kbts_un)HashCount * sizeof(kbts_u32) +
       ((kbts_un)CodepointLimit + PageCount) * sizeof(kbts_u16);
-  void *ScratchMemory = kbts__AllocatorAllocate(ScratchAllocator, ScratchAllocatorData,
-      ScratchBytes + KBTS_ALIGNOF(kbts_u32) - 1);
+  kbts_un ScratchMark = Scratch->Used;
+  void *ScratchMemory = kbts__MemoryPush(Scratch, ScratchBytes, KBTS_ALIGNOF(kbts_u32));
   if(!ScratchMemory) return KBTS_LOAD_FONT_ERROR_OUT_OF_MEMORY;
   kbts_u32 *Hashes = KBTS__ALIGN_POINTER(kbts_u32, ScratchMemory, KBTS_ALIGNOF(kbts_u32));
   KBTS_MEMSET(Hashes, 0, ScratchBytes);
@@ -17810,306 +16270,99 @@ static kbts_load_font_error kbts__CompileCmap(kbts_font *Font,
   // Bound added resident storage by the selected range table's own size.
   if(Bytes <= Cmap->Length)
   {
-    void *Memory = kbts__AllocatorAllocate(Allocator, AllocatorData, Bytes);
+    void *Memory = kbts__MemoryPush(Persistent, Bytes, KBTS_ALIGNOF(kbts__cmap_lookup));
     if(Memory)
     {
       kbts__cmap_lookup *Lookup = KBTS__ALIGN_POINTER(kbts__cmap_lookup, Memory, KBTS_ALIGNOF(kbts__cmap_lookup));
-      Lookup->BaseAllocation = Memory;
-      Lookup->Allocator = Allocator;
-      Lookup->AllocatorData = AllocatorData;
       Lookup->CodepointLimit = CodepointLimit;
       Lookup->Pages = (kbts_u16 *)(Lookup + 1);
       Lookup->Glyphs = Lookup->Pages + PageCount;
       KBTS_MEMCPY(Lookup->Pages, Pages, (kbts_un)PageCount * sizeof(*Pages));
       KBTS_MEMCPY(Lookup->Glyphs, Glyphs, (kbts_un)Unique * 32 * sizeof(*Glyphs));
       Font->CmapLookup = Lookup;
+      Persistent->Used -= KBTS_ALIGNOF(kbts__cmap_lookup) - 1;
     }
     else Error = KBTS_LOAD_FONT_ERROR_OUT_OF_MEMORY;
   }
-  kbts__AllocatorFree(ScratchAllocator, ScratchAllocatorData, ScratchMemory);
+  Scratch->Used = ScratchMark;
   return Error;
 }
 
-static void kbts__EnsureArenaInitialized(kbts_arena *Arena)
+static void *kbts__PushSize(kbts__arena *Arena, kbts_un Size, kbts_un Align)
 {
-  if(!Arena->BlockSentinel.Next)
-  {
-    KBTS__DLLIST_SENTINEL_INIT(&Arena->BlockSentinel);
-    KBTS__DLLIST_SENTINEL_INIT(&Arena->FreeBlockSentinel);
-
-    if(!Arena->Allocator)
-    {
-      Arena->Allocator = kbts__DefaultAllocator;
-    }
-  }
-}
-
-#define KBTS_ARENA_MIN_BLOCK_SIZE 4096
-static kbts__arena_block *kbts__ArenaPushBlock(kbts_arena *Arena, kbts_un Size, kbts_un Align)
-{
-  kbts__arena_block *Result = (kbts__arena_block *)&Arena->BlockSentinel;
-
-  if(!Arena->Error)
-  {
-    kbts_un BlockSize = sizeof(kbts__arena_block) + Size + KBTS_ALIGNOF(kbts__arena_block) + Align - 1;
-    if(BlockSize < KBTS_ARENA_MIN_BLOCK_SIZE)
-    {
-      BlockSize = KBTS_ARENA_MIN_BLOCK_SIZE;
-    }
-
-    Result = (kbts__arena_block *)Arena->FreeBlockSentinel.Prev;
-    if((Result == (kbts__arena_block *)&Arena->FreeBlockSentinel) ||
-       ((Result->Size + sizeof(kbts__arena_block)) < BlockSize))
-    {
-      void *Base = kbts__AllocatorAllocate(Arena->Allocator, Arena->AllocatorData, BlockSize);
-
-      if(Base)
-      {
-        Result = KBTS__ALIGN_POINTER(kbts__arena_block, Base, KBTS_ALIGNOF(kbts__arena_block));
-        KBTS_MEMSET(Result, 0, sizeof(*Result));
-        Result->BaseAllocation = Base;
-        Result->Size = (kbts_un)(KBTS__POINTER_OFFSET(char, Base, BlockSize) - KBTS__POINTER_AFTER(char, Result));
-      }
-      else
-      {
-        Result = (kbts__arena_block *)&Arena->BlockSentinel;
-        Arena->Error = 1;
-        return Result;
-      }
-    }
-    else
-    {
-      KBTS__DLLIST_REMOVE(&Result->Header);
-    }
-
-    KBTS__DLLIST_INSERT_BEFORE(&Result->Header, &Arena->BlockSentinel);
-
-    Result->Used = 0;
-  }
-
+  if(Arena->Error) return 0;
+  void *Result = kbts__MemoryPush(Arena->Memory, Size, Align);
+  if(!Result) Arena->Error = 1;
   return Result;
 }
-
-static int kbts__ArenaBlockIsValid(kbts_arena *Arena, kbts__arena_block *Block)
+static void *kbts__PushArraySize(kbts__arena *Arena, kbts_un Count, kbts_un Size, kbts_un Align)
 {
-  int Result = Block && (&Block->Header != &Arena->BlockSentinel);
-  return Result;
-}
-
-static void kbts__ClearArena(kbts_arena *Arena)
-{
-  kbts__EnsureArenaInitialized(Arena);
-
-  kbts_arena_block_header *First = Arena->BlockSentinel.Next;
-  kbts_arena_block_header *Last = Arena->BlockSentinel.Prev;
-
-  if(kbts__ArenaBlockIsValid(Arena, (kbts__arena_block *)First))
-  {
-    First->Prev = Arena->FreeBlockSentinel.Prev;
-    Last->Next = &Arena->FreeBlockSentinel;
-
-    First->Prev->Next = First;
-    Last->Next->Prev = Last;
-
-    KBTS__DLLIST_SENTINEL_INIT(&Arena->BlockSentinel);
-  }
-}
-
-static void *kbts__PushSize(kbts_arena *Arena, kbts_un Size, kbts_un Align)
-{
-  kbts__EnsureArenaInitialized(Arena);
-  void *Result = 0;
-
-  if(!Arena->Error)
-  {
-    kbts__arena_block *Block = (kbts__arena_block *)Arena->BlockSentinel.Prev;
-    char *BlockMemory = KBTS__POINTER_AFTER(char, Block);
-
-    if(kbts__ArenaBlockIsValid(Arena, Block))
-    {
-      char *Top = BlockMemory + Block->Used;
-      char *TopAligned = KBTS__ALIGN_POINTER(char, Top, Align);
-
-      if((kbts_un)((TopAligned + Size) - BlockMemory) <= Block->Size)
-      {
-        Result = TopAligned;
-      }
-    }
-
-    if(!Result)
-    {
-      Block = kbts__ArenaPushBlock(Arena, Size, Align);
-
-      if(kbts__ArenaBlockIsValid(Arena, Block))
-      {
-        BlockMemory = KBTS__POINTER_AFTER(char, Block);
-        char *Top = BlockMemory + Block->Used;
-        char *TopAligned = KBTS__ALIGN_POINTER(char, Top, Align);
-
-        Result = TopAligned;
-      }
-    }
-
-    if(Result)
-    {
-      Block->Used = (kbts_un)((char *)Result + Size - BlockMemory);
-      KBTS_ASSERT(Block->Used <= Block->Size);
-    }
-  }
-
-  return Result;
+  if(Size && Count > (kbts_un)-1 / Size)
+  { Arena->Error = 1; if(Arena->Memory) Arena->Memory->Error = 1; return 0; }
+  return kbts__PushSize(Arena, Count * Size, Align);
 }
 #define kbts__PushType(Arena, Type) (Type *)kbts__PushSize((Arena), sizeof(Type), KBTS_ALIGNOF(Type))
-#define kbts__PushArray(Arena, Type, Count) (Type *)kbts__PushSize((Arena), sizeof(Type) * (Count), KBTS_ALIGNOF(Type))
+#define kbts__PushArray(Arena, Type, Count) (Type *)kbts__PushArraySize((Arena), (Count), sizeof(Type), KBTS_ALIGNOF(Type))
 
-static kbts__arena_lifetime kbts__BeginLifetime(kbts_arena *Arena)
+static kbts__arena_lifetime kbts__BeginLifetime(kbts__arena *Arena)
 {
-  kbts__arena_block *Block = (kbts__arena_block *)Arena->BlockSentinel.Prev;
-  kbts_un Used = 0;
-
-  if(!Block)
-  {
-    Block = (kbts__arena_block *)&Arena->BlockSentinel;
-  }
-
-  if(kbts__ArenaBlockIsValid(Arena, Block))
-  {
-    Used = Block->Used;
-  }
-
   kbts__arena_lifetime Result = KBTS__ZERO;
   Result.Arena = Arena;
-  Result.BlockHeader = &Block->Header;
-  Result.Used = Used;
+  Result.Used = Arena->Memory ? Arena->Memory->Used : 0;
   return Result;
 }
-
 static void kbts__EndLifetime(kbts__arena_lifetime *Lifetime)
 {
-  kbts_arena *Arena = Lifetime->Arena;
-  if(Arena && !Arena->Error)
+  if(Lifetime->Arena && Lifetime->Arena->Memory)
+    Lifetime->Arena->Memory->Used = Lifetime->Used;
+}
+
+static kbts_un kbts__ProbeCapacity(kbts_shape_config *Config)
+{
+  kbts_un Capacity = 1;
+  if(Config->Shaper == KBTS_SHAPER_INDIC && Config->Locl)
   {
-    kbts__arena_block *Block = (kbts__arena_block *)Lifetime->BlockHeader;
-
-    if(kbts__ArenaBlockIsValid(Lifetime->Arena, Block))
+    const kbts_u16 *Roots = KBTS__POINTER_AFTER(kbts_u16, Config->Locl);
+    for(kbts_u32 I = 0; I < Config->Locl->LookupIndexCount; ++I)
     {
-      Block->Used = Lifetime->Used;
-    }
-
-    // This works even if Block is the sentinel.
-    for(kbts_arena_block_header *Header = Block->Header.Next;
-        kbts__ArenaBlockIsValid(Arena, (kbts__arena_block *)Header);
-        )
-    {
-      kbts_arena_block_header *Next = Header->Next;
-
-      KBTS__DLLIST_REMOVE(Header);
-      KBTS__DLLIST_INSERT_BEFORE(Header, &Arena->FreeBlockSentinel);
-
-      Header = Next;
+      if(Roots[I] >= Config->Font->CompiledContexts->LookupCount) return 0;
+      kbts_u32 Inserted = Config->Font->CompiledContexts->LookupSummaries[Roots[I]].MaxInserted;
+      if(Inserted > 0xfffffffeu - Capacity) return 0;
+      Capacity += Inserted;
     }
   }
+  return KBTS__MAX(Capacity, 4);
 }
 
-static void kbts__MoveArena(kbts_arena *To, kbts_arena *From)
+/* Named partitions: frame/decomposition union, matcher window, one fixed queue
+ * per GPOS lookup plus merge buffer, stream rows, and the independent locl probe.
+ * Queue tombstones are compacted before reusing a full queue. Nothing grows. */
+static kbts_un kbts__ShapeWorkspaceSize(kbts_un G, kbts_un Buckets, kbts_un Window,
+    kbts_un Stages, kbts_un Symbols, kbts_un Native, kbts_un Probe)
 {
-  *To = *From;
-
-  if(To->BlockSentinel.Next != &From->BlockSentinel)
-  {
-    To->BlockSentinel.Next->Prev = To->BlockSentinel.Prev->Next = &To->BlockSentinel;
-  }
-  else
-  {
-    KBTS__DLLIST_SENTINEL_INIT(&To->BlockSentinel);
-  }
-
-  if(To->FreeBlockSentinel.Next != &From->FreeBlockSentinel)
-  {
-    To->FreeBlockSentinel.Next->Prev = To->FreeBlockSentinel.Prev->Next = &To->FreeBlockSentinel;
-  }
-  else
-  {
-    KBTS__DLLIST_SENTINEL_INIT(&To->FreeBlockSentinel);
-  }
-}
-
-static void kbts__FreeArena(kbts_arena *Arena)
-{
-  kbts__EnsureArenaInitialized(Arena);
-
-  kbts_arena StackArena;
-  kbts__MoveArena(&StackArena, Arena);
-
-  kbts_arena_block_header *Sentinels[2] = {&StackArena.BlockSentinel, &StackArena.FreeBlockSentinel};
-
-  KBTS__FOR(SentinelIndex, 0, KBTS__ARRAY_LENGTH(Sentinels))
-  {
-    kbts_arena_block_header *Sentinel = Sentinels[SentinelIndex];
-
-    for(kbts_arena_block_header *Header = Sentinel->Next;
-        Header != Sentinel;
-        )
-    {
-      kbts_arena_block_header *Next = Header->Next;
-      kbts__arena_block *Block = (kbts__arena_block *)Header;
-
-      kbts__AllocatorFree(StackArena.Allocator, StackArena.AllocatorData, Block->BaseAllocation);
-
-      Header = Next;
-    }
-  }
-}
-
-static void kbts__ArenaAllocator(void *Data, kbts_allocator_op *Op)
-{
-  kbts_arena *Arena = (kbts_arena *)Data;
-
-  if(Op->Kind == KBTS_ALLOCATOR_OP_KIND_ALLOCATE)
-  {
-    Op->Allocate.Pointer = kbts__PushSize(Arena, Op->Allocate.Size, 8);
-  }
-  // No free!
-}
-
-static int kbts__InitializeFixedMemoryArena(kbts_arena *Arena, void *Memory, kbts_un MemorySize)
-{
-  int Result = 0;
-  KBTS_MEMSET(Arena, 0, sizeof(*Arena));
-  Arena->Allocator = kbts__NullAllocator;
-  kbts__EnsureArenaInitialized(Arena);
-
-  char *BaseAligned = KBTS__ALIGN_POINTER(char, Memory, KBTS_ALIGNOF(kbts__arena_block));
-  char *End = (char *)Memory + MemorySize;
-  kbts_un TotalBlockSize = (kbts_un)(End - BaseAligned);
-
-  if(TotalBlockSize >= sizeof(kbts__arena_block))
-  {
-    kbts__arena_block *Block = (kbts__arena_block *)BaseAligned;
-
-    Block->Header.Prev = Block->Header.Next = &Arena->BlockSentinel;
-    Block->Header.Prev->Next = Block->Header.Next->Prev = &Block->Header;
-    Block->BaseAllocation = 0;
-    Block->Size = TotalBlockSize - sizeof(kbts__arena_block);
-    Block->Used = 0;
-
-    Result = 1;
-  }
-
-  return Result;
-}
-
-
-static kbts_un kbts__ShapeScratchpadSize(kbts_un Buckets, kbts_un Window)
-{
-  kbts_un ScratchSize = KBTS__MAX(sizeof(kbts_glyph) * KBTS__MAXIMUM_DECOMPOSITION_CODEPOINTS,
+  if(G > 0xfffffffeu || !Probe || !kbts_SizeOfGlyphStorage(Probe)) return 0;
+  kbts_un Size = 0, Words = G / 64 + !!(G & 63);
+  kbts_un FrameBytes = KBTS__MAX(sizeof(kbts_glyph) * KBTS__MAXIMUM_DECOMPOSITION_CODEPOINTS,
       sizeof(kbts__gsub_frame) * KBTS_LOOKUP_STACK_SIZE);
-  kbts_un Size = sizeof(kbts_shape_scratchpad) + ScratchSize + 7 * KBTS_ALIGNOF(kbts_shape_scratchpad);
-  if(Buckets > (0xFFFFFFFFu - Size) / sizeof(kbts__glyph_bucket *)) return 0;
-  Size += Buckets * sizeof(kbts__glyph_bucket *);
-  kbts_un WindowWidth = sizeof(kbts_u32) * 2 + sizeof(kbts_glyph_ref);
-  if(Window > (0xFFFFFFFFu - Size) / WindowWidth) return 0;
-  return Size + Window * WindowWidth;
+#define KBTS__WORKSPACE(N,T) if(!kbts__BoundAdd(&Size,(N),sizeof(T),KBTS_ALIGNOF(T))) return 0
+  KBTS__WORKSPACE(1,kbts_shape_scratchpad);
+  if(!kbts__BoundAdd(&Size,1,FrameBytes,KBTS__MAX(KBTS_ALIGNOF(kbts_glyph),KBTS_ALIGNOF(kbts__gsub_frame)))) return 0;
+  KBTS__WORKSPACE(Buckets,kbts__glyph_bucket *);
+  KBTS__WORKSPACE(Window,kbts_u32);
+  KBTS__WORKSPACE(Window,kbts_glyph_ref);
+  KBTS__WORKSPACE(Window,kbts_u32);
+  KBTS__WORKSPACE(Buckets,kbts__glyph_bucket);
+  if(G && Buckets > (kbts_un)-1 / G) return 0;
+  KBTS__WORKSPACE(Buckets * G,kbts__bucketed_glyph);
+  KBTS__WORKSPACE(G,kbts__bucketed_glyph);
+  KBTS__WORKSPACE(Stages / 64 + !!(Stages & 63),kbts_u64);
+  KBTS__WORKSPACE(Symbols / 32 + !!(Symbols & 31),kbts_u32);
+  if(Words && (Symbols > (kbts_un)-1 / Words || Native > (kbts_un)-1 / Words)) return 0;
+  KBTS__WORKSPACE(Symbols * Words,kbts_u64);
+  KBTS__WORKSPACE(Native * Words,kbts_u64);
+  if(!kbts__BoundAdd(&Size,1,kbts_SizeOfGlyphStorage(Probe),1)) return 0;
+#undef KBTS__WORKSPACE
+  return Size;
 }
 
 static void kbts__BindScratchpadConfig(kbts_shape_scratchpad *Result, kbts_shape_config *Config)
@@ -18118,6 +16371,7 @@ static void kbts__BindScratchpadConfig(kbts_shape_scratchpad *Result, kbts_shape
   Result->Config = Config;
   Result->Storage = 0;
   Result->GposFirstLookup = Config->GsubPlan->GsubLookupCount;
+  Result->SkipPostGposCleanup = 0;
   Result->SequentialLookupCount = (kbts_u32)kbts__SequentialLookupCount(Config);
   Result->GlyphIdCount = Blob->GlyphCount;
   Result->LookupSubtableCount = Blob->LookupSubtableCount;
@@ -18143,138 +16397,79 @@ static void kbts__BindScratchpadConfig(kbts_shape_scratchpad *Result, kbts_shape
   Result->JoiningBefore = Result->JoiningAfter = 0;
 }
 
-static kbts_shape_scratchpad *kbts__PlaceScratchpad(kbts_shape_config *Config, void *Memory,
-    kbts_allocator_function *Allocator, void *AllocatorData, kbts_u32 Buckets, kbts_u32 Window)
+KBTS_EXPORT kbts_un kbts_SizeOfShapeScratchpad(kbts_shape_config *Config, kbts_un GlyphCapacity)
 {
-  kbts__pointer_bump_allocator Bump = kbts__PointerBumpAllocator(Memory);
+  if(!Config || !Config->Font || !Config->Font->CompiledContexts || !Config->GsubPlan) return 0;
+  const kbts__gsub_plan *Plan = Config->GsubPlan;
+  kbts_un Count = kbts__SequentialLookupCount(Config);
+  if(Count < Plan->GsubLookupCount || Count > 0xFFFFFFFFu) return 0;
+  return kbts__ShapeWorkspaceSize(GlyphCapacity, Count - Plan->GsubLookupCount,
+      Config->WindowCapacity, Plan->StageCount, Plan->SymbolCount, Plan->NativeCount, kbts__ProbeCapacity(Config));
+}
+
+KBTS_EXPORT kbts_shape_scratchpad *kbts_PlaceShapeScratchpad(kbts_shape_config *Config, void *Scratch, kbts_un GlyphCapacity)
+{
+  if(!Scratch || !kbts_SizeOfShapeScratchpad(Config, GlyphCapacity)) return 0;
+  const kbts__gsub_plan *Plan = Config->GsubPlan;
+  kbts_un Buckets = kbts__SequentialLookupCount(Config) - Plan->GsubLookupCount;
+  kbts_un Window = Config->WindowCapacity, Words = GlyphCapacity / 64 + !!(GlyphCapacity & 63);
+  kbts__pointer_bump_allocator Bump = kbts__PointerBumpAllocator(Scratch);
   kbts_shape_scratchpad *Result = kbts__PointerPushType(&Bump, kbts_shape_scratchpad);
   KBTS_MEMSET(Result, 0, sizeof(*Result));
-  Result->Allocator = Allocator ? Allocator : kbts__DefaultAllocator;
-  Result->AllocatorData = AllocatorData;
-  Result->BucketCapacity = Buckets;
+  Result->GlyphCapacity = GlyphCapacity;
+  Result->ProbeCapacity = kbts__ProbeCapacity(Config);
+  Result->BucketCapacity = (kbts_u32)Buckets;
   kbts_un ScratchSize = KBTS__MAX(sizeof(kbts_glyph) * KBTS__MAXIMUM_DECOMPOSITION_CODEPOINTS,
       sizeof(kbts__gsub_frame) * KBTS_LOOKUP_STACK_SIZE);
   Result->ScratchMemory = kbts__PointerPush(&Bump, ScratchSize,
       KBTS__MAX(KBTS_ALIGNOF(kbts_glyph), KBTS_ALIGNOF(kbts__gsub_frame)));
   Result->LookupGlyphBuckets = kbts__PointerPushArray(&Bump, kbts__glyph_bucket *, Buckets);
-  KBTS_MEMSET(Result->LookupGlyphBuckets, 0, (kbts_un)Buckets * sizeof(kbts__glyph_bucket *));
-  Result->CompiledWindowCapacity = Window;
+  KBTS_MEMSET(Result->LookupGlyphBuckets, 0, Buckets * sizeof(kbts__glyph_bucket *));
+  Result->CompiledWindowCapacity = (kbts_u32)Window;
   Result->CompiledSymbols = kbts__PointerPushArray(&Bump, kbts_u32, Window);
   Result->CompiledGlyphs = kbts__PointerPushArray(&Bump, kbts_glyph_ref, Window);
   Result->CompiledOffsets = kbts__PointerPushArray(&Bump, kbts_u32, Window);
+  kbts__glyph_bucket *Headers = kbts__PointerPushArray(&Bump, kbts__glyph_bucket, Buckets);
+  kbts__bucketed_glyph *Entries = kbts__PointerPushArray(&Bump, kbts__bucketed_glyph, Buckets * GlyphCapacity);
+  for(kbts_un I = 0; I < Buckets; ++I)
+  {
+    kbts__glyph_bucket *Bucket = &Headers[I];
+    KBTS_MEMSET(Bucket, 0, sizeof(*Bucket));
+    Bucket->Glyphs = Entries + I * GlyphCapacity;
+    Bucket->Memory = Bucket->Glyphs;
+    Bucket->Capacity = GlyphCapacity;
+    Bucket->Next = Result->FreeGlyphBuckets;
+    Result->FreeGlyphBuckets = Bucket;
+  }
+  Result->SortBuffer = kbts__PointerPushArray(&Bump, kbts__bucketed_glyph, GlyphCapacity);
+  Result->SortMemory = Result->SortBuffer;
+  Result->SortCapacity = GlyphCapacity;
+  kbts__gsub_stream *Stream = &Result->Stream;
+  Stream->Memory = kbts__PointerPushArray(&Bump, kbts_u64, Plan->StageCount / 64 + !!(Plan->StageCount & 63));
+  kbts__PointerPushArray(&Bump, kbts_u32, Plan->SymbolWordCount);
+  Stream->MetadataCapacity = Bump.At - (kbts_uptr)Stream->Memory;
+  Stream->SymbolMemory = kbts__PointerPushArray(&Bump, kbts_u64, (kbts_un)Plan->SymbolCount * Words);
+  Stream->SymbolCapacity = (kbts_un)Plan->SymbolCount * Words * sizeof(kbts_u64);
+  Stream->NativeMemory = kbts__PointerPushArray(&Bump, kbts_u64, (kbts_un)Plan->NativeCount * Words);
+  Stream->NativeCapacity = (kbts_un)Plan->NativeCount * Words * sizeof(kbts_u64);
+  Stream->Capacity = GlyphCapacity;
+  Stream->SymbolStride = Words;
+  Result->ProbeMemory = kbts__PointerPush(&Bump, kbts_SizeOfGlyphStorage(Result->ProbeCapacity), 1);
   kbts__BindScratchpadConfig(Result, Config);
-  return Result;
-}
-
-KBTS_EXPORT kbts_un kbts_SizeOfShapeScratchpad(kbts_shape_config *Config)
-{
-  if(!Config || !Config->Font || !Config->Font->CompiledContexts || !Config->GsubPlan) return 0;
-  kbts_un Count = kbts__SequentialLookupCount(Config);
-  if(Count < Config->GsubPlan->GsubLookupCount || Count > 0xFFFFFFFFu) return 0;
-  return kbts__ShapeScratchpadSize(Count - Config->GsubPlan->GsubLookupCount, Config->WindowCapacity);
-}
-
-KBTS_EXPORT kbts_shape_scratchpad *kbts_PlaceShapeScratchpad(kbts_shape_config *Config, void *Memory, kbts_allocator_function *Allocator, void *AllocatorData)
-{
-  if(!Memory || !kbts_SizeOfShapeScratchpad(Config)) return 0;
-  return kbts__PlaceScratchpad(Config, Memory, Allocator, AllocatorData,
-      (kbts_u32)kbts__SequentialLookupCount(Config) - Config->GsubPlan->GsubLookupCount, Config->WindowCapacity);
-}
-
-KBTS_EXPORT kbts_shape_scratchpad *kbts_PlaceShapeScratchpadFixedMemory(kbts_shape_config *Config, void *Memory, int Size)
-{
-  kbts_un ScratchpadSize = kbts_SizeOfShapeScratchpad(Config);
-  kbts_un Overhead = sizeof(kbts_arena) + KBTS_ALIGNOF(kbts_arena) - 1 +
-      sizeof(kbts__arena_block) + KBTS_ALIGNOF(kbts__arena_block) - 1;
-  if(!Memory || !ScratchpadSize || Size < 0 || (kbts_un)Size < ScratchpadSize ||
-      (kbts_un)Size - ScratchpadSize < Overhead) return 0;
-  kbts_arena *Arena = KBTS__ALIGN_POINTER(kbts_arena, (char *)Memory + ScratchpadSize, KBTS_ALIGNOF(kbts_arena));
-  void *Remaining = KBTS__POINTER_AFTER(void, Arena);
-  kbts_un Used = (kbts_un)((char *)Remaining - (char *)Memory);
-  if(!kbts__InitializeFixedMemoryArena(Arena, Remaining, (kbts_un)Size - Used)) return 0;
-  return kbts_PlaceShapeScratchpad(Config, Memory, kbts__ArenaAllocator, Arena);
-}
-
-KBTS_EXPORT kbts_shape_scratchpad *kbts_CreateShapeScratchpad(kbts_shape_config *Config, kbts_allocator_function *Allocator, void *AllocatorData)
-{
-  if(!Allocator) Allocator = kbts__DefaultAllocator;
-  kbts_un Size = kbts_SizeOfShapeScratchpad(Config);
-  if(!Size) return 0;
-  void *Memory = kbts__AllocatorAllocate(Allocator, AllocatorData, Size);
-  if(!Memory) return 0;
-  kbts_shape_scratchpad *Result = kbts_PlaceShapeScratchpad(Config, Memory, Allocator, AllocatorData);
-  Result->BaseAllocation = Memory;
   return Result;
 }
 
 static void kbts__ReleaseGlyphBucket(kbts_shape_scratchpad *Scratchpad, kbts_un SequentialLookupIndex);
 
-/* High-level execution owns one reusable heap workspace. Rebinding never
- * consults old glyph storage or configuration data, whose lifetime may end
- * before the next call. Failure leaves the old allocation graph intact. */
-static kbts_b32 kbts__BindShapeScratchpad(kbts_shape_scratchpad **Workspace,
-    kbts_shape_config *Config, kbts_allocator_function *Allocator, void *AllocatorData)
-{
-  if(!kbts_SizeOfShapeScratchpad(Config)) return 0;
-  if(!*Workspace)
-  {
-    *Workspace = kbts_CreateShapeScratchpad(Config, Allocator, AllocatorData);
-    return *Workspace != 0;
-  }
-  kbts_shape_scratchpad *Old = *Workspace;
-  KBTS_ASSERT(Old->BaseAllocation);
-  kbts_u32 Buckets = (kbts_u32)kbts__SequentialLookupCount(Config) - Config->GsubPlan->GsubLookupCount;
-  kbts_u32 Window = Config->WindowCapacity;
-  kbts_shape_scratchpad *New = Old;
-  if(Buckets > Old->BucketCapacity || Window > Old->CompiledWindowCapacity)
-  {
-    Buckets = KBTS__MAX(Buckets, Old->BucketCapacity);
-    Window = KBTS__MAX(Window, Old->CompiledWindowCapacity);
-    kbts_un Size = kbts__ShapeScratchpadSize(Buckets, Window);
-    if(!Size) return 0;
-    void *Memory = kbts__AllocatorAllocate(Old->Allocator, Old->AllocatorData, Size);
-    if(!Memory) return 0;
-    New = kbts__PlaceScratchpad(Config, Memory, Old->Allocator, Old->AllocatorData, Buckets, Window);
-    New->BaseAllocation = Memory;
-  }
-  for(kbts_u32 I = Old->GposFirstLookup; I < Old->SequentialLookupCount; ++I)
-    kbts__ReleaseGlyphBucket(Old, I);
-  if(New != Old)
-  {
-    New->FreeGlyphBuckets = Old->FreeGlyphBuckets;
-    New->SortBuffer = Old->SortBuffer;
-    New->SortMemory = Old->SortMemory;
-    New->SortCapacity = Old->SortCapacity;
-    New->Stream = Old->Stream;
-    kbts__AllocatorFree(Old->Allocator, Old->AllocatorData, Old->BaseAllocation);
-    *Workspace = New;
-  }
-  kbts__BindScratchpadConfig(New, Config);
-  return 1;
-}
 
-/* Vectors grow without repairing membership: glyphs carry indices, not
- * interior pointers. The raw allocator result is the only freed address. */
 static kbts_b32 kbts__ReserveBucketEntries(kbts_shape_scratchpad *Scratchpad,
     kbts__bucketed_glyph **Entries, void **Memory, kbts_un *Capacity,
     kbts_un Count, kbts_un Required)
 {
+  KBTS__UNUSED(Entries); KBTS__UNUSED(Memory); KBTS__UNUSED(Count);
   if(Required <= *Capacity) return 1;
-  kbts_un Limit = (0xFFFFFFFFu - (KBTS_ALIGNOF(kbts__bucketed_glyph) - 1)) / sizeof(kbts__bucketed_glyph);
-  if(Required > Limit) { Scratchpad->Error = KBTS_SHAPE_ERROR_OUT_OF_MEMORY; return 0; }
-  kbts_un NewCapacity = *Capacity ? *Capacity : 16;
-  while(NewCapacity < Required)
-    NewCapacity = NewCapacity <= Limit / 2 ? NewCapacity * 2 : Required;
-  void *Raw = kbts__AllocatorAllocate(Scratchpad->Allocator, Scratchpad->AllocatorData,
-      NewCapacity * sizeof(kbts__bucketed_glyph) + KBTS_ALIGNOF(kbts__bucketed_glyph) - 1);
-  if(!Raw) { Scratchpad->Error = KBTS_SHAPE_ERROR_OUT_OF_MEMORY; return 0; }
-  kbts__bucketed_glyph *New = KBTS__ALIGN_POINTER(kbts__bucketed_glyph, Raw, KBTS_ALIGNOF(kbts__bucketed_glyph));
-  if(Count) KBTS_MEMCPY(New, *Entries, Count * sizeof(*New));
-  kbts__AllocatorFree(Scratchpad->Allocator, Scratchpad->AllocatorData, *Memory);
-  *Entries = New;
-  *Memory = Raw;
-  *Capacity = NewCapacity;
-  return 1;
+  Scratchpad->Error = KBTS_SHAPE_ERROR_OUT_OF_MEMORY;
+  return 0;
 }
 
 static kbts__bucketed_glyph *kbts__InsertGlyphIntoBucket(kbts_shape_scratchpad *Scratchpad, kbts_un BucketIndex, kbts_glyph *Glyph, kbts_u16 FeatureValue)
@@ -18287,22 +16482,25 @@ static kbts__bucketed_glyph *kbts__InsertGlyphIntoBucket(kbts_shape_scratchpad *
   {
     Bucket = Scratchpad->FreeGlyphBuckets;
     if(Bucket) Scratchpad->FreeGlyphBuckets = Bucket->Next;
-    else
-    {
-      void *Raw = kbts__AllocatorAllocate(Scratchpad->Allocator, Scratchpad->AllocatorData,
-          sizeof(*Bucket) + KBTS_ALIGNOF(kbts__glyph_bucket) - 1);
-      if(!Raw) { Scratchpad->Error = KBTS_SHAPE_ERROR_OUT_OF_MEMORY; return 0; }
-      Bucket = KBTS__ALIGN_POINTER(kbts__glyph_bucket, Raw, KBTS_ALIGNOF(kbts__glyph_bucket));
-      KBTS_MEMSET(Bucket, 0, sizeof(*Bucket));
-      Bucket->BaseAllocation = Raw;
-    }
+    else { Scratchpad->Error = KBTS_SHAPE_ERROR_OUT_OF_MEMORY; return 0; }
     Bucket->Next = 0;
     *Slot = Bucket;
   }
+  kbts__UnbucketGlyph(Scratchpad, Glyph);
+  if(Bucket->Count == Bucket->Capacity)
+  {
+    kbts_un Live = 0;
+    for(kbts_un I = 0; I < Bucket->Count; ++I)
+      if(Bucket->Glyphs[I].SortKey != KBTS__DELETED_SORT_KEY)
+      {
+        Bucket->Glyphs[Live] = Bucket->Glyphs[I];
+        kbts__Glyph(Scratchpad->Storage, Bucket->Glyphs[Live].Glyph)->Bucketed = (kbts_u32)Live + 1;
+        ++Live;
+      }
+    Bucket->Count = Live;
+  }
   if(!kbts__ReserveBucketEntries(Scratchpad, &Bucket->Glyphs, &Bucket->Memory,
       &Bucket->Capacity, Bucket->Count, Bucket->Count + 1)) return 0;
-  /* A live rebucket cancels the old entry only after allocation succeeds. */
-  kbts__UnbucketGlyph(Scratchpad, Glyph);
   kbts__bucketed_glyph *Result = &Bucket->Glyphs[Bucket->Count++];
   Result->Glyph = Glyph->Ref;
   Result->SortKey = Glyph->SortKey;
@@ -18312,129 +16510,97 @@ static kbts__bucketed_glyph *kbts__InsertGlyphIntoBucket(kbts_shape_scratchpad *
   return Result;
 }
 
-static kbts_b32 kbts__BucketGlyph(kbts_shape_scratchpad *Scratchpad, kbts_glyph *Glyph, kbts_un MinimumSequentialLookupIndex, kbts_b32 ScanBackwards)
+typedef struct kbts__lookup_word
 {
-  KB_PROFILE_SCOPE(KBP_BUCKET);
-  kbts_b32 Result = 0;
-  kbts_shape_config *Config = Scratchpad->Config;
-  kbts_un SequentialLookupCount = Scratchpad->SequentialLookupCount;
+  kbts_un Index;
+  kbts_u32 Bits;
+} kbts__lookup_word;
 
-  if(MinimumSequentialLookupIndex < SequentialLookupCount)
+static kbts__lookup_word kbts__NextLookupWord(const kbts_u32 *Row,
+    kbts_un WordCount, kbts_un FirstWord, kbts_u32 FirstMask)
+{
+  kbts__lookup_word Result = {FirstWord, 0};
+  for(; Result.Index < WordCount; ++Result.Index)
   {
-    kbts__matrix_index LastIndex = kbts__IdSequentialLookupMatrixIndex(SequentialLookupCount - 1, Glyph->Id, SequentialLookupCount);
-    kbts_un OnePastLastWordIndex = LastIndex.WordIndex + 1;
-
-    if(Glyph->Id < Config->GlyphCount)
-    {
-      kbts_glyph_config *GlyphConfig = Glyph->Config;
-
-      if(!GlyphConfig)
-      {
-        kbts_u32 *IdSequentialLookupMatrix = Config->IdSequentialLookupMatrix;
-        kbts__matrix_index MatrixIndex = kbts__IdSequentialLookupMatrixIndex(MinimumSequentialLookupIndex, Glyph->Id, SequentialLookupCount);
-        kbts_u32 *At = &IdSequentialLookupMatrix[MatrixIndex.WordIndex];
-        // Mask out lookups < MinimumSequentialLookupIndex.
-        kbts_u32 BeforeFirstMask = ((1u << MatrixIndex.BitIndex) - 1);
-        kbts_u32 Bits = *At++ & ~BeforeFirstMask;
-        kbts_un SequentialLookupIndexOffset = 0;
-
-        kbts_un WordIndex = MatrixIndex.WordIndex + 1;
-        while((WordIndex < OnePastLastWordIndex) &&
-              !Bits)
-        {
-          Bits = *At++;
-
-          WordIndex += 1;
-          SequentialLookupIndexOffset += KBTS__BIT_WIDTH(kbts_u32);
-        }
-
-        if(Bits)
-        {
-          SequentialLookupIndexOffset += (kbts_un)kbts__LsbPositionOrBitWidth32(Bits) - (kbts_un)MatrixIndex.BitIndex;
-          kbts_un SequentialLookupIndex = MinimumSequentialLookupIndex + SequentialLookupIndexOffset;
-          kbts__InsertGlyphIntoBucket(Scratchpad, SequentialLookupIndex, Glyph, 1);
-          Result = 1;
-        }
-      }
-      else
-      {
-        kbts_u32 *IdSequentialLookupMatrix = Config->IdSequentialLookupMatrix;
-        kbts__matrix_index MatrixIndex = kbts__IdSequentialLookupMatrixIndex(MinimumSequentialLookupIndex, Glyph->Id, SequentialLookupCount);
-        kbts__matrix_index RowIndex = kbts__IdSequentialLookupMatrixIndex(MinimumSequentialLookupIndex, 0, SequentialLookupCount);
-
-        kbts_u32 *At = &IdSequentialLookupMatrix[MatrixIndex.WordIndex];
-        kbts_u32 *AtEnabled = &GlyphConfig->EnabledLookupBits[RowIndex.WordIndex];
-        kbts_u32 *AtDisabled = &GlyphConfig->DisabledLookupBits[RowIndex.WordIndex];
-
-        // Mask out lookups < MinimumSequentialLookupIndex.
-        kbts_u32 BeforeFirstMask = ((1u << MatrixIndex.BitIndex) - 1);
-
-        kbts_u32 Bits;
-        kbts_un SequentialLookupIndexOffset = 0;
-        kbts_un WordIndex = MatrixIndex.WordIndex + 1;
-        if(GlyphConfig->HasEnabledLookups)
-        {
-          /* Feature enables must not turn unrelated glyphs into candidates.
-           * Keep applicability separate from the default feature selection. */
-          kbts_u32 *AtAll = &Config->IdAllLookupMatrix[MatrixIndex.WordIndex];
-          Bits = ((*At++ | (*AtEnabled++ & *AtAll++)) & ~(*AtDisabled++)) & ~BeforeFirstMask;
-          while(WordIndex < OnePastLastWordIndex && !Bits)
-          {
-            Bits = (*At++ | (*AtEnabled++ & *AtAll++)) & ~(*AtDisabled++);
-            ++WordIndex;
-            SequentialLookupIndexOffset += KBTS__BIT_WIDTH(kbts_u32);
-          }
-        }
-        else
-        {
-          Bits = (*At++ & ~(*AtDisabled++)) & ~BeforeFirstMask;
-          while(WordIndex < OnePastLastWordIndex && !Bits)
-          {
-            Bits = *At++ & ~(*AtDisabled++);
-            ++WordIndex;
-            SequentialLookupIndexOffset += KBTS__BIT_WIDTH(kbts_u32);
-          }
-        }
-
-        if(Bits)
-        {
-          SequentialLookupIndexOffset += (kbts_un)kbts__LsbPositionOrBitWidth32(Bits) - (kbts_un)MatrixIndex.BitIndex;
-          kbts_un SequentialLookupIndex = MinimumSequentialLookupIndex + SequentialLookupIndexOffset;
-          kbts_u16 FeatureValue = 1;
-
-          KBTS__FOR(NonBinaryEnabledLookupIndex, 0, GlyphConfig->NonBinaryEnabledLookupCount)
-          {
-            kbts__enabled_lookup *Enabled = &GlyphConfig->NonBinaryEnabledLookups[NonBinaryEnabledLookupIndex];
-
-            if(Enabled->SequentialLookupIndex == SequentialLookupIndex)
-            {
-              FeatureValue = (kbts_u16)Enabled->Value;
-              
-              break;
-            }
-          }
-
-          kbts__InsertGlyphIntoBucket(Scratchpad, SequentialLookupIndex, Glyph, FeatureValue);
-          Result = 1;
-        }
-      }
-    }
-    else
-    {
-      // Out-of-bounds glyphs traverse every lookup, I guess.
-      kbts__InsertGlyphIntoBucket(Scratchpad, MinimumSequentialLookupIndex, Glyph, 1);
-    }
+    Result.Bits = Row[Result.Index] & FirstMask;
+    if(Result.Bits) break;
+    FirstMask = ~(kbts_u32)0;
   }
-
   return Result;
 }
 
-static kbts_b32 kbts__GsubLookupEnabled(const kbts_shape_config *Config, kbts_u32 GlyphId,
-    const kbts_glyph_config *GlyphConfig, kbts_u32 SequentialLookupIndex, kbts_u16 *FeatureValue)
+static kbts__lookup_word kbts__GlyphLookupCoverage(const kbts_shape_config *Config,
+    const kbts_glyph *Glyph, kbts_un WordCount, kbts_un FirstWord, kbts_u32 FirstMask)
+{
+  kbts__lookup_word Result = {FirstWord, 0};
+  if(FirstWord >= WordCount) return Result;
+  if(Glyph->Id >= Config->GlyphCount)
+  {
+    // Unknown IDs must still visit each lookup; coverage cannot reject them.
+    Result.Bits = FirstMask;
+    return Result;
+  }
+  const kbts_u32 *Row = Config->IdAllLookupMatrix + (kbts_un)Glyph->Id * WordCount;
+  return kbts__NextLookupWord(Row, WordCount, FirstWord, FirstMask);
+}
+
+static void kbts__BucketCoveredGlyph(kbts_shape_scratchpad *Scratchpad,
+    kbts_glyph *Glyph, kbts_un WordCount, kbts__lookup_word Word)
+{
+  KB_PROFILE_SCOPE(KBP_BUCKET);
+  const kbts_shape_config *Config = Scratchpad->Config;
+  const kbts_glyph_config *GlyphConfig = Glyph->Id < Config->GlyphCount ? Glyph->Config : 0;
+  if(Glyph->Id < Config->GlyphCount)
+  {
+    kbts_un RowOffset = (kbts_un)Glyph->Id * WordCount;
+    const kbts_u32 *Row = Config->IdAllLookupMatrix + RowOffset;
+    while(Word.Bits)
+    {
+      // Consume the already-read coverage word. If feature selection rejects
+      // all its bits, resume at the next word instead of searching it again.
+      kbts_u32 Enabled = Config->IdSequentialLookupMatrix[RowOffset + Word.Index];
+      if(GlyphConfig)
+      {
+        if(GlyphConfig->HasEnabledLookups) Enabled |= GlyphConfig->EnabledLookupBits[Word.Index];
+        Enabled &= ~GlyphConfig->DisabledLookupBits[Word.Index];
+      }
+      Word.Bits &= Enabled;
+      if(Word.Bits) break;
+      Word = kbts__NextLookupWord(Row, WordCount, Word.Index + 1, ~(kbts_u32)0);
+    }
+  }
+  if(!Word.Bits) return;
+  kbts_un Lookup = Word.Index * 32 + kbts__LsbPositionOrBitWidth32(Word.Bits);
+  if(Lookup >= Scratchpad->SequentialLookupCount) return;
+  kbts_u16 FeatureValue = 1;
+  if(GlyphConfig)
+  {
+    KBTS__FOR(I, 0, GlyphConfig->NonBinaryEnabledLookupCount)
+    {
+      const kbts__enabled_lookup *Enabled = &GlyphConfig->NonBinaryEnabledLookups[I];
+      if(Enabled->SequentialLookupIndex == Lookup)
+      {
+        FeatureValue = (kbts_u16)Enabled->Value;
+        break;
+      }
+    }
+  }
+  kbts__InsertGlyphIntoBucket(Scratchpad, Lookup, Glyph, FeatureValue);
+}
+
+static kbts_b32 kbts__GsubLookupEnabled(const kbts_shape_config *Config, const kbts_glyph *Glyph,
+    kbts_u32 SequentialLookupIndex, kbts_u32 Filter, kbts_u16 *FeatureValue)
 {
   *FeatureValue = 1;
   kbts_u32 Count = Config->GsubPlan->LookupCount;
   if(SequentialLookupIndex >= Count) return 0;
+  const kbts_glyph_config *GlyphConfig = Glyph->Config;
+  // Automatic feature masks restrict default application, not an explicit
+  // enable on this glyph's source range. Disabled lookups still win below.
+  if((Glyph->Flags & Filter) != Filter &&
+     (!GlyphConfig || !(GlyphConfig->EnabledLookupBits[SequentialLookupIndex / 32] &
+                       (1u << (SequentialLookupIndex & 31))))) return 0;
+  kbts_u32 GlyphId = Glyph->Id;
   if(GlyphId >= Config->GlyphCount) return 1;
   kbts__matrix_index Index = kbts__IdSequentialLookupMatrixIndex(SequentialLookupIndex, GlyphId, Count);
   kbts_u32 Bits = Config->IdSequentialLookupMatrix[Index.WordIndex];
@@ -18601,6 +16767,7 @@ static void kbts__FreeGlyphBucket(kbts_shape_scratchpad *Scratchpad, kbts_un Seq
   kbts__ReleaseGlyphBucket(Scratchpad, SequentialLookupIndex);
 }
 
+#include "kb_normalize.inc"
 #include "kb_execute_op.inc"
 
 
@@ -18671,7 +16838,13 @@ static kbts_b32 kbts__ConfigReach(kbts_shape_config *Config, kbts_u32 Root,
   return 1;
 }
 
-static kbts_shape_config *kbts__PlaceShapeConfig(kbts_font *Font, kbts_script Script, kbts_language Language, void *Memory, kbts_un *Size)
+typedef struct kbts__config_bounds
+{
+  kbts_shape_config Config;
+  kbts_un Roots, GsubRoots;
+} kbts__config_bounds;
+
+static kbts_shape_config *kbts__PlaceShapeConfig(kbts_font *Font, kbts_script Script, kbts_language Language, void *Memory, kbts_un *Size, kbts__config_bounds *Bounds)
 {
   KB_PROFILE_SCOPE(KBP_CONFIG_BUILD);
   if(Size) *Size = 0;
@@ -18945,15 +17118,12 @@ static kbts_shape_config *kbts__PlaceShapeConfig(kbts_font *Font, kbts_script Sc
     KBTS__CONFIG_PUSH(&Temporary, ProbeCapacity, kbts__glyph_link, Storage.Links);
     KBTS__CONFIG_PUSH(&Temporary, ProbeCapacity, kbts_u32, Storage.FreeSlots);
     Storage.Capacity = (kbts_u32)ProbeCapacity;
-    Storage.FixedMemory = 1;
-    Storage.Allocator = kbts__NullAllocator;
     Storage.First = Storage.Tail = Storage.End = KBTS__GLYPH_END;
     TemporaryEnd = KBTS__MAX(TemporaryEnd, Temporary.At);
     if(Memory)
     {
       kbts_shape_scratchpad Dummy = KBTS__ZERO;
       Dummy.Config = &Config;
-      Dummy.Allocator = kbts__NullAllocator;
       Dummy.LookupSubtableIndexOffsets = KBTS__POINTER_OFFSET(kbts_u32, Font->Blob, Font->Blob->LookupSubtableIndexOffsetsOffsetFromStartOfFile);
       Dummy.CompiledWindowCapacity = Capacity;
       Dummy.CompiledSymbols = Symbols;
@@ -19005,6 +17175,12 @@ static kbts_shape_config *kbts__PlaceShapeConfig(kbts_font *Font, kbts_script Sc
   kbts_uptr Peak = KBTS__MAX(Bump.At, TemporaryEnd);
   if(Peak < (kbts_uptr)Memory || Peak - (kbts_uptr)Memory > 0x7fffffffu - KBTS_ALIGNOF(kbts_shape_config)) return 0;
   if(Size) *Size = Peak - (kbts_uptr)Memory + KBTS_ALIGNOF(kbts_shape_config) - 1;
+  if(Bounds)
+  {
+    Bounds->Config = Config;
+    Bounds->Roots = RootCapacity;
+    Bounds->GsubRoots = GsubCapacity;
+  }
   if(Memory)
   {
     Config.ResidentSize = Bump.At - (kbts_uptr)Memory;
@@ -19016,7 +17192,7 @@ static kbts_shape_config *kbts__PlaceShapeConfig(kbts_font *Font, kbts_script Sc
 }
 
 /* Repack already analyzed configuration payloads, not semantic construction.
- * The heap allocation retains exact stages and admission stride, never the
+ * Resident storage retains exact stages and admission stride, never the
  * caller-placement construction tail or stage-count upper bound. */
 static kbts_shape_config *kbts__PackShapeConfig(const kbts_shape_config *Source, void *Memory, kbts_un *Size)
 {
@@ -19060,173 +17236,49 @@ static kbts_shape_config *kbts__PackShapeConfig(const kbts_shape_config *Source,
 KBTS_EXPORT int kbts_SizeOfShapeConfig(kbts_font *Font, kbts_script Script, kbts_language Language)
 {
   kbts_un Size = 0;
-  kbts__PlaceShapeConfig(Font, Script, Language, 0, &Size);
+  kbts__PlaceShapeConfig(Font, Script, Language, 0, &Size, 0);
   return Size <= 0x7fffffffu ? (int)Size : 0;
 }
 
-KBTS_EXPORT kbts_shape_config *kbts_PlaceShapeConfig(kbts_font *Font, kbts_script Script, kbts_language Language, void *Memory, kbts_un MemorySize)
+KBTS_EXPORT kbts_un kbts_SizeOfShapeConfigScratch(kbts_font *Font, kbts_script Script, kbts_language Language)
 {
-  int Required = kbts_SizeOfShapeConfig(Font, Script, Language);
-  if(!Memory || Required <= 0 || MemorySize < (kbts_un)Required) return 0;
-  kbts_un Size;
-  return kbts__PlaceShapeConfig(Font, Script, Language, Memory, &Size);
+  return (kbts_un)kbts_SizeOfShapeConfig(Font, Script, Language);
 }
 
-static kbts_shape_config *kbts__CreateShapeConfig(kbts_font *Font, kbts_script Script, kbts_language Language,
-    kbts_allocator_function *Allocator, void *AllocatorData,
-    kbts_allocator_function *ScratchAllocator, void *ScratchAllocatorData)
+KBTS_EXPORT kbts_shape_config *kbts_PlaceShapeConfig(kbts_font *Font, kbts_script Script, kbts_language Language,
+    void *Output, void *Scratch, kbts_un *OutputUsed)
 {
-  if(!Allocator) Allocator = kbts__DefaultAllocator;
-  int Peak = kbts_SizeOfShapeConfig(Font, Script, Language);
-  if(!Peak) return 0;
-  void *Temporary = kbts__AllocatorAllocate(ScratchAllocator, ScratchAllocatorData, (kbts_un)Peak);
-  if(!Temporary) return 0;
-  kbts_un Used = 0, Resident = 0;
-  kbts_shape_config *Build = kbts__PlaceShapeConfig(Font, Script, Language, Temporary, &Used);
-  kbts_shape_config *Result = 0;
-  if(Build)
+  if(OutputUsed) *OutputUsed = 0;
+  if(!Output || !Scratch) return 0;
+  kbts_un Used = 0;
+  kbts_shape_config *Build = kbts__PlaceShapeConfig(Font, Script, Language, Scratch, &Used, 0);
+  if(!Build) return 0;
+  kbts_shape_config *Result = kbts__PackShapeConfig(Build, Output, &Used);
+  if(Result)
   {
-    kbts__PackShapeConfig(Build, 0, &Resident);
-    if(Resident)
-    {
-      void *Memory = kbts__AllocatorAllocate(Allocator, AllocatorData, Resident);
-      if(Memory)
-      {
-        Result = kbts__PackShapeConfig(Build, Memory, &Used);
-        if(Result)
-        {
-          Result->Allocator = Allocator;
-          Result->AllocatorData = AllocatorData;
-          Result->BaseAllocation = Memory;
-          Result->ResidentSize = Resident;
-          Result->ConstructionSize = (kbts_un)Peak + Resident;
-        }
-        else kbts__AllocatorFree(Allocator, AllocatorData, Memory);
-      }
-    }
+    // Pack's bound contains one trailing alignment allowance, not retained data.
+    Result->ResidentSize = Used - (KBTS_ALIGNOF(kbts_shape_config) - 1);
+    Result->ConstructionSize = Build->ConstructionSize;
+    if(OutputUsed) *OutputUsed = Result->ResidentSize;
   }
-  kbts__AllocatorFree(ScratchAllocator, ScratchAllocatorData, Temporary);
   return Result;
 }
 
-
-KBTS_EXPORT kbts_shape_config *kbts_CreateShapeConfig(kbts_font *Font, kbts_script Script, kbts_language Language, kbts_allocator_function *Allocator, void *AllocatorData)
-{
-  if(!Allocator) Allocator = kbts__DefaultAllocator;
-  return kbts__CreateShapeConfig(Font, Script, Language, Allocator, AllocatorData, Allocator, AllocatorData);
-}
-
-KBTS_EXPORT void kbts_DestroyShapeConfig(kbts_shape_config *Config)
-{
-  if(Config && Config->Allocator)
-    kbts__AllocatorFree(Config->Allocator, Config->AllocatorData, Config->BaseAllocation);
-}
 KBTS_EXPORT int kbts_SizeOfShapeContext(void)
 {
   int Result = sizeof(kbts_shape_context) + KBTS_ALIGNOF(kbts_shape_context) - 1;
   return Result;
 }
 
-KBTS_EXPORT kbts_shape_context *kbts_PlaceShapeContext2(kbts_allocator_function *Allocator, void *AllocatorData, void *Memory, kbts_shape_context_flags Flags)
+KBTS_EXPORT kbts_shape_context *kbts_PlaceShapeContext(void *Memory, kbts_shape_context_flags Flags)
 {
-  kbts_shape_context *Result = Memory ? KBTS__ALIGN_POINTER(kbts_shape_context, Memory, KBTS_ALIGNOF(kbts_shape_context)) : 0;
-
-  if(Memory)
-  {
-    if(!Allocator)
-    {
-      Allocator = kbts__DefaultAllocator;
-    }
-
-    KBTS_MEMSET(Result, 0, sizeof(*Result));
-
-    Result->PermanentArena.Allocator = Allocator;
-    Result->PermanentArena.AllocatorData = AllocatorData;
-
-    Result->FontArena.Allocator = Allocator;
-    Result->FontArena.AllocatorData = AllocatorData;
-
-    Result->ConfigArena.Allocator = Allocator;
-    Result->ConfigArena.AllocatorData = AllocatorData;
-
-    Result->ScratchArena.Allocator = Allocator;
-    Result->ScratchArena.AllocatorData = AllocatorData;
-
-    Result->GlyphStorage.Allocator = Allocator;
-    Result->GlyphStorage.AllocatorData = AllocatorData;
-
-    Result->PublicFlags = Flags;
-
-    KBTS__DLLIST_SENTINEL_INIT(&Result->ExistingShapeConfigBlockSentinel);
-    KBTS__DLLIST_SENTINEL_INIT(&Result->ExistingGlyphConfigBlockSentinel);
-  }
-
-  return Result;
-}
-
-KBTS_EXPORT kbts_shape_context *kbts_PlaceShapeContext(kbts_allocator_function *Allocator, void *AllocatorData, void *Memory)
-{
-  kbts_shape_context *Result = kbts_PlaceShapeContext2(Allocator, AllocatorData, Memory, KBTS_SHAPE_CONTEXT_FLAG_NONE);
-  return Result;
-}
-
-KBTS_EXPORT kbts_shape_context *kbts_PlaceShapeContextFixedMemory2(void *Memory, int Size, kbts_shape_context_flags Flags)
-{
-  if(!Memory || Size < 0) return 0;
-  kbts_un Required = (kbts_un)kbts_SizeOfShapeContext() + sizeof(kbts_arena) + KBTS_ALIGNOF(kbts_arena) - 1;
-  if((kbts_un)Size < Required) return 0;
-  kbts_shape_context *Context = KBTS__ALIGN_POINTER(kbts_shape_context, Memory, KBTS_ALIGNOF(kbts_shape_context));
-  kbts_arena *Arena = KBTS__ALIGN_POINTER(kbts_arena, Context + 1, KBTS_ALIGNOF(kbts_arena));
-  void *Remaining = Arena + 1;
-  kbts_un Used = (kbts_un)((char *)Remaining - (char *)Memory);
-  kbts__InitializeFixedMemoryArena(Arena, Remaining, (kbts_un)Size - Used);
-  return kbts_PlaceShapeContext2(kbts__ArenaAllocator, Arena, Context, Flags);
-}
-
-KBTS_EXPORT kbts_shape_context *kbts_PlaceShapeContextFixedMemory(void *Memory, int Size)
-{
-  kbts_shape_context *Result = kbts_PlaceShapeContextFixedMemory2(Memory, Size, KBTS_SHAPE_CONTEXT_FLAG_NONE);
-  return Result;
-}
-
-KBTS_EXPORT kbts_shape_context *kbts_CreateShapeContext2(kbts_allocator_function *Allocator, void *AllocatorData, kbts_shape_context_flags Flags)
-{
-  if(!Allocator)
-  {
-    Allocator = kbts__DefaultAllocator;
-  }
-
-  void *Memory = kbts__AllocatorAllocate(Allocator, AllocatorData, (kbts_un)kbts_SizeOfShapeContext());
   if(!Memory) return 0;
-  kbts_shape_context *Result = kbts_PlaceShapeContext2(Allocator, AllocatorData, Memory, Flags);
-  Result->SelfAllocator = Allocator;
-  Result->SelfAllocatorData = AllocatorData;
-  Result->BaseAllocation = Memory;
+  kbts_shape_context *Result = KBTS__ALIGN_POINTER(kbts_shape_context, Memory, KBTS_ALIGNOF(kbts_shape_context));
+  KBTS_MEMSET(Result, 0, sizeof(*Result));
+  Result->PublicFlags = Flags;
+  KBTS__DLLIST_SENTINEL_INIT(&Result->ExistingShapeConfigBlockSentinel);
+  KBTS__DLLIST_SENTINEL_INIT(&Result->ExistingGlyphConfigBlockSentinel);
   return Result;
-}
-
-KBTS_EXPORT kbts_shape_context *kbts_CreateShapeContext(kbts_allocator_function *Allocator, void *AllocatorData)
-{
-  kbts_shape_context *Result = kbts_CreateShapeContext2(Allocator, AllocatorData, KBTS_SHAPE_CONTEXT_FLAG_NONE);
-  return Result;
-}
-
-KBTS_EXPORT void kbts_DestroyShapeContext(kbts_shape_context *Context)
-{
-  if(Context)
-  {
-    kbts_DestroyShapeScratchpad(Context->ExecutionScratchpad);
-    kbts__FreeArena(&Context->PermanentArena);
-    kbts__FreeArena(&Context->ConfigArena);
-    kbts__FreeArena(&Context->ScratchArena);
-    kbts__FreeArena(&Context->FontArena);
-    kbts_FreeAllGlyphs(&Context->GlyphStorage);
-
-    if(Context->SelfAllocator)
-    {
-      kbts__AllocatorFree(Context->SelfAllocator, Context->SelfAllocatorData, Context->BaseAllocation);
-    }
-  }
 }
 
 KBTS_EXPORT kbts_direction kbts_ScriptDirection(kbts_script Script)
@@ -19243,7 +17295,6 @@ static kbts__context_font *kbts__ShapePushFont(kbts_shape_context *Context)
   {
     Result = &Context->Fonts[Context->FontCount++];
     Result->Font = 0;
-    Result->Lifetime = kbts__BeginLifetime(&Context->FontArena);
   }
 
   return Result;
@@ -19273,117 +17324,12 @@ KBTS_EXPORT kbts_font *kbts_ShapePopFont(kbts_shape_context *Context)
     kbts__context_font *ContextFont = &Context->Fonts[Context->FontCount - 1];
     Result = ContextFont->Font;
 
-    kbts__EndLifetime(&ContextFont->Lifetime);
 
     Context->FontCount -= 1;
   }
 
   return Result;
 }
-
-#ifndef KB_TEXT_SHAPE_NO_CRT
-KBTS_EXPORT kbts_font *kbts_ShapePushFontFromFile(kbts_shape_context *Context, const char *FileName, int FontIndex)
-{
-  kbts__context_font *ContextFont = kbts__ShapePushFont(Context);
-  kbts_font *Result = 0;
-
-  if(!Context->Error)
-  {
-    Result = kbts__PushType(&Context->FontArena, kbts_font);
-    if(Result)
-    {
-      *Result = kbts_FontFromFile(FileName, FontIndex, kbts__ArenaAllocator, &Context->FontArena, 0, 0);
-
-      if(!Result->Error)
-      {
-        ContextFont->Font = Result;
-      }
-      else
-      {
-        kbts_ShapePopFont(Context);
-        Result = 0;
-      }
-    }
-    else
-    {
-      Context->Error = KBTS_SHAPE_ERROR_OUT_OF_MEMORY;
-    }
-  }
-
-  return Result;
-}
-#endif
-
-KBTS_EXPORT kbts_font *kbts_ShapePushFontFromMemory(kbts_shape_context *Context, void *Memory, int Length, int FontIndex)
-{
-  kbts_font *Result = 0;
-
-  if(!Context->Error && (Length > 0))
-  {
-    kbts__context_font *ContextFont = kbts__ShapePushFont(Context);
-    if(!ContextFont) return 0;
-
-    Result = kbts__PushType(&Context->FontArena, kbts_font);
-    if(!Result) { kbts_ShapePopFont(Context); return 0; }
-
-    if(Result)
-    {
-      *Result = KBTS__ZERO_TYPE(kbts_font);
-      kbts__arena_lifetime ScratchLifetime = kbts__BeginLifetime(&Context->ScratchArena);
-      int ScratchSize, OutputSize;
-      kbts_load_font_state State = KBTS__ZERO;
-      kbts_load_font_error Error = kbts_LoadFont(Result, &State, Memory, Length, FontIndex, &ScratchSize, &OutputSize);
-      if(!Error && Result->Blob)
-      {
-        if((kbts_un)Length > 0x7fffffffu - KBTS_ALIGNOF(kbts_blob_header)) Error = KBTS_LOAD_FONT_ERROR_INVALID_FONT;
-        else
-        {
-          State.NativeBlobSize = (kbts_u32)Length; State.ScratchSize = 4;
-          State.TotalSize = (kbts_u32)Length + KBTS_ALIGNOF(kbts_blob_header);
-          ScratchSize = 4; OutputSize = (int)State.TotalSize;
-          Error = KBTS_LOAD_FONT_ERROR_NEED_TO_CREATE_BLOB;
-        }
-      }
-      if(Error == KBTS_LOAD_FONT_ERROR_NEED_TO_CREATE_BLOB)
-      {
-        void *Scratch = kbts__PushSize(&Context->ScratchArena, (kbts_un)ScratchSize, 8);
-        void *Output = kbts__PushSize(&Context->FontArena, (kbts_un)OutputSize, 8);
-
-        Error = kbts_PlaceBlob(Result, &State, Scratch, Output);
-      }
-
-      if(!Error)
-        Error = kbts__CompileFontTables(Result, kbts__ArenaAllocator, &Context->FontArena);
-      if(!Error)
-        Error = kbts__CompileCmap(Result, kbts__ArenaAllocator, &Context->FontArena,
-            kbts__ArenaAllocator, &Context->ScratchArena);
-
-      if(!Error)
-      {
-        Result->CompiledContexts = kbts__CompileFontData(Result,
-            kbts__ArenaAllocator, &Context->FontArena,
-            kbts__ArenaAllocator, &Context->ScratchArena);
-        if(!Result->CompiledContexts)
-          Error = Result->Error ? Result->Error : KBTS_LOAD_FONT_ERROR_OUT_OF_MEMORY;
-      }
-      kbts__EndLifetime(&ScratchLifetime);
-
-      if(!Error)
-      {
-        ContextFont->Font = Result;
-      }
-      else
-      {
-        kbts_ShapePopFont(Context);
-        Result = 0;
-      }
-    }
-  }
-
-  return Result;
-}
-
-
 
 static kbts_glyph_config *kbts__LayoutGlyphConfig(kbts_shape_config *ShapeConfig,
     kbts_feature_override *Overrides, int OverrideCount, void *Memory, kbts_un *Size)
@@ -19427,7 +17373,7 @@ KBTS_EXPORT int kbts_SizeOfGlyphConfig(kbts_shape_config *ShapeConfig, kbts_feat
 
 KBTS_EXPORT kbts_glyph_config *kbts_PlaceGlyphConfig(kbts_shape_config *ShapeConfig, kbts_feature_override *Overrides, int OverrideCount, void *Memory)
 {
-  if(!Memory) return 0;
+  if(!Memory || !kbts_SizeOfGlyphConfig(ShapeConfig, Overrides, OverrideCount)) return 0;
   kbts_un Size;
   kbts_glyph_config *Result = kbts__LayoutGlyphConfig(ShapeConfig, Overrides, OverrideCount, Memory, &Size);
   if(!Result) return 0;
@@ -19490,37 +17436,8 @@ KBTS_EXPORT kbts_glyph_config *kbts_PlaceGlyphConfig(kbts_shape_config *ShapeCon
     }
   return Result;
 }
-KBTS_EXPORT kbts_glyph_config *kbts_CreateGlyphConfig(kbts_shape_config *ShapeConfig, kbts_feature_override *Overrides, int OverrideCount, kbts_allocator_function *Allocator, void *AllocatorData)
-{
-  if(!Allocator)
-  {
-    Allocator = kbts__DefaultAllocator;
-  }
 
-  int Size = kbts_SizeOfGlyphConfig(ShapeConfig, Overrides, OverrideCount);
-  if(!Size || !ShapeConfig) return 0;
-  void *Memory = kbts__AllocatorAllocate(Allocator, AllocatorData, (kbts_un)Size);
-  if(!Memory) return 0;
-  kbts_glyph_config *Result = kbts_PlaceGlyphConfig(ShapeConfig, Overrides, OverrideCount, Memory);
 
-  if(Result)
-  {
-    Result->Allocator = Allocator;
-    Result->AllocatorData = AllocatorData;
-    Result->BaseAllocation = Memory;
-  }
-  else kbts__AllocatorFree(Allocator, AllocatorData, Memory);
-
-  return Result;
-}
-
-KBTS_EXPORT void kbts_DestroyGlyphConfig(kbts_glyph_config *Config)
-{
-  if(Config && Config->Allocator)
-  {
-    kbts__AllocatorFree(Config->Allocator, Config->AllocatorData, Config->BaseAllocation);
-  }
-}
 
 KBTS_EXPORT kbts_shape_error kbts_ShapeError(kbts_shape_context *Context)
 {
@@ -19528,12 +17445,107 @@ KBTS_EXPORT kbts_shape_error kbts_ShapeError(kbts_shape_context *Context)
   return Result;
 }
 
-KBTS_EXPORT void kbts_ShapeBegin(kbts_shape_context *Context, kbts_direction ParagraphDirection, kbts_language Language)
+/* The pass has at most N feature snapshots, N glyph configs, N+1 runs/config
+ * keys, and one execution workspace. Script/font config keys are also bounded
+ * by the finite font stack times the library's script domain. Count every such
+ * key without allocating, then use the tighter total / per-input maximum. */
+KBTS_EXPORT kbts_un kbts_SizeOfContextScratch(kbts_shape_context *Context, kbts_language Language,
+    kbts_un CodepointCapacity, kbts_un GlyphCapacity)
 {
-  if(!Context->Error)
+  if(!Context || CodepointCapacity >= ((kbts_un)1 << KBTS__INPUT_CODEPOINT_ONE_PAST_LAST_BLOCK_MSB) ||
+      !kbts_SizeOfGlyphStorage(GlyphCapacity)) return 0;
+  kbts_un ConfigTotal = 0, ConfigMax = 0, GlyphMax = 0, ExecutionMax = 0, Keys = 0;
+  for(kbts_u32 F = 0; F < Context->FontCount; ++F)
   {
-    kbts__ClearArena(&Context->ScratchArena);
-    kbts_ClearActiveGlyphs(&Context->GlyphStorage);
+    kbts_font *Font = Context->Fonts[F].Font;
+    if(!Font || Font->Error || !Font->CompiledContexts || !Font->Tables) return 0;
+    for(kbts_un S = 0; S < KBTS__ARRAY_LENGTH(kbts__ScriptProperties); ++S)
+    {
+      kbts__config_bounds Bounds = KBTS__ZERO;
+      kbts_un Bytes = 0;
+      kbts__PlaceShapeConfig(Font, (kbts_script)S, Language, 0, &Bytes, &Bounds);
+      if(!Bytes || !kbts__BoundAdd(&ConfigTotal, 1, Bytes, 1)) return 0;
+      ConfigMax = KBTS__MAX(ConfigMax, Bytes);
+      ++Keys;
+      // Every GSUB root can form its own native/context stage. The font-wide
+      // matcher window bounds every reachable subset selected by this script.
+      kbts_un Work = kbts__ShapeWorkspaceSize(GlyphCapacity, Bounds.Roots - Bounds.GsubRoots,
+          KBTS__MAX(9, Font->CompiledContexts->WindowCapacity), Bounds.GsubRoots,
+          Font->CompiledContexts->SymbolCount, Bounds.GsubRoots, kbts__ProbeCapacity(&Bounds.Config));
+      if(!Work) return 0;
+      ExecutionMax = KBTS__MAX(ExecutionMax, Work);
+      kbts_un Glyph = 0, Rows = Bounds.Roots / 32 + !!(Bounds.Roots & 31);
+      kbts_un Stages = Bounds.GsubRoots / 64 + !!(Bounds.GsubRoots & 63);
+      if(!kbts__BoundAdd(&Glyph, 1, sizeof(kbts_glyph_config), KBTS_ALIGNOF(kbts_glyph_config)) ||
+         !kbts__BoundAdd(&Glyph, Rows, sizeof(kbts_u32), KBTS_ALIGNOF(kbts_u32)) ||
+         !kbts__BoundAdd(&Glyph, Rows, sizeof(kbts_u32), KBTS_ALIGNOF(kbts_u32)) ||
+         !kbts__BoundAdd(&Glyph, KBTS_MAX_SIMULTANEOUS_FEATURES, sizeof(kbts__enabled_lookup), KBTS_ALIGNOF(kbts__enabled_lookup)) ||
+         !kbts__BoundAdd(&Glyph, Stages, sizeof(kbts_u64), KBTS_ALIGNOF(kbts_u64)) ||
+         !kbts__BoundAdd(&Glyph, 1, KBTS_ALIGNOF(kbts_glyph_config) - 1, 1)) return 0;
+      GlyphMax = KBTS__MAX(GlyphMax, Glyph);
+    }
+  }
+  kbts_un Runs = CodepointCapacity + 1;
+  Keys = KBTS__MIN(Keys, Runs);
+  if(ConfigMax && Keys <= ConfigTotal / ConfigMax) ConfigTotal = Keys * ConfigMax;
+  kbts_un Size = 0;
+#define KBTS__PASS(N,T) if(!kbts__BoundAdd(&Size,(N),sizeof(T),KBTS_ALIGNOF(T))) return 0
+  KBTS__PASS(Runs + 1,kbts_u32);
+  KBTS__PASS(Runs,kbts__run_metadata);
+  // Input blocks preserve stable public iterator addresses and include the
+  // one-past-last sentinel consumed by segmentation/ShapeEnd.
+  kbts_un Covered = 0, Block = (kbts_un)1 << (KBTS__INPUT_CODEPOINT_FIRST_BLOCK_MSB + 1);
+  do
+  {
+    KBTS__PASS(Block,kbts_shape_codepoint);
+    Covered += Block;
+    if(Covered > Block) Block *= 2;
+  } while(Covered <= CodepointCapacity);
+  kbts_un FeatureBytes = sizeof(kbts__effective_features) +
+      (KBTS_MAX_SIMULTANEOUS_FEATURES - 1) * sizeof(kbts_feature_override) +
+      KBTS_ALIGNOF(kbts__effective_features) - 1;
+  if(!kbts__BoundAdd(&Size, CodepointCapacity, FeatureBytes, 1) ||
+     !kbts__BoundAdd(&Size, CodepointCapacity, GlyphMax, 1) ||
+     !kbts__BoundAdd(&Size, 1, ConfigTotal, 1)) return 0;
+  // Blocks each need their own alignment, unlike a single contiguous array.
+  kbts_un ShapeBlocks = (Keys + KBTS__EXISTING_SHAPE_CONFIGS_PER_BLOCK - 1) / KBTS__EXISTING_SHAPE_CONFIGS_PER_BLOCK;
+  kbts_un GlyphBlocks = (CodepointCapacity + KBTS__EXISTING_GLYPH_CONFIGS_PER_BLOCK - 1) / KBTS__EXISTING_GLYPH_CONFIGS_PER_BLOCK;
+  if(!kbts__BoundAdd(&Size, ShapeBlocks, sizeof(kbts__existing_shape_config_block) + KBTS_ALIGNOF(kbts__existing_shape_config_block) - 1, 1) ||
+     !kbts__BoundAdd(&Size, GlyphBlocks, sizeof(kbts__existing_glyph_config_block) + KBTS_ALIGNOF(kbts__existing_glyph_config_block) - 1, 1) ||
+     !kbts__BoundAdd(&Size, 1, KBTS__MAX(ConfigMax, ExecutionMax), 1)) return 0;
+#undef KBTS__PASS
+  return Size;
+}
+
+KBTS_EXPORT void kbts_ShapeBegin(kbts_shape_context *Context, kbts_direction ParagraphDirection, kbts_language Language,
+    void *Destination, void *Scratch, kbts_un CodepointCapacity, kbts_un GlyphCapacity)
+{
+  if(!Context || Context->Error) return;
+  {
+    kbts_un Size = kbts_SizeOfContextScratch(Context, Language, CodepointCapacity, GlyphCapacity);
+    if(!Scratch || !Size || !kbts_InitializeGlyphStorage(&Context->GlyphStorage, Destination, GlyphCapacity))
+    { Context->Error = KBTS_SHAPE_ERROR_OUT_OF_MEMORY; return; }
+    Context->PassMemory = KBTS__ZERO_TYPE(kbts__memory);
+    Context->PassMemory.Data = Scratch;
+    Context->PassMemory.Capacity = Size;
+    Context->ScratchArena.Memory = &Context->PassMemory;
+    Context->ScratchArena.Error = 0;
+    Context->CodepointCapacity = CodepointCapacity;
+    Context->GlyphCapacity = GlyphCapacity;
+    Context->ExecutionMark = 0;
+    Context->ExecutionScratchpad = 0;
+    Context->FeatureSets = 0;
+    Context->PreparedShapeConfig = 0;
+    Context->PreparedFeatureOverrides = 0;
+    Context->PreparedGlyphConfig = 0;
+    KBTS__DLLIST_SENTINEL_INIT(&Context->ExistingShapeConfigBlockSentinel);
+    KBTS__DLLIST_SENTINEL_INIT(&Context->ExistingGlyphConfigBlockSentinel);
+    KBTS_MEMSET(Context->InputBlocks, 0, sizeof(Context->InputBlocks));
+    Context->RunCapacity = (kbts_u32)CodepointCapacity + 1;
+    Context->RunBoundaries = kbts__PushArray(&Context->ScratchArena, kbts_u32, (kbts_un)Context->RunCapacity + 1);
+    Context->Runs = kbts__PushArray(&Context->ScratchArena, kbts__run_metadata, Context->RunCapacity);
+    if(!Context->RunBoundaries || !Context->Runs)
+    { Context->Error = KBTS_SHAPE_ERROR_OUT_OF_MEMORY; return; }
 
     Context->BreakStartIndex = 0;
 
@@ -19589,14 +17601,16 @@ static kbts_shape_codepoint *kbts__InputCodepoint(kbts_shape_context *Context, k
 {
   kbts_shape_codepoint *Result = 0;
 
-  if(!Context->Error)
+  if(Context->Error) return 0;
+  if(Index > Context->CodepointCapacity)
+  { Context->Error = KBTS_SHAPE_ERROR_OUT_OF_MEMORY; return 0; }
   {
     kbts__input_codepoint_index InputIndex = kbts__InputCodepointIndex(Index);
 
     kbts_shape_codepoint *Block = Context->InputBlocks[InputIndex.BlockIndex];
     if(!Block && AllocateIfNeeded)
     {
-      Block = kbts__PushArray(&Context->PermanentArena, kbts_shape_codepoint, InputIndex.BlockCodepointCount);
+      Block = kbts__PushArray(&Context->ScratchArena, kbts_shape_codepoint, InputIndex.BlockCodepointCount);
       if(!Block)
       {
         Context->Error = KBTS_SHAPE_ERROR_OUT_OF_MEMORY;
@@ -19846,7 +17860,7 @@ KBTS_EXPORT void kbts_ShapeManualBreak(kbts_shape_context *Context)
   kbts_ShapeEndManualRuns(Context);
 }
 
-/* Last-wins values are sorted once and interned for the entire context lifetime.
+/* Last-wins values are sorted once and interned for the current shaping pass.
  * Both input spans and derived-configuration keys borrow these immutable values. */
 static kbts_b32 kbts__ResolveEffectiveFeatures(kbts_shape_context *Context)
 {
@@ -19876,7 +17890,7 @@ static kbts_b32 kbts__ResolveEffectiveFeatures(kbts_shape_context *Context)
     if(!Set)
     {
       kbts_un Bytes = sizeof(*Set) + (Count - 1) * sizeof(*Values);
-      Set = (kbts__effective_features *)kbts__PushSize(&Context->PermanentArena, Bytes,
+      Set = (kbts__effective_features *)kbts__PushSize(&Context->ScratchArena, Bytes,
           KBTS_ALIGNOF(kbts__effective_features));
       if(!Set)
       {
@@ -19899,6 +17913,8 @@ KBTS_EXPORT void kbts_ShapeCodepointWithUserId(kbts_shape_context *Context, int 
 {
   if(!Context->Error)
   {
+    if(Context->InputCodepointCount >= Context->CodepointCapacity)
+    { Context->Error = KBTS_SHAPE_ERROR_OUT_OF_MEMORY; return; }
     if(Context->NeedNewGlyphConfig && !kbts__ResolveEffectiveFeatures(Context)) return;
 
     { // Add the codepoint.
@@ -20090,6 +18106,10 @@ static void kbts__ShapeDirect(kbts_shape_scratchpad *Scratchpad, kbts_glyph_stor
   KB_PROFILE_SCOPE(KBP_SHAPE);
   KBTS_INSTRUMENT_FUNCTION_BEGIN;
   Scratchpad->Storage = Storage;
+  Scratchpad->SkipPostGposCleanup = 0;
+  if(Storage->Error || Storage->Capacity > Scratchpad->GlyphCapacity)
+  { Scratchpad->Error = KBTS_SHAPE_ERROR_OUT_OF_MEMORY; return; }
+  if(Scratchpad->Error) return;
 
   if(Storage->First != Storage->End)
   {
@@ -20203,42 +18223,16 @@ static void kbts__ShapeDirect(kbts_shape_scratchpad *Scratchpad, kbts_glyph_stor
   KBTS_INSTRUMENT_FUNCTION_END;
 }
 
-KBTS_EXPORT void kbts_DestroyShapeScratchpad(kbts_shape_scratchpad *Scratchpad)
-{
-  if(!Scratchpad) return;
-  kbts_allocator_function *Allocator = Scratchpad->Allocator;
-  void *AllocatorData = Scratchpad->AllocatorData;
-  kbts__AllocatorFree(Allocator, AllocatorData, Scratchpad->SortMemory);
-  kbts__AllocatorFree(Allocator, AllocatorData, Scratchpad->Stream.Memory);
-  kbts__AllocatorFree(Allocator, AllocatorData, Scratchpad->Stream.SymbolMemory);
-  kbts__AllocatorFree(Allocator, AllocatorData, Scratchpad->Stream.NativeMemory);
-  for(kbts_u32 I = Scratchpad->GposFirstLookup; I < Scratchpad->SequentialLookupCount; ++I)
-    kbts__ReleaseGlyphBucket(Scratchpad, I);
-  kbts__glyph_bucket *Bucket = Scratchpad->FreeGlyphBuckets;
-  while(Bucket)
-  {
-    kbts__glyph_bucket *Next = Bucket->Next;
-    kbts__AllocatorFree(Allocator, AllocatorData, Bucket->Memory);
-    kbts__AllocatorFree(Allocator, AllocatorData, Bucket->BaseAllocation);
-    Bucket = Next;
-  }
-  kbts__AllocatorFree(Allocator, AllocatorData, Scratchpad->BaseAllocation);
-}
+
 
 KBTS_EXPORT kbts_shape_error kbts_ShapeDirect(kbts_shape_scratchpad *Scratchpad, kbts_glyph_storage *Storage, kbts_direction RunDirection, kbts_glyph_iterator *Output)
 {
+  if(Output) *Output = KBTS__ZERO_TYPE(kbts_glyph_iterator);
+  if(!Scratchpad || !Storage || !Output) return KBTS_SHAPE_ERROR_OUT_OF_MEMORY;
   kbts__ShapeDirect(Scratchpad, Storage, RunDirection);
   kbts_shape_error Result = Scratchpad->Error;
-
-  if(!Result)
-  {
-    *Output = kbts_ActiveGlyphIterator(Storage);
-  }
-  else
-  {
-    *Output = KBTS__ZERO_TYPE(kbts_glyph_iterator);
-  }
-
+  if(Storage->Error) Result = Scratchpad->Error = KBTS_SHAPE_ERROR_OUT_OF_MEMORY;
+  if(!Result) *Output = kbts_ActiveGlyphIterator(Storage);
   return Result;
 }
 
@@ -20279,7 +18273,7 @@ static kbts_shape_config *kbts__FindOrCreateShapeConfig(kbts_shape_context *Cont
   if(!kbts__ExistingShapeConfigBlockIsValid(Context, Last) ||
      Last->Count == KBTS__EXISTING_SHAPE_CONFIGS_PER_BLOCK)
   {
-    kbts__existing_shape_config_block *Block = kbts__PushType(&Context->ConfigArena, kbts__existing_shape_config_block);
+    kbts__existing_shape_config_block *Block = kbts__PushType(&Context->ScratchArena, kbts__existing_shape_config_block);
     if(!Block)
     {
       Context->Error = KBTS_SHAPE_ERROR_OUT_OF_MEMORY;
@@ -20289,10 +18283,12 @@ static kbts_shape_config *kbts__FindOrCreateShapeConfig(kbts_shape_context *Cont
     Block->Count = 0;
     Last = Block;
   }
+  kbts_un Size = (kbts_un)kbts_SizeOfShapeConfig(Font, Script, Language);
+  void *Output = Size ? kbts__PushSize(&Context->ScratchArena, Size, 1) : 0;
   kbts__arena_lifetime Lifetime = kbts__BeginLifetime(&Context->ScratchArena);
-  kbts_shape_config *Result = kbts__CreateShapeConfig(Font, Script, Language,
-      kbts__ArenaAllocator, &Context->ConfigArena,
-      kbts__ArenaAllocator, &Context->ScratchArena);
+  void *Scratch = Size ? kbts__PushSize(&Context->ScratchArena, Size, 1) : 0;
+  kbts_shape_config *Result = Output && Scratch ? kbts_PlaceShapeConfig(Font, Script, Language,
+      Output, Scratch, 0) : 0;
   kbts__EndLifetime(&Lifetime);
   if(!Result)
   {
@@ -20325,7 +18321,7 @@ static kbts_glyph_config *kbts__FindOrCreateGlyphConfig(kbts_shape_context *Cont
   if(!kbts__ExistingGlyphConfigBlockIsValid(Context, Last) ||
      Last->Count == KBTS__EXISTING_GLYPH_CONFIGS_PER_BLOCK)
   {
-    kbts__existing_glyph_config_block *Block = kbts__PushType(&Context->ConfigArena, kbts__existing_glyph_config_block);
+    kbts__existing_glyph_config_block *Block = kbts__PushType(&Context->ScratchArena, kbts__existing_glyph_config_block);
     if(!Block)
     {
       Context->Error = KBTS_SHAPE_ERROR_OUT_OF_MEMORY;
@@ -20335,8 +18331,9 @@ static kbts_glyph_config *kbts__FindOrCreateGlyphConfig(kbts_shape_context *Cont
     Block->Count = 0;
     Last = Block;
   }
-  kbts_glyph_config *Result = kbts_CreateGlyphConfig(ShapeConfig, FeatureOverrides, FeatureOverrideCount,
-      kbts__ArenaAllocator, &Context->ConfigArena);
+  kbts_un Size = (kbts_un)kbts_SizeOfGlyphConfig(ShapeConfig, FeatureOverrides, FeatureOverrideCount);
+  void *Output = Size ? kbts__PushSize(&Context->ScratchArena, Size, 1) : 0;
+  kbts_glyph_config *Result = Output ? kbts_PlaceGlyphConfig(ShapeConfig, FeatureOverrides, FeatureOverrideCount, Output) : 0;
   if(!Result)
   {
     Context->Error = KBTS_SHAPE_ERROR_OUT_OF_MEMORY;
@@ -20353,24 +18350,7 @@ static kbts_b32 kbts__AppendRun(kbts_shape_context *Context, kbts_u32 First, kbt
     kbts_font *Font, kbts_script Script, kbts_direction Direction,
     kbts_direction ParagraphDirection, kbts_break_flags Flags)
 {
-  if(Context->RunCount == Context->RunCapacity)
-  {
-    kbts_u32 Capacity = Context->RunCapacity ? Context->RunCapacity * 2 : 8;
-    if(Capacity < Context->RunCapacity ||
-       (kbts_un)Capacity + 1 > 0x7fffffffu / (sizeof(kbts__run_metadata) + sizeof(kbts_u32)))
-      goto OutOfMemory;
-    kbts_u32 *Boundaries = kbts__PushArray(&Context->PermanentArena, kbts_u32, (kbts_un)Capacity + 1);
-    kbts__run_metadata *Runs = kbts__PushArray(&Context->PermanentArena, kbts__run_metadata, Capacity);
-    if(!Boundaries || !Runs) goto OutOfMemory;
-    if(Context->RunCount)
-    {
-      KBTS_MEMCPY(Boundaries, Context->RunBoundaries, ((kbts_un)Context->RunCount + 1) * sizeof(*Boundaries));
-      KBTS_MEMCPY(Runs, Context->Runs, (kbts_un)Context->RunCount * sizeof(*Runs));
-    }
-    Context->RunBoundaries = Boundaries;
-    Context->Runs = Runs;
-    Context->RunCapacity = Capacity;
-  }
+  if(Context->RunCount == Context->RunCapacity) goto OutOfMemory;
   kbts_shape_config *Config = 0;
   if(Font)
   {
@@ -20540,8 +18520,12 @@ KBTS_EXPORT int kbts_ShapeRun(kbts_shape_context *Context, kbts_run *Run)
           Input->GlyphConfig, InputIndex, Input->MappedGlyphId))
         goto OutOfMemory;
     }
-    if(!kbts__BindShapeScratchpad(&Context->ExecutionScratchpad, Config,
-        Context->PermanentArena.Allocator, Context->PermanentArena.AllocatorData)) goto OutOfMemory;
+    if(Context->ExecutionScratchpad) Context->ScratchArena.Memory->Used = Context->ExecutionMark;
+    Context->ExecutionMark = Context->ScratchArena.Memory->Used;
+    kbts_un Size = kbts_SizeOfShapeScratchpad(Config, Context->GlyphCapacity);
+    void *Scratch = Size ? kbts__PushSize(&Context->ScratchArena, Size, 1) : 0;
+    Context->ExecutionScratchpad = Scratch ? kbts_PlaceShapeScratchpad(Config, Scratch, Context->GlyphCapacity) : 0;
+    if(!Context->ExecutionScratchpad) goto OutOfMemory;
     kbts_shape_scratchpad *Scratchpad = Context->ExecutionScratchpad;
     if(Metadata->ContextFirst < First)
       Scratchpad->JoiningBefore = kbts__GetUnicodeJoiningType(kbts__InputCodepoint(Context, Metadata->ContextFirst, 0)->Codepoint);
@@ -21147,7 +19131,7 @@ static void kbts__BuildFontMatrices(kbts_font *Font)
 
 }
 
-KBTS_EXPORT kbts_load_font_error kbts_PlaceBlob(kbts_font *Font, kbts_load_font_state *State, void *ScratchMemory, void *OutputMemory)
+static kbts_load_font_error kbts__PlaceBlob(kbts_font *Font, kbts_load_font_state *State, void *ScratchMemory, void *OutputMemory)
 {
   kbts_load_font_error Result = 0;
 
@@ -21770,6 +19754,17 @@ KBTS_EXPORT kbts_load_font_error kbts_PlaceBlob(kbts_font *Font, kbts_load_font_
   return Result;
 }
 
+KBTS_EXPORT kbts_load_font_error kbts_PlaceBlob(kbts_font *Font, kbts_load_font_state *State, void *Scratch, void *Output)
+{
+  if(!Font || !State) return KBTS_LOAD_FONT_ERROR_INVALID_FONT;
+  if(!Output || (!State->NativeBlobSize && !Scratch)) return Font->Error = KBTS_LOAD_FONT_ERROR_OUT_OF_MEMORY;
+  kbts_font Copy = *Font;
+  kbts_load_font_error Error = kbts__PlaceBlob(&Copy, State, Scratch, Output);
+  if(Error) Font->Error = Error;
+  else *Font = Copy;
+  return Error;
+}
+
 KBTS_EXPORT void kbts_GetFontInfo2(kbts_font *Font, kbts_font_info2 *Info)
 {
   if(Info && Info->Size)
@@ -21949,122 +19944,51 @@ KBTS_EXPORT void kbts_GetFontInfo(kbts_font *Font, kbts_font_info *Info)
 
 #include "kb_context_compile.inc"
 #include "kb_context_fuse.inc"
+#include "kb_memory_sizes.inc"
 
-KBTS_EXPORT kbts_load_font_error kbts_CompileFont(kbts_font *Font, kbts_allocator_function *Allocator, void *AllocatorData)
+KBTS_EXPORT kbts_un kbts_SizeOfCompiledFont(kbts_font *Font)
 {
+  kbts_un Output = 0, Scratch = 0;
+  return kbts__FontCompileBounds(Font, &Output, &Scratch) ? Output : 0;
+}
+
+KBTS_EXPORT kbts_un kbts_SizeOfFontCompileScratch(kbts_font *Font)
+{
+  kbts_un Output = 0, Scratch = 0;
+  return kbts__FontCompileBounds(Font, &Output, &Scratch) ? Scratch : 0;
+}
+
+KBTS_EXPORT kbts_load_font_error kbts_CompileFont(kbts_font *Font, void *Output, void *Scratch, kbts_un *OutputUsed)
+{
+  if(OutputUsed) *OutputUsed = 0;
   if(!Font || !Font->Blob) return KBTS_LOAD_FONT_ERROR_INVALID_FONT;
   if(Font->Error) return Font->Error;
   if(Font->CompiledContexts) return KBTS_LOAD_FONT_ERROR_NONE;
-  if(!Allocator) Allocator = kbts__DefaultAllocator;
-  Font->Error = kbts__CompileFontTables(Font, Allocator, AllocatorData);
-  if(Font->Error) return Font->Error;
-  Font->Error = kbts__CompileCmap(Font, Allocator, AllocatorData, Allocator, AllocatorData);
-  if(Font->Error) return Font->Error;
-  Font->CompiledContexts = kbts__CompileFontData(Font, Allocator, AllocatorData, Allocator, AllocatorData);
-  if(!Font->CompiledContexts && !Font->Error) Font->Error = KBTS_LOAD_FONT_ERROR_OUT_OF_MEMORY;
-  return Font->Error;
+  kbts_un OutputSize = 0, ScratchSize = 0;
+  if(!kbts__FontCompileBounds(Font, &OutputSize, &ScratchSize))
+    return Font->Error = KBTS_LOAD_FONT_ERROR_INVALID_FONT;
+  kbts__memory Resident = KBTS__ZERO, Temporary = KBTS__ZERO;
+  Resident.Data = Output; Resident.Capacity = OutputSize;
+  Temporary.Data = Scratch; Temporary.Capacity = ScratchSize;
+  if(!Output || !Scratch || !kbts__SeparateMemory(&Resident, &Temporary))
+    return Font->Error = KBTS_LOAD_FONT_ERROR_OUT_OF_MEMORY;
+  kbts_font Copy = *Font;
+  Copy.Error = kbts__CompileFontTables(&Copy, &Resident);
+  if(!Copy.Error) Copy.Error = kbts__CompileCmap(&Copy, &Resident, &Temporary);
+  if(!Copy.Error)
+  {
+    Copy.CompiledContexts = kbts__CompileFontData(&Copy, &Resident, &Temporary);
+    if(!Copy.CompiledContexts && !Copy.Error) Copy.Error = KBTS_LOAD_FONT_ERROR_OUT_OF_MEMORY;
+  }
+  if(Copy.Error) Font->Error = Copy.Error;
+  else
+  {
+    *Font = Copy;
+    if(OutputUsed) *OutputUsed = Resident.Used;
+  }
+  return Copy.Error;
 }
 
-KBTS_EXPORT kbts_font kbts_FontFromMemory(void *FileData, int FileSize, int FontIndex, kbts_allocator_function *Allocator, void *AllocatorData)
-{
-  KB_PROFILE_SCOPE(KBP_FONT_LOAD);
-  kbts_font Result = KBTS__ZERO;
-  if(!Allocator) Allocator = kbts__DefaultAllocator;
-  kbts_load_font_state State = KBTS__ZERO;
-  int ScratchSize = 0, OutputSize = 0;
-  kbts_load_font_error Error = kbts_LoadFont(&Result, &State, FileData, FileSize, FontIndex, &ScratchSize, &OutputSize);
-  if(!Error && Result.Blob)
-  {
-    if((kbts_un)FileSize > 0x7fffffffu - KBTS_ALIGNOF(kbts_blob_header)) Error = KBTS_LOAD_FONT_ERROR_INVALID_FONT;
-    else
-    {
-      State.NativeBlobSize = (kbts_u32)FileSize; State.ScratchSize = 4;
-      State.TotalSize = (kbts_u32)FileSize + KBTS_ALIGNOF(kbts_blob_header);
-      ScratchSize = 4; OutputSize = (int)State.TotalSize;
-      Error = KBTS_LOAD_FONT_ERROR_NEED_TO_CREATE_BLOB;
-    }
-  }
-  if(Error == KBTS_LOAD_FONT_ERROR_NEED_TO_CREATE_BLOB)
-  {
-    void *Scratch = State.NativeBlobSize ? 0 : kbts__AllocatorAllocate(Allocator, AllocatorData, (kbts_un)ScratchSize);
-    void *Output = kbts__AllocatorAllocate(Allocator, AllocatorData, (kbts_un)OutputSize);
-    Error = (!State.NativeBlobSize && !Scratch) || !Output ? KBTS_LOAD_FONT_ERROR_OUT_OF_MEMORY : kbts_PlaceBlob(&Result, &State, Scratch, Output);
-    kbts__AllocatorFree(Allocator, AllocatorData, Scratch);
-    if(Error) { kbts__AllocatorFree(Allocator, AllocatorData, Output); Result.Blob = 0; Result.BlobSize = 0; }
-    else { Result.BlobAllocation = Output; Result.Allocator = Allocator; Result.AllocatorData = AllocatorData; }
-  }
-  Result.Error = Error;
-  if(!Error) Result.Error = kbts_CompileFont(&Result, Allocator, AllocatorData);
-  if(Result.Error) kbts_FreeFont(&Result);
-  return Result;
-}
-
-#ifndef KB_TEXT_SHAPE_NO_CRT
-
-KBTS_EXPORT kbts_font kbts_FontFromFile(const char *FileName, int FontIndex, kbts_allocator_function *Allocator, void *AllocatorData, void **FileData, int *FileSize_)
-{
-  kbts_font Result = KBTS__ZERO;
-  if(FileData) *FileData = 0;
-  if(FileSize_) *FileSize_ = 0;
-  if(!Allocator) Allocator = kbts__DefaultAllocator;
-  FILE *File;
-#  ifndef _MSC_VER
-  File = fopen(FileName, "rb");
-#  else
-  fopen_s(&File, FileName, "rb");
-#  endif
-  if(!File) { Result.Error = KBTS_LOAD_FONT_ERROR_COULD_NOT_OPEN_FILE; return Result; }
-  Result.Error = KBTS_LOAD_FONT_ERROR_READ_ERROR;
-  if(!fseek(File, 0, SEEK_END))
-  {
-    long Size = ftell(File);
-    if(Size <= 0 || (kbts_u64)Size > 0x7fffffff) Result.Error = KBTS_LOAD_FONT_ERROR_INVALID_FONT;
-    else if(!fseek(File, 0, SEEK_SET))
-    {
-      void *Data = kbts__AllocatorAllocate(Allocator, AllocatorData, (kbts_un)Size);
-      if(!Data) Result.Error = KBTS_LOAD_FONT_ERROR_OUT_OF_MEMORY;
-      else
-      {
-        if(fread(Data, (kbts_un)Size, 1, File)) Result = kbts_FontFromMemory(Data, (int)Size, FontIndex, Allocator, AllocatorData);
-        if(!Result.Error)
-        {
-          if(FileSize_) *FileSize_ = (int)Size;
-          if(FileData) { *FileData = Data; Data = 0; }
-        }
-        kbts__AllocatorFree(Allocator, AllocatorData, Data);
-      }
-    }
-  }
-  fclose(File);
-  return Result;
-}
-
-#endif
-
-KBTS_EXPORT void kbts_FreeFont(kbts_font *Font)
-{
-  if(!Font) return;
-  if(Font->CmapLookup)
-  {
-    kbts__cmap_lookup *Lookup = Font->CmapLookup;
-    kbts__AllocatorFree(Lookup->Allocator, Lookup->AllocatorData, Lookup->BaseAllocation);
-    Font->CmapLookup = 0;
-  }
-  if(Font->CompiledContexts)
-  {
-    kbts__compiled_contexts *Compiled = Font->CompiledContexts;
-    kbts__AllocatorFree(Compiled->Allocator, Compiled->AllocatorData, Compiled->BaseAllocation);
-    Font->CompiledContexts = 0;
-  }
-  if(Font->Tables)
-  {
-    kbts__font_tables *Tables = Font->Tables;
-    kbts__AllocatorFree(Tables->Allocator, Tables->AllocatorData, Tables->BaseAllocation);
-    Font->Tables = 0;
-  }
-  if(Font->BlobAllocation) kbts__AllocatorFree(Font->Allocator, Font->AllocatorData, Font->BlobAllocation);
-  Font->BlobAllocation = 0; Font->Blob = 0; Font->BlobSize = 0; Font->Cmap = 0; Font->Cmap14 = 0;
-}
 
 static void kbts__DoBreak(kbts_break_state *State, kbts_s32 Position, kbts_u8 Flags, kbts_direction Direction, kbts_direction ParagraphDirection, kbts_script Script)
 {

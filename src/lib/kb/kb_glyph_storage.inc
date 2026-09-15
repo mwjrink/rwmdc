@@ -1,6 +1,5 @@
-/* Canonical records occupy stable slots. A zero Ref is a tombstone; logical
- * order lives in slot links, not in a second glyph representation. Only backing
- * allocation growth copies records. Insertion, deletion and reordering do not. */
+/* Canonical records occupy fixed, stable slots. A zero Ref is a tombstone;
+ * logical order and attachment chains live in separately placed slot links. */
 static void kbts__GsubInsertSlot(kbts_shape_scratchpad *Scratchpad, kbts_u32 Slot);
 static void kbts__GsubRemoveSlot(kbts_shape_scratchpad *Scratchpad, kbts_u32 Slot);
 
@@ -28,49 +27,9 @@ static void kbts__BindGlyphStorage(kbts_glyph_storage *Storage, void *Memory, kb
 static kbts_b32 kbts__ReserveGlyphs(kbts_glyph_storage *Storage, kbts_u32 Required)
 {
   if(Storage->Error) return 0;
-  Required = KBTS__MAX(Required, Storage->Count);
   if(Required <= Storage->Capacity) return 1;
-  kbts_un Overhead = kbts__GlyphStorageOverhead();
-  kbts_un Stride = kbts__GlyphStorageStride();
-  kbts_u32 MaximumCapacity = (kbts_u32)(((kbts_un)(kbts_u32)-1 - Overhead) / Stride);
-  if(Storage->FixedMemory || Required > MaximumCapacity)
-  {
-    Storage->Error = 1;
-    return 0;
-  }
-  kbts_u32 Capacity = Storage->Capacity ? Storage->Capacity : KBTS__MIN(32, MaximumCapacity);
-  while(Capacity < Required)
-  {
-    if(Capacity > MaximumCapacity / 2) { Capacity = MaximumCapacity; break; }
-    Capacity *= 2;
-  }
-  kbts_un Size = Overhead + (kbts_un)Capacity * Stride;
-  void *Memory = kbts__AllocatorAllocate(Storage->Allocator, Storage->AllocatorData, Size);
-  if(!Memory)
-  {
-    Storage->Error = 1;
-    return 0;
-  }
-  if((kbts_uptr)Memory > (kbts_uptr)-1 - Size)
-  {
-    kbts__AllocatorFree(Storage->Allocator, Storage->AllocatorData, Memory);
-    Storage->Error = 1;
-    return 0;
-  }
-  kbts_glyph_storage NewStorage = *Storage;
-  kbts__BindGlyphStorage(&NewStorage, Memory, Capacity);
-  if(Storage->Count)
-  {
-    KBTS_MEMCPY(NewStorage.Glyphs, Storage->Glyphs, (kbts_un)Storage->Count * sizeof(*Storage->Glyphs));
-    KBTS_MEMCPY(NewStorage.Links, Storage->Links, (kbts_un)Storage->Count * sizeof(*Storage->Links));
-  }
-  if(Storage->FreeSlotCount)
-    KBTS_MEMCPY(NewStorage.FreeSlots, Storage->FreeSlots,
-                (kbts_un)Storage->FreeSlotCount * sizeof(*Storage->FreeSlots));
-  void *OldMemory = Storage->Memory;
-  *Storage = NewStorage;
-  kbts__AllocatorFree(Storage->Allocator, Storage->AllocatorData, OldMemory);
-  return 1;
+  Storage->Error = 1;
+  return 0;
 }
 
 static void kbts__LinkGlyphBefore(kbts_glyph_storage *Storage, kbts_u32 Slot, kbts_u32 Next)
@@ -277,29 +236,6 @@ static void kbts__PopGlyphRange(kbts_glyph_storage *Storage, kbts__glyph_range *
   *Range = KBTS__ZERO_TYPE(kbts__glyph_range);
 }
 
-/* GPOS does not change slot identity or logical order. Rebuild its direct-child
- * links after GSUB, including existing attachments in the active range. */
-static void kbts__RebuildAttachmentLinks(kbts_glyph_storage *Storage)
-{
-  for(kbts_u32 Slot = Storage->First; Slot != Storage->End; Slot = Storage->Links[Slot].Next)
-  {
-    kbts__glyph_link *Link = &Storage->Links[Slot];
-    Link->FirstAttached = Link->NextAttached = Link->PrevAttached = 0;
-    kbts_glyph_ref Parent = Storage->Glyphs[Slot].AttachGlyph;
-    if(kbts__GlyphIsValid(Storage, Parent)) Storage->Links[Parent - 1].FirstAttached = 0;
-  }
-  for(kbts_u32 Slot = Storage->First; Slot != Storage->End; Slot = Storage->Links[Slot].Next)
-  {
-    kbts_glyph_ref Parent = Storage->Glyphs[Slot].AttachGlyph;
-    if(!kbts__GlyphIsValid(Storage, Parent)) continue;
-    kbts__glyph_link *ParentLink = &Storage->Links[Parent - 1];
-    kbts_glyph_ref First = ParentLink->FirstAttached;
-    Storage->Links[Slot].NextAttached = First;
-    if(First) Storage->Links[First - 1].PrevAttached = Slot + 1;
-    ParentLink->FirstAttached = Slot + 1;
-  }
-}
-
 static void kbts__ResetGlyphSlots(kbts_glyph_storage *Storage)
 {
   Storage->Count = Storage->LiveCount = Storage->FreeSlotCount = 0;
@@ -310,30 +246,20 @@ static void kbts__ResetGlyphSlots(kbts_glyph_storage *Storage)
   Storage->Boundary = KBTS__ZERO_TYPE(kbts_glyph);
 }
 
-KBTS_EXPORT int kbts_InitializeGlyphStorage(kbts_glyph_storage *Storage, kbts_allocator_function *Allocator, void *AllocatorData)
+KBTS_EXPORT kbts_un kbts_SizeOfGlyphStorage(kbts_un GlyphCapacity)
 {
-  if(!Storage) return 0;
-  KBTS_MEMSET(Storage, 0, sizeof(*Storage));
-  Storage->Allocator = Allocator;
-  Storage->AllocatorData = AllocatorData;
-  kbts__ResetGlyphSlots(Storage);
-  return 1;
+  kbts_un Overhead = kbts__GlyphStorageOverhead(), Stride = kbts__GlyphStorageStride();
+  if(GlyphCapacity > 0xfffffffeu || GlyphCapacity > ((kbts_un)-1 - Overhead) / Stride) return 0;
+  return Overhead + GlyphCapacity * Stride;
 }
 
-KBTS_EXPORT int kbts_InitializeGlyphStorageFixedMemory(kbts_glyph_storage *Storage, void *Memory, int MemorySize)
+KBTS_EXPORT int kbts_InitializeGlyphStorage(kbts_glyph_storage *Storage, void *Output, kbts_un GlyphCapacity)
 {
   if(!Storage) return 0;
   KBTS_MEMSET(Storage, 0, sizeof(*Storage));
   kbts__ResetGlyphSlots(Storage);
-  Storage->FixedMemory = 1;
-  kbts_un Overhead = kbts__GlyphStorageOverhead(), Stride = kbts__GlyphStorageStride();
-  if(!Memory || MemorySize <= 0 || (kbts_un)MemorySize < Overhead + Stride ||
-     (kbts_uptr)Memory > (kbts_uptr)-1 - (kbts_un)MemorySize)
-  {
-    Storage->Error = 1;
-    return 0;
-  }
-  kbts__BindGlyphStorage(Storage, Memory, (kbts_u32)(((kbts_un)MemorySize - Overhead) / Stride));
+  if(!Output || !kbts_SizeOfGlyphStorage(GlyphCapacity)) { Storage->Error = 1; return 0; }
+  kbts__BindGlyphStorage(Storage, Output, (kbts_u32)GlyphCapacity);
   return 1;
 }
 
@@ -361,18 +287,10 @@ KBTS_EXPORT void kbts_ClearActiveGlyphs(kbts_glyph_storage *Storage)
   Storage->Boundary = KBTS__ZERO_TYPE(kbts_glyph);
 }
 
-KBTS_EXPORT void kbts_FreeAllGlyphs(kbts_glyph_storage *Storage)
+KBTS_EXPORT void kbts_ResetGlyphStorage(kbts_glyph_storage *Storage)
 {
   if(!Storage) return;
-  if(!Storage->FixedMemory)
-  {
-    kbts__AllocatorFree(Storage->Allocator, Storage->AllocatorData, Storage->Memory);
-    Storage->Memory = 0;
-    Storage->Glyphs = 0;
-    Storage->Links = 0;
-    Storage->FreeSlots = 0;
-    Storage->Capacity = 0;
-  }
+  Storage->Error = 0;
   kbts__ResetGlyphSlots(Storage);
 }
 

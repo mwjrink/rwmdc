@@ -63,9 +63,6 @@ typedef struct kbts__compiled_lookup
 
 struct kbts__compiled_contexts
 {
-  kbts_allocator_function *Allocator;
-  void *AllocatorData;
-  void *BaseAllocation;
   kbts_u32 GlyphCount;
   kbts_u32 SymbolCount;
   kbts_u32 SymbolWordCount;
@@ -100,8 +97,7 @@ struct kbts__compiled_contexts
 };
 
 static kbts__compiled_contexts *kbts__CompileFontData(kbts_font *Font,
-    kbts_allocator_function *Allocator, void *AllocatorData,
-    kbts_allocator_function *ScratchAllocator, void *ScratchAllocatorData);
+    kbts__memory *Persistent, kbts__memory *Scratch);
 KBTS_INLINE kbts_u32 kbts__CompiledGlyphSymbol(const kbts__compiled_contexts *Cache, kbts_u32 GlyphId)
 {
   if(GlyphId >= Cache->GlyphCount || GlyphId > 0xFFFF) return 0;

@@ -677,7 +677,7 @@ static void kbts__FillGlyphClasses(kbts_glyph_classes *Classes, kbts_u32 GlyphCo
 }
 
 static kbts_load_font_error kbts__CompileFontTables(kbts_font *Font,
-    kbts_allocator_function *Allocator, void *AllocatorData)
+    kbts__memory *Persistent)
 {
   if(Font->Tables) return KBTS_LOAD_FONT_ERROR_NONE;
   kbts_blob_header Header;
@@ -688,13 +688,13 @@ static kbts_load_font_error kbts__CompileFontTables(kbts_font *Font,
       (kbts_u64)Header.LookupSubtableCount * sizeof(kbts__font_subtable) +
       (kbts_u64)Header.GlyphCount * sizeof(kbts_glyph_classes) + 3 * KBTS_ALIGNOF(kbts__font_lookup);
   if(Bytes > (kbts_un)-1) return KBTS_LOAD_FONT_ERROR_INVALID_FONT;
-  if(!Allocator) Allocator = kbts__DefaultAllocator;
-  void *Allocation = kbts__AllocatorAllocate(Allocator, AllocatorData, (kbts_un)Bytes);
+  kbts_un PersistentMark = Persistent->Used;
+  void *Allocation = kbts__MemoryPush(Persistent, (kbts_un)Bytes, 1);
   if(!Allocation) return KBTS_LOAD_FONT_ERROR_OUT_OF_MEMORY;
   kbts__pointer_bump_allocator Bump = kbts__PointerBumpAllocator(Allocation);
   kbts__font_tables *T = kbts__PointerPushType(&Bump, kbts__font_tables);
   *T = KBTS__ZERO_TYPE(kbts__font_tables);
-  T->Allocator = Allocator; T->AllocatorData = AllocatorData; T->BaseAllocation = Allocation; T->AllocationSize = (kbts_un)Bytes;
+  T->AllocationSize = (kbts_un)Bytes;
   T->LookupCount = Header.LookupCount; T->SubtableCount = Header.LookupSubtableCount;
   T->Lookups = kbts__PointerPushArray(&Bump, kbts__font_lookup, Header.LookupCount);
   T->Subtables = kbts__PointerPushArray(&Bump, kbts__font_subtable, Header.LookupSubtableCount);
@@ -702,7 +702,7 @@ static kbts_load_font_error kbts__CompileFontTables(kbts_font *Font,
   KBTS_MEMSET(T->Lookups, 0, Header.LookupCount * sizeof(*T->Lookups));
   KBTS_MEMSET(T->GlyphClasses, 0, Header.GlyphCount * sizeof(*T->GlyphClasses));
   if(!kbts__ValidateNativeBlob(Font->Blob, Font->BlobSize, &Header, T))
-  { kbts__AllocatorFree(Allocator, AllocatorData, Allocation); return KBTS_LOAD_FONT_ERROR_INVALID_FONT; }
+  { Persistent->Used = PersistentMark; return KBTS_LOAD_FONT_ERROR_INVALID_FONT; }
   kbts__gdef *Gdef = kbts__BlobTableDataType(Font->Blob, KBTS_BLOB_TABLE_ID_GDEF, kbts__gdef);
   if(Gdef)
   {
@@ -710,5 +710,7 @@ static kbts_load_font_error kbts__CompileFontTables(kbts_font *Font,
     kbts__FillGlyphClasses(T->GlyphClasses, Header.GlyphCount, Gdef, Gdef->MarkAttachmentClassDefinitionOffset, 1);
   }
   Font->Tables = T;
+  T->AllocationSize = Bump.At - (kbts_uptr)Allocation;
+  Persistent->Used = Bump.At - (kbts_uptr)Persistent->Data;
   return KBTS_LOAD_FONT_ERROR_NONE;
 }

@@ -12,7 +12,7 @@ static kbts_u32 kbts__GsubStreamContextFormat(kbts_shape_config *Config, kbts_u3
 static kbts_b32 kbts__GsubStreamSlice(kbts_un *Size, kbts_un Count, kbts_un Width,
                                      kbts_un Alignment, kbts_un *Offset)
 {
-  const kbts_un Limit = 0xFFFFFFFFu;
+  const kbts_un Limit = (kbts_un)-1;
   kbts_un Padding = (Alignment - (*Size & (Alignment - 1))) & (Alignment - 1);
   if(Padding > Limit - *Size) return 0;
   *Size += Padding;
@@ -23,24 +23,21 @@ static kbts_b32 kbts__GsubStreamSlice(kbts_un *Size, kbts_un Count, kbts_un Widt
   return 1;
 }
 
-/* Retained families are independent: a native interval does not allocate,
- * clear or copy symbol rows. Rows are readable only through WordCount; dormant
- * rows are initialized on admission, never speculatively across capacity. */
+/* Fixed families are independent: a native interval does not clear symbol
+ * rows. Rows are readable only through WordCount; dormant rows are initialized
+ * on admission, never speculatively across capacity. */
 static kbts_b32 kbts__ReserveGsubStream(kbts_shape_scratchpad *Scratchpad, kbts_un Required)
 {
   kbts__gsub_stream *Stream = &Scratchpad->Stream;
   const kbts__gsub_plan *Plan = Scratchpad->Config->GsubPlan;
-  kbts_un Capacity = Stream->Capacity ? Stream->Capacity : 64;
-  while(Capacity < Required)
-  {
-    if(Capacity > 0xFFFFFFFFu / 2) { Capacity = Required; break; }
-    Capacity *= 2;
-  }
-  kbts_un Stride = Capacity / 64 + !!(Capacity & 63);
+  kbts_un Capacity = Scratchpad->GlyphCapacity;
+  kbts_un Stride = Stream->SymbolStride;
   kbts_un Words = Required / 64 + !!(Required & 63);
   kbts_un StageWords = (kbts_un)Plan->StageCount / 64 + !!(Plan->StageCount & 63);
   kbts_un MetaSize = 0, StageOffset, PresenceOffset, SymbolSize = 0, NativeSize = 0, Ignored;
-  if(Capacity > 0xFFFFFFFFu ||
+  if(Required > Capacity || Stream->Capacity != Capacity ||
+     Stride != Capacity / 64 + !!(Capacity & 63) ||
+     Stride > (kbts_un)-1 / sizeof(kbts_u64) ||
      !kbts__GsubStreamSlice(&MetaSize, StageWords, sizeof(kbts_u64), KBTS_ALIGNOF(kbts_u64), &StageOffset) ||
      !kbts__GsubStreamSlice(&MetaSize, Stream->IndexSymbols ? Plan->SymbolWordCount : 0,
          sizeof(kbts_u32), KBTS_ALIGNOF(kbts_u32), &PresenceOffset) ||
@@ -49,82 +46,45 @@ static kbts_b32 kbts__ReserveGsubStream(kbts_shape_scratchpad *Scratchpad, kbts_
      !kbts__GsubStreamSlice(&NativeSize, Stream->IndexNative ? Stream->NativeCount : 0,
          Stride * sizeof(kbts_u64), KBTS_ALIGNOF(kbts_u64), &Ignored))
     goto Failure;
+  if(MetaSize > Stream->MetadataCapacity || SymbolSize > Stream->SymbolCapacity ||
+     NativeSize > Stream->NativeCapacity ||
+     (MetaSize && !Stream->Memory) || (SymbolSize && !Stream->SymbolMemory) ||
+     (NativeSize && !Stream->NativeMemory))
+    goto Failure;
+  Stream->StageCandidates = KBTS__POINTER_OFFSET(kbts_u64,
+      KBTS__ALIGN_POINTER(void, Stream->Memory, KBTS_ALIGNOF(kbts_u64)), StageOffset);
+  Stream->PresentSymbols = Stream->IndexSymbols ? KBTS__POINTER_OFFSET(kbts_u32,
+      KBTS__ALIGN_POINTER(void, Stream->Memory, KBTS_ALIGNOF(kbts_u64)), PresenceOffset) : 0;
+  Stream->SymbolCandidates = Stream->IndexSymbols ?
+      KBTS__ALIGN_POINTER(kbts_u64, Stream->SymbolMemory, KBTS_ALIGNOF(kbts_u64)) : 0;
+  Stream->NativeCandidates = Stream->IndexNative ?
+      KBTS__ALIGN_POINTER(kbts_u64, Stream->NativeMemory, KBTS_ALIGNOF(kbts_u64)) : 0;
+  if(Stream->Indexing && Words > Stream->WordCount)
   {
-    kbts_un Sizes[3] = {MetaSize, SymbolSize, NativeSize};
-    kbts_un OldSizes[3] = {Stream->MetadataCapacity, Stream->SymbolCapacity, Stream->NativeCapacity};
-    void *Old[3] = {Stream->Memory, Stream->SymbolMemory, Stream->NativeMemory};
-    void *New[3] = {Old[0], Old[1], Old[2]};
-    for(kbts_u32 I = 0; I < 3; ++I)
-    {
-      if(Sizes[I] <= OldSizes[I]) continue;
-      if(Sizes[I] > 0xFFFFFFFFu - (KBTS_ALIGNOF(kbts_u64) - 1)) goto AllocationFailure;
-      New[I] = kbts__AllocatorAllocate(Scratchpad->Allocator, Scratchpad->AllocatorData,
-          Sizes[I] + KBTS_ALIGNOF(kbts_u64) - 1);
-      if(!New[I]) goto AllocationFailure;
-    }
-    {
-      kbts_u64 *Stages = KBTS__POINTER_OFFSET(kbts_u64,
-          KBTS__ALIGN_POINTER(void, New[0], KBTS_ALIGNOF(kbts_u64)), StageOffset);
-      kbts_u32 *Present = Stream->IndexSymbols ? KBTS__POINTER_OFFSET(kbts_u32,
-          KBTS__ALIGN_POINTER(void, New[0], KBTS_ALIGNOF(kbts_u64)), PresenceOffset) : 0;
-      kbts_u64 *Symbols = Stream->IndexSymbols ? KBTS__ALIGN_POINTER(kbts_u64, New[1], KBTS_ALIGNOF(kbts_u64)) : 0;
-      kbts_u64 *Native = Stream->IndexNative ? KBTS__ALIGN_POINTER(kbts_u64, New[2], KBTS_ALIGNOF(kbts_u64)) : 0;
-      if(Stream->Indexing)
+    KBTS_ASSERT(Stream->BoundConfig == Scratchpad->Config);
+    /* Fixed strides preserve existing words; admit only the newly readable
+     * suffix of active rows. First admission initializes every dormant row. */
+    if(Stream->IndexSymbols)
+      for(kbts_u32 S = 0; S < Plan->SymbolCount; ++S)
+        if(Stream->PresentSymbols[S / 32] & (1u << (S & 31)))
+        {
+          kbts_u64 *Row = Stream->SymbolCandidates + (kbts_un)S * Stride;
+          KBTS_MEMSET(Row + Stream->WordCount, 0, (Words - Stream->WordCount) * sizeof(*Row));
+        }
+    if(Stream->IndexNative)
+      for(kbts_u32 I = Stream->FirstLookup; I < Stream->LastLookup; ++I)
       {
-        KBTS_ASSERT(Stream->BoundConfig == Scratchpad->Config);
-        /* Move rows backwards when the stride widens in retained storage. */
-        if(Stream->IndexSymbols)
-          for(kbts_u32 S = Plan->SymbolCount; S-- > 0;)
-            if(Stream->PresentSymbols[S / 32] & (1u << (S & 31)))
-            {
-              kbts_u64 *Dst = Symbols + (kbts_un)S * Stride;
-              kbts_u64 *Src = Stream->SymbolCandidates + (kbts_un)S * Stream->SymbolStride;
-              if(Dst != Src)
-                KBTS_MEMMOVE(Dst, Src, Stream->WordCount * sizeof(*Dst));
-              if(Words > Stream->WordCount)
-                KBTS_MEMSET(Dst + Stream->WordCount, 0, (Words - Stream->WordCount) * sizeof(*Dst));
-            }
-        if(Stream->IndexNative)
-          for(kbts_u32 I = Stream->LastLookup; I-- > Stream->FirstLookup;)
-          {
-            const kbts__gsub_node *Node = &Plan->Nodes[I];
-            if(Node->Kind != KBTS__GSUB_NATIVE || Node->Stage < Stream->MinimumStage ||
-               !(Stream->StageCandidates[Node->Stage / 64] & ((kbts_u64)1 << (Node->Stage & 63)))) continue;
-            kbts_un Row = Node->NativeIndex - Stream->NativeFirst;
-            kbts_u64 *Dst = Native + Row * Stride;
-            kbts_u64 *Src = Stream->NativeCandidates + Row * Stream->SymbolStride;
-            if(Dst != Src) KBTS_MEMMOVE(Dst, Src, Stream->WordCount * sizeof(*Dst));
-            if(Words > Stream->WordCount)
-              KBTS_MEMSET(Dst + Stream->WordCount, 0, (Words - Stream->WordCount) * sizeof(*Dst));
-          }
-        if(Stages != Stream->StageCandidates)
-          KBTS_MEMCPY(Stages, Stream->StageCandidates, StageWords * sizeof(*Stages));
-        if(Present && Present != Stream->PresentSymbols)
-          KBTS_MEMCPY(Present, Stream->PresentSymbols, Plan->SymbolWordCount * sizeof(*Present));
+        const kbts__gsub_node *Node = &Plan->Nodes[I];
+        if(Node->Kind != KBTS__GSUB_NATIVE || Node->Stage < Stream->MinimumStage ||
+           !(Stream->StageCandidates[Node->Stage / 64] & ((kbts_u64)1 << (Node->Stage & 63)))) continue;
+        kbts_u64 *Row = Stream->NativeCandidates +
+            (kbts_un)(Node->NativeIndex - Stream->NativeFirst) * Stride;
+        KBTS_MEMSET(Row + Stream->WordCount, 0, (Words - Stream->WordCount) * sizeof(*Row));
       }
-      Stream->StageCandidates = Stages;
-      Stream->PresentSymbols = Present;
-      Stream->SymbolCandidates = Symbols;
-      Stream->NativeCandidates = Native;
-    }
-    for(kbts_u32 I = 0; I < 3; ++I)
-      if(New[I] != Old[I]) kbts__AllocatorFree(Scratchpad->Allocator, Scratchpad->AllocatorData, Old[I]);
-    Stream->Memory = New[0];
-    Stream->SymbolMemory = New[1];
-    Stream->NativeMemory = New[2];
-    Stream->MetadataCapacity = KBTS__MAX(OldSizes[0], Sizes[0]);
-    Stream->SymbolCapacity = KBTS__MAX(OldSizes[1], Sizes[1]);
-    Stream->NativeCapacity = KBTS__MAX(OldSizes[2], Sizes[2]);
-    Stream->Capacity = Capacity;
-    Stream->SymbolStride = Stride;
-    Stream->WordCount = Words;
-    Stream->BoundConfig = Scratchpad->Config;
-    return 1;
-AllocationFailure:
-    for(kbts_u32 I = 0; I < 3; ++I)
-      if(New[I] && New[I] != Old[I])
-        kbts__AllocatorFree(Scratchpad->Allocator, Scratchpad->AllocatorData, New[I]);
   }
+  Stream->WordCount = Words;
+  Stream->BoundConfig = Scratchpad->Config;
+  return 1;
 Failure:
   Scratchpad->Error = KBTS_SHAPE_ERROR_OUT_OF_MEMORY;
   return 0;
@@ -134,6 +94,45 @@ Failure:
 /* Config-owned stage words already aggregate every glyph's static lookup
  * eligibility. Overrides select the possible row; live flags, disabled
  * features, required features and nonbinary values are checked at execution. */
+static inline kbts_u64 kbts__GsubAdmissionWord(const kbts_shape_config *Config,
+    const kbts_glyph *Glyph, kbts_u32 Word)
+{
+  const kbts__gsub_plan *Plan = Config->GsubPlan;
+  kbts_u64 Bits = ~(kbts_u64)0;
+  if(Glyph->Id < Config->GlyphCount)
+  {
+    const kbts_u64 *Rows = Glyph->Config && Glyph->Config->HasEnabledLookups ?
+        Plan->PossibleStages : Plan->DefaultStages;
+    Bits = Rows[(kbts_un)Glyph->Id * Plan->AdmissionStride + Word];
+  }
+  if(Glyph->Config && Glyph->Config->DisabledGsubStages)
+    Bits &= ~Glyph->Config->DisabledGsubStages[Word];
+  return Bits;
+}
+
+/* Initial construction and live edits share row admission and initialization. */
+static inline void kbts__GsubAdmitStageWord(const kbts__gsub_plan *Plan,
+    kbts__gsub_stream *Stream, kbts_u64 Bits, kbts_u64 NativeMask,
+    kbts_u32 Word, kbts_u32 Slot)
+{
+  kbts_u64 New = Bits & ~Stream->StageCandidates[Word];
+  Stream->StageCandidates[Word] |= Bits;
+  Bits &= NativeMask;
+  while(Bits)
+  {
+    kbts_u32 Low = (kbts_u32)Bits;
+    kbts_u32 B = Low ? kbts__LsbPositionOrBitWidth32(Low) :
+        32 + kbts__LsbPositionOrBitWidth32((kbts_u32)(Bits >> 32));
+    kbts_u32 Stage = Word * 64 + B;
+    const kbts__gsub_node *Node = &Plan->Nodes[Plan->Stages[Stage].FirstLookup];
+    kbts_u64 *Row = Stream->NativeCandidates +
+        (kbts_un)(Node->NativeIndex - Stream->NativeFirst) * Stream->SymbolStride;
+    if(New & ((kbts_u64)1 << B)) KBTS_MEMSET(Row, 0, Stream->WordCount * sizeof(*Row));
+    Row[Slot / 64] |= (kbts_u64)1 << (Slot & 63);
+    Bits &= Bits - 1;
+  }
+}
+
 static void kbts__GsubAdmitStages(kbts_shape_config *Config, kbts__gsub_stream *Stream,
     const kbts_glyph *Glyph, kbts_u32 Slot, kbts_u32 FirstLookup, kbts_u32 LastLookup,
     kbts_u32 MinimumStage)
@@ -143,33 +142,13 @@ static void kbts__GsubAdmitStages(kbts_shape_config *Config, kbts__gsub_stream *
   kbts_u32 FirstStage = KBTS__MAX(MinimumStage, Plan->Nodes[FirstLookup].Stage);
   kbts_u32 LastStage = Plan->Nodes[LastLookup - 1].Stage;
   if(FirstStage > LastStage) return;
-  const kbts_u64 *Row = 0;
-  if(Glyph->Id < Config->GlyphCount)
-    Row = ((Glyph->Config && Glyph->Config->HasEnabledLookups) ?
-        Plan->PossibleStages : Plan->DefaultStages) + (kbts_un)Glyph->Id * Plan->AdmissionStride;
   for(kbts_u32 W = FirstStage / 64; W <= LastStage / 64; ++W)
   {
-    kbts_u64 Bits = Row ? Row[W] : ~(kbts_u64)0;
-    if(Glyph->Config && Glyph->Config->DisabledGsubStages)
-      Bits &= ~Glyph->Config->DisabledGsubStages[W];
+    kbts_u64 Bits = kbts__GsubAdmissionWord(Config, Glyph, W);
     if(W == FirstStage / 64) Bits &= ~(kbts_u64)0 << (FirstStage & 63);
     if(W == LastStage / 64) Bits &= ~(kbts_u64)0 >> (63 - (LastStage & 63));
-    kbts_u64 New = Bits & ~Stream->StageCandidates[W];
-    Stream->StageCandidates[W] |= Bits;
-    if(!Stream->IndexNative) continue;
-    Bits &= Plan->NativeStages[W];
-    while(Bits)
-    {
-      kbts_u32 Low = (kbts_u32)Bits;
-      kbts_u32 B = Low ? kbts__LsbPositionOrBitWidth32(Low) :
-          32 + kbts__LsbPositionOrBitWidth32((kbts_u32)(Bits >> 32));
-      kbts_u32 Stage = W * 64 + B;
-      const kbts__gsub_node *Node = &Plan->Nodes[Plan->Stages[Stage].FirstLookup];
-      kbts_u64 *NativeRow = Stream->NativeCandidates + (kbts_un)(Node->NativeIndex - Stream->NativeFirst) * Stream->SymbolStride;
-      if(New & ((kbts_u64)1 << B)) KBTS_MEMSET(NativeRow, 0, Stream->WordCount * sizeof(*NativeRow));
-      NativeRow[Slot / 64] |= (kbts_u64)1 << (Slot & 63);
-      Bits &= Bits - 1;
-    }
+    kbts_u64 NativeMask = Stream->IndexNative ? Plan->NativeStages[W] : 0;
+    kbts__GsubAdmitStageWord(Plan, Stream, Bits, NativeMask, W, Slot);
   }
 }
 
@@ -186,25 +165,40 @@ KBTS_INLINE kbts_u64 *kbts__GsubSymbolRow(kbts__gsub_stream *Stream, kbts_u32 Sy
   return Row;
 }
 
-/* One initial pass per operation. Stable-slot edits never rebuild survivors. */
+/* Build once per contiguous GSUB interval, directly from stable slots. Hoist
+ * interval masks per stage word; subsequent edits admit only their changed slot. */
 static void kbts__GsubBuildIndexes(kbts_shape_config *Config, kbts_glyph_storage *Storage, kbts__gsub_stream *Stream,
     kbts_u32 FirstLookup, kbts_u32 LastLookup, kbts_u32 MinimumStage)
 {
   const kbts__gsub_plan *Plan = Config->GsubPlan;
   KBTS_MEMSET(Stream->StageCandidates, 0,
       ((kbts_un)Plan->StageCount / 64 + !!(Plan->StageCount & 63)) * sizeof(kbts_u64));
-  if(Stream->IndexSymbols)
-    KBTS_MEMSET(Stream->PresentSymbols, 0, (kbts_un)Plan->SymbolWordCount * sizeof(kbts_u32));
   Stream->HasIgnorables = 0;
-  for(kbts_u32 Slot = Storage->First; Slot != Storage->End; Slot = kbts__NextGlyphSlot(Storage, Slot))
+  if(Stream->IndexSymbols)
   {
-    const kbts_glyph *Glyph = &Storage->Glyphs[Slot];
-    if(Stream->IndexSymbols)
+    KBTS_MEMSET(Stream->PresentSymbols, 0, (kbts_un)Plan->SymbolWordCount * sizeof(kbts_u32));
+    for(kbts_u32 Slot = Storage->First; Slot != Storage->End; Slot = kbts__NextGlyphSlot(Storage, Slot))
     {
+      const kbts_glyph *Glyph = &Storage->Glyphs[Slot];
       Stream->HasIgnorables |= !!(Glyph->UnicodeFlags & KBTS_UNICODE_FLAG_DEFAULT_IGNORABLE);
       kbts__GsubSymbolRow(Stream, Glyph->CompiledSymbol)[Slot / 64] |= (kbts_u64)1 << (Slot & 63);
     }
-    kbts__GsubAdmitStages(Config, Stream, Glyph, Slot, FirstLookup, LastLookup, MinimumStage);
+  }
+  if(FirstLookup >= LastLookup || MinimumStage >= Plan->StageCount) return;
+  kbts_u32 FirstStage = KBTS__MAX(MinimumStage, Plan->Nodes[FirstLookup].Stage);
+  kbts_u32 LastStage = Plan->Nodes[LastLookup - 1].Stage;
+  if(FirstStage > LastStage) return;
+  for(kbts_u32 W = FirstStage / 64; W <= LastStage / 64; ++W)
+  {
+    kbts_u64 Mask = ~(kbts_u64)0;
+    if(W == FirstStage / 64) Mask &= ~(kbts_u64)0 << (FirstStage & 63);
+    if(W == LastStage / 64) Mask &= ~(kbts_u64)0 >> (63 - (LastStage & 63));
+    kbts_u64 NativeMask = Stream->IndexNative ? Plan->NativeStages[W] : 0;
+    for(kbts_u32 Slot = Storage->First; Slot != Storage->End; Slot = kbts__NextGlyphSlot(Storage, Slot))
+    {
+      kbts_u64 Bits = kbts__GsubAdmissionWord(Config, &Storage->Glyphs[Slot], W) & Mask;
+      kbts__GsubAdmitStageWord(Plan, Stream, Bits, NativeMask, W, Slot);
+    }
   }
 }
 
@@ -326,7 +320,8 @@ static void kbts__GsubInsertSlot(kbts_shape_scratchpad *Scratchpad, kbts_u32 Slo
 {
   kbts__gsub_stream *Stream = &Scratchpad->Stream;
   if(!Stream->Indexing || Scratchpad->Error) return;
-  if(Scratchpad->Storage->Count > Stream->WordCount * 64 &&
+  if((Scratchpad->Storage->Count > Scratchpad->GlyphCapacity ||
+      Scratchpad->Storage->Count > Stream->WordCount * 64) &&
      !kbts__ReserveGsubStream(Scratchpad, Scratchpad->Storage->Count)) return;
   const kbts_glyph *Glyph = &Scratchpad->Storage->Glyphs[Slot];
   if(Stream->IndexSymbols)
@@ -439,8 +434,7 @@ static void kbts__GsubConstantNode(kbts_shape_scratchpad *Scratchpad, kbts_shape
       Progress = kbts__NextGlyphSlot(Storage, Anchor);
       kbts_glyph *Glyph = &Storage->Glyphs[Anchor];
       kbts_u16 FeatureValue;
-      if((Glyph->Flags & Filter) != Filter ||
-         !kbts__GsubLookupEnabled(Config, Glyph->Id, Glyph->Config, LookupIndex, &FeatureValue)) continue;
+      if(!kbts__GsubLookupEnabled(Config, Glyph, LookupIndex, Filter, &FeatureValue)) continue;
       KB_PROFILE_SCOPE(KBP_SUBSTITUTE);
       for(kbts_u32 Subtable = 0; Subtable < Node->SubtableCount; ++Subtable)
       {
@@ -463,8 +457,7 @@ static void kbts__GsubConstantNode(kbts_shape_scratchpad *Scratchpad, kbts_shape
             const kbts_glyph *Next = &Storage->Glyphs[Slot];
             kbts_u16 NextFeature;
             if(Scratchpad->CompiledOffsets[Program->MaxBacktrack + Count] != Slot ||
-               (Next->Flags & Sequential->GlyphFilter) != Sequential->GlyphFilter ||
-               !kbts__GsubLookupEnabled(Config, Next->Id, Next->Config, LookupIndex, &NextFeature) ||
+               !kbts__GsubLookupEnabled(Config, Next, LookupIndex, Filter, &NextFeature) ||
                NextFeature != FeatureValue) break;
             ++Count;
             Slot = kbts__NextGlyphSlot(Storage, Slot);
@@ -535,8 +528,8 @@ KBTS_INLINE kbts_u32 kbts__GsubNativeCandidate(const kbts_u64 *Candidates,
 
 /* Native candidates are conservative, not a frozen anchor queue. Every
  * continuation reloads even the current word to see contextual child writes.
- * Structural edits repair just their own slot; capacity growth preserves rows,
- * and every continuation reloads the candidate pointer after possible growth. */
+ * Structural edits repair just their own slot; newly readable words are
+ * initialized without moving the fixed candidate rows. */
 static kbts_b32 kbts__GsubNativeNode(kbts_shape_scratchpad *Scratchpad, kbts_shape_config *Config,
     kbts_glyph_storage *Storage, kbts_u32 LookupIndex,
     kbts_u32 StageIndex, kbts_u32 LastLookup)
@@ -565,8 +558,7 @@ static kbts_b32 kbts__GsubNativeNode(kbts_shape_scratchpad *Scratchpad, kbts_sha
     const kbts_glyph *Current = &Storage->Glyphs[Position];
     kbts_glyph_ref Glyph = Current->Ref;
     kbts_u16 FeatureValue;
-    if((Current->Flags & Filter) != Filter ||
-       !kbts__GsubLookupEnabled(Config, Current->Id, Current->Config, LookupIndex, &FeatureValue))
+    if(!kbts__GsubLookupEnabled(Config, Current, LookupIndex, Filter, &FeatureValue))
     {
       Position = Reverse ? (Position == Storage->First ? KBTS__GLYPH_END :
           kbts__PrevGlyphSlot(Storage, Position)) : kbts__NextGlyphSlot(Storage, Position);

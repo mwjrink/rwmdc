@@ -150,344 +150,8 @@ static void kbts__ExecuteOp(kbts_shape_scratchpad *Scratchpad, kbts_glyph_storag
     {
       KB_PROFILE_SCOPE(KBP_NORMALIZE);
       KBTS_INSTRUMENT_BLOCK_BEGIN(NORMALIZE);
-
-      KBTS_INSTRUMENT_BLOCK_BEGIN(Decompose);
-      { // Full NFD decomposition
-        kbts_glyph *DecompositionGlyphs = (kbts_glyph *)Scratchpad->ScratchMemory;
-        kbts_un CodepointsToDecomposeCount = 0;
-
-        for(kbts_u32 GlyphIndex = Storage->First; GlyphIndex != Storage->End; GlyphIndex = kbts__NextGlyphSlot(Storage, GlyphIndex))
-        {
-          kbts_glyph *Glyph = &Storage->Glyphs[GlyphIndex];
-          if(kbts__GetDecompositionSize(Glyph->Decomposition))
-          {
-            kbts_glyph_ref GlyphRef = Glyph->Ref;
-            kbts_glyph_ref PrevAnchor = kbts__PrevGlyphRef(Storage, GlyphRef);
-
-            DecompositionGlyphs[0] = *Glyph;
-            CodepointsToDecomposeCount = 1;
-
-            kbts__FreeGlyph(Scratchpad, Storage, GlyphRef);
-
-            while(CodepointsToDecomposeCount)
-            {
-              kbts_glyph GlyphToDecompose = DecompositionGlyphs[--CodepointsToDecomposeCount];
-              kbts_u64 Decomposition = 0;
-              kbts_u32 DecompositionSize = 0;
-              int AnyUnsupported = 0;
-              kbts_glyph Decomposed[2];
-
-              if(!(GlyphToDecompose.Flags & KBTS_GLYPH_FLAG_DO_NOT_DECOMPOSE))
-              {
-                Decomposition = GlyphToDecompose.Decomposition;
-                DecompositionSize = kbts__GetDecompositionSize(Decomposition);
-
-                // Only decompose when the font supports the decomposed form.
-                KBTS__FOR(DecompositionIndex, 0, DecompositionSize)
-                {
-                  kbts_glyph DecompositionGlyph = kbts_CodepointToGlyph(Font, (int)kbts__GetDecompositionCodepoint(Decomposition, DecompositionIndex), 0, 0);
-                  DecompositionGlyph.Config = GlyphToDecompose.Config;
-                  DecompositionGlyph.UserIdOrCodepointIndex = GlyphToDecompose.UserIdOrCodepointIndex;
-
-                  AnyUnsupported |= !DecompositionGlyph.Id;
-                  Decomposed[DecompositionIndex] = DecompositionGlyph;
-                }
-              }
-
-              if(AnyUnsupported | !DecompositionSize)
-              {
-                kbts_glyph_ref NewGlyph = kbts__InsertGlyphAfter(Storage, PrevAnchor, &GlyphToDecompose);
-                if(!NewGlyph)
-                {
-                  goto OutOfMemory;
-                }
-
-                PrevAnchor = NewGlyph;
-              }
-              else
-              {
-                KBTS_ASSERT((CodepointsToDecomposeCount + DecompositionSize) <= KBTS__MAXIMUM_DECOMPOSITION_CODEPOINTS);
-
-                if(Decomposition & KBTS_UNICODE_DECOMPOSITION_DO_NOT_RECURSE0)
-                {
-                  Decomposed[0].Flags |= KBTS_GLYPH_FLAG_DO_NOT_DECOMPOSE;
-                }
-                if(Decomposition & KBTS_UNICODE_DECOMPOSITION_DO_NOT_RECURSE1)
-                {
-                  Decomposed[1].Flags |= KBTS_GLYPH_FLAG_DO_NOT_DECOMPOSE;
-                }
-
-                KBTS__FOR(DecompositionIndex, 0, DecompositionSize)
-                {
-                  // We reverse the glyphs here because we use a stack.
-                  DecompositionGlyphs[CodepointsToDecomposeCount++] = Decomposed[DecompositionSize - 1 - DecompositionIndex];
-                }
-              }
-            }
-
-            GlyphIndex = PrevAnchor - 1;
-          }
-        }
-      }
-      KBTS_INSTRUMENT_BLOCK_END(Decompose);
-
-      KBTS_INSTRUMENT_BLOCK_BEGIN(Recompose);
-      { // Selective recomposition.
-        // The OpenType shaping documents say that Hebrew Alphabetic Presentation Form compositions aren't canonical,
-        // but looking at UnicodeData.txt, it seems like they totally are, so they are handled here.
-        kbts_glyph_ref LastBase = 0;
-        kbts_un LastBaseParentCount = 0;
-        kbts_un PreSlashDecimalDigitCount = 0;
-        kbts_glyph_ref PreSlashGlyph = 0;
-        kbts_glyph_ref DigitGlyph = 0;
-        kbts_un DecimalDigitCount = 0;
-        kbts_b32 InFraction = 0;
-        kbts_u32 LastBaseParentsLoaded = 0;
-        kbts_glyph_parent LastBaseParents[KBTS_MAXIMUM_RECOMPOSITION_PARENTS];
-        kbts_u16 LastBaseParentIds[KBTS_MAXIMUM_RECOMPOSITION_PARENTS];
-
-        kbts_u32 BeforeFractionSlashGlyphFlags = KBTS_GLYPH_FLAG_NUMR | KBTS_GLYPH_FLAG_FRAC;
-        kbts_u32 AfterFractionSlashGlyphFlags = KBTS_GLYPH_FLAG_DNOM | KBTS_GLYPH_FLAG_FRAC;
-        if(kbts__ShaperRtl(Config->Shaper))
-        {
-          // RTL needs to invert NUMR and DNOM.
-          kbts_u32 Swap = BeforeFractionSlashGlyphFlags;
-          BeforeFractionSlashGlyphFlags = AfterFractionSlashGlyphFlags;
-          AfterFractionSlashGlyphFlags = Swap;
-        }
-
-        kbts_b32 ShouldFlip = (Scratchpad->RunDirection == KBTS_DIRECTION_RTL);
-
-        for(kbts_u32 GlyphIndex = Storage->First; GlyphIndex != Storage->End;)
-        {
-          kbts_glyph *CurrentGlyph = &Storage->Glyphs[GlyphIndex];
-          kbts_glyph_ref Glyph = CurrentGlyph->Ref;
-          CurrentGlyph->Uid = kbts__NextGlyphUid(Scratchpad);
-
-          // In RTL, mirror all glyphs when their mirror is covered.
-          if(ShouldFlip &&
-             (CurrentGlyph->UnicodeFlags & KBTS_UNICODE_FLAG_MIRRORED))
-          {
-            kbts_u32 MatchingBracketCodepoint = kbts__GetUnicodeMirrorCodepoint(CurrentGlyph->Codepoint);
-            kbts_glyph MatchingBracket = kbts_CodepointToGlyph(Font, (int)MatchingBracketCodepoint, CurrentGlyph->Config, 0);
-            if(MatchingBracket.Id)
-            {
-              kbts__SetGlyphPreserveIdentityAndUserId(CurrentGlyph, &MatchingBracket);
-            }
-          }
-
-          kbts_u32 SingleRecompositionCodepoints[KBTS_MAXIMUM_RECOMPOSITION_PARENTS];
-          kbts_un SingleRecompositionCodepointCount = 0;
-          kbts_un DoubleRecompositionCount = LastBaseParentCount;
-
-          if(!CurrentGlyph->CombiningClass)
-          {
-            LastBase = Glyph;
-            // From the Microsoft docs:
-            // USE decomposes split vowel characters belonging to UISC = Vowel_Dependent according to character
-            // decomposition mappings defined in UnicodeData.txt
-            // Cluster validation, is done based on the decomposed state of a split vowel.
-            //
-            // (Note: our Matra corresponds to Vowel_Dependent + Pure_Killer.)
-            if((Config->Shaper != KBTS_SHAPER_USE) ||
-               (CurrentGlyph->SyllabicClass != KBTS_INDIC_SYLLABIC_CLASS_MATRA))
-            {
-              kbts_s32 *LastBaseParentDeltas = kbts__GetParentInfoDeltas(CurrentGlyph->ParentInfo);
-              kbts_un ParentCount = kbts__GetParentInfoCount(CurrentGlyph->ParentInfo);
-
-              kbts_un DoubleDecompositionCount = 0;
-              KBTS__FOR(ParentIndex, 0, ParentCount)
-              {
-                kbts_glyph_parent Parent = KBTS__ZERO;
-                Parent.Codepoint = CurrentGlyph->Codepoint + (kbts_u32)LastBaseParentDeltas[ParentIndex];
-
-                kbts_u64 Decomposition = kbts__GetUnicodeDecomposition(Parent.Codepoint);
-                Parent.Codepoint1 = kbts__GetDecompositionCodepoint(Decomposition, 1);
-
-                kbts_un DecompositionSize = kbts__GetDecompositionSize(Decomposition);
-                if(DecompositionSize == 1)
-                {
-                  SingleRecompositionCodepoints[SingleRecompositionCodepointCount++] = Parent.Codepoint;
-                }
-                else
-                {
-                  LastBaseParents[DoubleDecompositionCount++] = Parent;
-                }
-              }
-
-              LastBaseParentCount = DoubleDecompositionCount;
-              LastBaseParentsLoaded = 0;
-            }
-            else
-            {
-              LastBaseParentCount = 0;
-            }
-
-            DoubleRecompositionCount = 0;
-          }
-
-          kbts_b32 Recomposed = 0;
-
-          if(!Recomposed)
-          {
-            KBTS_INSTRUMENT_BLOCK_BEGIN(ParentNSquaredStupidity);
-            KBTS__FOR(ParentIndex, 0, DoubleRecompositionCount)
-            {
-              kbts_glyph_parent *Parent = &LastBaseParents[ParentIndex];
-              kbts_u32 Codepoint1 = Parent->Codepoint1;
-
-              if(CurrentGlyph->Codepoint == Codepoint1)
-              {
-                kbts_u16 ParentId = LastBaseParentIds[ParentIndex];
-
-                if(!(LastBaseParentsLoaded & (1u << ParentIndex)))
-                {
-                  ParentId = (kbts_u16)kbts_CodepointToGlyphId(Font, (int)Parent->Codepoint);
-                  LastBaseParentIds[ParentIndex] = ParentId;
-                }
-
-                if(ParentId)
-                {
-                  // Both match. Reclaim space.
-                  kbts_glyph ParentGlyph = kbts_CodepointToGlyph(Font, (int)Parent->Codepoint, 0, 0);
-                  kbts_glyph *BaseGlyph = kbts__Glyph(Storage, LastBase);
-                  ParentGlyph.Uid = BaseGlyph->Uid;
-                  ParentGlyph.UserIdOrCodepointIndex = BaseGlyph->UserIdOrCodepointIndex;
-                  ParentGlyph.Config = BaseGlyph->Config;
-
-                  kbts_u32 Next = kbts__NextGlyphSlot(Storage, GlyphIndex);
-                  kbts__FreeGlyph(Scratchpad, Storage, Glyph);
-                  GlyphIndex = Next;
-                  CurrentGlyph = Next != Storage->End ? &Storage->Glyphs[Next] : &Storage->Boundary;
-                  Glyph = CurrentGlyph->Ref;
-
-                  Recomposed = 1;
-                  kbts__SetGlyphPreserveIdentityAndUserId(kbts__Glyph(Storage, LastBase), &ParentGlyph);
-
-                  break;
-                }
-                else
-                {
-                  // This glyph is never good. Forget it.
-                  LastBaseParents[ParentIndex] = LastBaseParents[LastBaseParentCount - 1];
-                  LastBaseParentIds[ParentIndex] = LastBaseParentIds[LastBaseParentCount - 1];
-                  LastBaseParentsLoaded &= ~(1u << ParentIndex);
-                  LastBaseParentsLoaded |= (LastBaseParentsLoaded & (1u << (LastBaseParentCount - 1))) >> (LastBaseParentCount - 1 - ParentIndex);
-                  
-                  LastBaseParentCount -= 1;
-                  DoubleRecompositionCount -= 1;
-                  ParentIndex -= 1;
-                }
-              }
-            }
-            KBTS_INSTRUMENT_BLOCK_END(ParentNSquaredStupidity);
-          }
-
-          if(!Recomposed)
-          {
-            KBTS__FOR(SingleRecompositionIndex, 0, SingleRecompositionCodepointCount)
-            {
-              kbts_u16 ParentGlyphId = (kbts_u16)kbts_CodepointToGlyphId(Font, (int)SingleRecompositionCodepoints[SingleRecompositionIndex]);
-
-              if(ParentGlyphId)
-              {
-                kbts_glyph ParentGlyph = kbts_CodepointToGlyph(Font, (int)SingleRecompositionCodepoints[SingleRecompositionIndex], 0, 0);
-                ParentGlyph.Config = CurrentGlyph->Config;
-
-                kbts__SetGlyphPreserveIdentityAndUserId(CurrentGlyph, &ParentGlyph);
-                Recomposed = 1;
-                break;
-              }
-            }
-          }
-
-          // It is safe to look for fractions here, because decimal digits/the fraction slash are not marks or
-          // jamos, so they should not get reordered after this pass.
-          if(CurrentGlyph->UnicodeFlags & KBTS_UNICODE_FLAG_DECIMAL_DIGIT)
-          {
-            if(InFraction)
-            {
-              // We are in the post-slash part of the fraction.
-              CurrentGlyph->Flags |= AfterFractionSlashGlyphFlags;
-              // Only flag the pre-slash part of the fraction if there is a post-slash part.
-              KBTS__FOR(DecimalDigitIndex, 0, PreSlashDecimalDigitCount)
-              {
-                kbts__Glyph(Storage, PreSlashGlyph)->Flags |= BeforeFractionSlashGlyphFlags;
-                PreSlashGlyph = kbts__NextGlyphRef(Storage, PreSlashGlyph);
-              }
-              PreSlashDecimalDigitCount = 0;
-            }
-            if(!DecimalDigitCount)
-            {
-              DigitGlyph = Glyph;
-            }
-            DecimalDigitCount += 1;
-          }
-          else if((CurrentGlyph->Codepoint == 0x2044) &&
-                  (!InFraction || DecimalDigitCount))
-          {
-            // Fraction slash.
-            CurrentGlyph->Flags |= KBTS_GLYPH_FLAG_FRAC;
-            PreSlashDecimalDigitCount = DecimalDigitCount;
-            PreSlashGlyph = DigitGlyph;
-            InFraction = DecimalDigitCount != 0;
-            DecimalDigitCount = 0;
-          }
-          else
-          {
-            InFraction = 0;
-          }
-
-          if(!Recomposed)
-          {
-            // Recomposition revisits the surviving glyph or the continuation after deletion.
-            GlyphIndex = kbts__NextGlyphSlot(Storage, GlyphIndex);
-          }
-        }
-      }
-      KBTS_INSTRUMENT_BLOCK_END(Recompose);
-
-      KBTS_INSTRUMENT_BLOCK_BEGIN(MarkReordering);
-      { // Unicode mark reordering.
-        for(kbts_u32 GlyphIndex = Storage->First; GlyphIndex != Storage->End;)
-        {
-          kbts_glyph *Glyph = &Storage->Glyphs[GlyphIndex];
-          kbts_u8 CombiningClass = Glyph->CombiningClass;
-
-          if(CombiningClass)
-          {
-            Glyph->MarkOrdering = CombiningClass;
-            kbts_u32 SequenceEnd = kbts__NextGlyphSlot(Storage, GlyphIndex);
-            for(; SequenceEnd != Storage->End; SequenceEnd = kbts__NextGlyphSlot(Storage, SequenceEnd))
-            {
-              kbts_glyph *SequenceGlyph = &Storage->Glyphs[SequenceEnd];
-              kbts_u8 SequenceGlyphCombiningClass = SequenceGlyph->CombiningClass;
-              if(!SequenceGlyphCombiningClass) break;
-              SequenceGlyph->MarkOrdering = SequenceGlyphCombiningClass;
-            }
-
-            kbts_glyph_ref First = Glyph->Ref;
-            kbts_glyph_ref End = SequenceEnd != Storage->End ? Storage->Glyphs[SequenceEnd].Ref : 0;
-            KBTS__SORT_GLYPHS(Storage, First, End, MarkOrdering);
-
-            #ifdef KBTS_SANITY_CHECK
-            for(kbts_glyph_ref Last = kbts__PrevGlyphRef(Storage, End), Previous = kbts__PrevGlyphRef(Storage, Last);
-                Previous && kbts__Glyph(Storage, Previous)->CombiningClass;
-                Last = Previous, Previous = kbts__PrevGlyphRef(Storage, Previous))
-            {
-              KBTS_ASSERT(kbts__Glyph(Storage, Previous)->MarkOrdering <= kbts__Glyph(Storage, Last)->MarkOrdering);
-            }
-            #endif
-
-            GlyphIndex = SequenceEnd != Storage->End ? kbts__NextGlyphSlot(Storage, SequenceEnd) : Storage->End;
-          }
-          else
-          {
-            GlyphIndex = kbts__NextGlyphSlot(Storage, GlyphIndex);
-          }
-        }
-      }
-      KBTS_INSTRUMENT_BLOCK_END(MarkReordering);
+      kbts__NormalizeGlyphs(Scratchpad, Storage);
+      if(Scratchpad->Error) goto OutOfMemory;
 
       if(Config->Script == KBTS_SCRIPT_ARABIC)
       {
@@ -833,11 +497,19 @@ static void kbts__ExecuteOp(kbts_shape_scratchpad *Scratchpad, kbts_glyph_storag
       KB_PROFILE_SCOPE(KBP_GSUB);
       KBTS_INSTRUMENT_BLOCK_BEGIN(GSUB_FEATURES);
 
-      // Script operations between feature stages may reorder the logical sequence.
-      // Each invocation uses the current active glyph range.
+      // Adjacent feature operations share one indexed interval. Keep the baked
+      // stages intact and stop before any script operation or range boundary.
       kbts_un FeatureStageIndex = kbts__CurrentBakedFeatureStageIndex(Scratchpad);
       kbts_un FirstSequentialLookupIndex = Config->FeatureStageFirstLookupIndices[FeatureStageIndex];
       kbts_un OnePastLastSequentialLookupIndex = Config->FeatureStageFirstLookupIndices[FeatureStageIndex + 1];
+      while(Scratchpad->Ip < Config->OpList.OpCount)
+      {
+        kbts__op_kind Next = Config->OpList.Ops[Scratchpad->Ip];
+        if(Next != KBTS__OP_KIND_GSUB_FEATURES && Next != KBTS__OP_KIND_GSUB_FEATURES_WITH_USER) break;
+        ++Scratchpad->Ip;
+        ++Scratchpad->FeatureStagesRead;
+        OnePastLastSequentialLookupIndex = Config->FeatureStageFirstLookupIndices[Scratchpad->FeatureStagesRead];
+      }
       kbts__RunGsubStages(Scratchpad, Config, Storage, FirstSequentialLookupIndex,
           OnePastLastSequentialLookupIndex);
       if(Scratchpad->Error) return;
@@ -911,12 +583,25 @@ static void kbts__ExecuteOp(kbts_shape_scratchpad *Scratchpad, kbts_glyph_storag
       // GSUB owns no lookup buckets. Seed only the positioning lookups now,
       // after resizing and cluster reordering have established final logical order.
       kbts_u32 SortKey = 1;
+      kbts_un LookupWordCount = ((kbts_un)Scratchpad->SequentialLookupCount + 31) / 32;
+      kbts_un FirstLookupWord = Scratchpad->GposFirstLookup / 32;
+      kbts_u32 FirstLookupMask = ~((1u << (Scratchpad->GposFirstLookup % 32)) - 1);
       for(kbts_u32 GlyphIndex = Storage->First; GlyphIndex != Storage->End; GlyphIndex = kbts__NextGlyphSlot(Storage, GlyphIndex))
       {
         kbts_glyph *Glyph = &Storage->Glyphs[GlyphIndex];
         Glyph->SortKey = SortKey;
         SortKey += 1;
-        kbts__BucketGlyph(Scratchpad, Glyph, Scratchpad->GposFirstLookup, 0);
+        // Finish clearing reverse links before indexing any parent relationships.
+        kbts__glyph_link *Link = &Storage->Links[GlyphIndex];
+        Link->FirstAttached = Link->NextAttached = Link->PrevAttached = 0;
+        if(kbts__GlyphIsValid(Storage, Glyph->AttachGlyph))
+          Storage->Links[Glyph->AttachGlyph - 1].FirstAttached = 0;
+        if(Scratchpad->GposFirstLookup < Scratchpad->SequentialLookupCount)
+        {
+          kbts__lookup_word Word = kbts__GlyphLookupCoverage(Config, Glyph,
+              LookupWordCount, FirstLookupWord, FirstLookupMask);
+          if(Word.Bits) kbts__BucketCoveredGlyph(Scratchpad, Glyph, LookupWordCount, Word);
+        }
         if(Scratchpad->Error) return;
       }
       // hmtx/vmtx pass.
@@ -955,11 +640,25 @@ static void kbts__ExecuteOp(kbts_shape_scratchpad *Scratchpad, kbts_glyph_storag
         }
       }
 
-      kbts__RebuildAttachmentLinks(Storage);
+      kbts_b32 NeedsCleanup = 0;
+      kbts_b32 ClearPostMarks = kbts__ShaperClearsMarkAdvancesInPostGposFixup(Config->Shaper);
       for(kbts_u32 GlyphIndex = Storage->First; GlyphIndex != Storage->End; GlyphIndex = kbts__NextGlyphSlot(Storage, GlyphIndex))
       {
         kbts_glyph *Glyph = &Storage->Glyphs[GlyphIndex];
+        kbts_b32 Ignorable = !(Glyph->Flags & KBTS_GLYPH_FLAG_GENERATED_BY_GSUB) &&
+            (Glyph->UnicodeFlags & KBTS_UNICODE_FLAG_DEFAULT_IGNORABLE);
+        NeedsCleanup |= Ignorable || (ClearPostMarks && Glyph->Classes.Class == KBTS__GLYPH_CLASS_MARK);
         kbts__SetCursiveFlags(Glyph, 0);
+        // GSUB may preserve parents whose reverse links need reconstruction.
+        kbts_glyph_ref Parent = Glyph->AttachGlyph;
+        if(kbts__GlyphIsValid(Storage, Parent))
+        {
+          kbts__glyph_link *ParentLink = &Storage->Links[Parent - 1];
+          kbts_glyph_ref First = ParentLink->FirstAttached;
+          Storage->Links[GlyphIndex].NextAttached = First;
+          if(First) Storage->Links[First - 1].PrevAttached = GlyphIndex + 1;
+          ParentLink->FirstAttached = GlyphIndex + 1;
+        }
 
         kbts__long_mtx Metric = DefaultMetric;
         if(LongMetrics)
@@ -977,7 +676,7 @@ static void kbts__ExecuteOp(kbts_shape_scratchpad *Scratchpad, kbts_glyph_storag
           //    cursive offsets.)
           // - In POST_GPOS_FIXUP, we perform the glyph ID substitution. We have to wait until all GPOS features have been
           //   executed to do this because they might possibly match the original ID.
-          if(!(Glyph->Flags & KBTS_GLYPH_FLAG_GENERATED_BY_GSUB) && (Glyph->UnicodeFlags & KBTS_UNICODE_FLAG_DEFAULT_IGNORABLE))
+          if(Ignorable)
           {
             Metric.Advance = 0;
             // :LeftSideBearing
@@ -1013,6 +712,9 @@ static void kbts__ExecuteOp(kbts_shape_scratchpad *Scratchpad, kbts_glyph_storag
           }
         }
       }
+      // GSUB and structural changes are finished. GPOS preserves the identity,
+      // class and flags used above, so this negative remains valid until fixup.
+      Scratchpad->SkipPostGposCleanup = !NeedsCleanup;
 
       KBTS_INSTRUMENT_BLOCK_END(GPOS_METRICS);
     }
@@ -1078,7 +780,29 @@ static void kbts__ExecuteOp(kbts_shape_scratchpad *Scratchpad, kbts_glyph_storag
                   {
                     // We are scheduled for the current bucket. Cancel that, and move on to the next.
                     kbts__UnbucketGlyph(Scratchpad, MatchedGlyph);
-                    kbts__BucketGlyph(Scratchpad, MatchedGlyph, SequentialLookupIndex + 1, 1);
+                    kbts_un NextLookup = SequentialLookupIndex + 1;
+                    if(NextLookup < Scratchpad->SequentialLookupCount)
+                    {
+                      kbts_un WordCount = ((kbts_un)Scratchpad->SequentialLookupCount + 31) / 32;
+                      kbts_u32 FirstMask = ~((1u << (NextLookup % 32)) - 1);
+                      if(!MatchedGlyph->Config && MatchedGlyph->Id < Config->GlyphCount)
+                      {
+                        // Default rebucketing already has exact enabled coverage;
+                        // do not repeat initial all-feature admission here.
+                        const kbts_u32 *Row = Config->IdSequentialLookupMatrix +
+                            (kbts_un)MatchedGlyph->Id * WordCount;
+                        kbts__lookup_word Word = kbts__NextLookupWord(Row, WordCount, NextLookup / 32, FirstMask);
+                        if(Word.Bits)
+                          kbts__InsertGlyphIntoBucket(Scratchpad,
+                              Word.Index * 32 + kbts__LsbPositionOrBitWidth32(Word.Bits), MatchedGlyph, 1);
+                      }
+                      else
+                      {
+                        kbts__lookup_word Word = kbts__GlyphLookupCoverage(Config, MatchedGlyph,
+                            WordCount, NextLookup / 32, FirstMask);
+                        if(Word.Bits) kbts__BucketCoveredGlyph(Scratchpad, MatchedGlyph, WordCount, Word);
+                      }
+                    }
                   }
                 }
 
@@ -1152,7 +876,8 @@ static void kbts__ExecuteOp(kbts_shape_scratchpad *Scratchpad, kbts_glyph_storag
       // for dotted circle insertion. However, Harfbuzz does not do this!
       // When the font does not contain a dotted circle, nothing is inserted, but when the font
       // does not contain a whitespace glyph, _we still insert an empty glyph_.
-      for(kbts_u32 GlyphIndex = Storage->First; GlyphIndex != Storage->End;)
+      for(kbts_u32 GlyphIndex = Scratchpad->SkipPostGposCleanup ? Storage->End : Storage->First;
+          GlyphIndex != Storage->End;)
       {
         kbts_glyph *Glyph = &Storage->Glyphs[GlyphIndex];
         int Keep = 0;
@@ -1190,6 +915,7 @@ static void kbts__ExecuteOp(kbts_shape_scratchpad *Scratchpad, kbts_glyph_storag
           GlyphIndex = kbts__NextGlyphSlot(Storage, GlyphIndex);
         }
       }
+      Scratchpad->SkipPostGposCleanup = 0;
 
       KBTS_INSTRUMENT_BLOCK_END(POST_GPOS_FIXUP);
     }

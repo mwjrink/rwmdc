@@ -83,7 +83,7 @@ shaping-profile isa="avx2" *args:
 # RDTSCP stage/lookup scopes only; micro-helper hooks compile out.
 shaping-core isa="avx2" *args:
     @bash bench/shaping-build.sh core {{quote(isa)}} {{args}}
-# Exact owned/upstream equality; HarfBuzz differences remain diagnostic.
+# Exact selected-reference equality (--reference upstream|harfbuzz).
 shaping-verify isa="avx2" *args:
     @bash bench/shaping-build.sh verify {{quote(isa)}} {{args}}
 
@@ -91,6 +91,6 @@ shaping-verify isa="avx2" *args:
 shaping-stress isa="avx2" *args:
     @bash bench/shaping-build.sh stress {{quote(isa)}} {{args}}
 
-# Canonical KB-only language/font/length matrix, machine-readable results.
+# Canonical CPU shaping language/font/length matrix, machine-readable results.
 shaping-suite command="list" *args:
     @python3 bench/shaping-suite.py {{quote(command)}} {{args}}

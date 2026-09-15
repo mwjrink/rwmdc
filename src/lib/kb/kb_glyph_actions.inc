@@ -1001,8 +1001,8 @@ static kbts_u32 kbts__ApplyCompiledFusion(kbts_shape_scratchpad *Scratchpad, kbt
     kbts_u16 NextFeatureValue;
     if(!kbts__GlyphIsValid(Storage, Next) ||
        Next != Scratchpad->CompiledGlyphs[Program->MaxBacktrack + Count] ||
-       !kbts__GsubLookupEnabled(Config, kbts__Glyph(Storage, Next)->Id, kbts__Glyph(Storage, Next)->Config, (kbts_u32)SequentialLookupIndex, &NextFeatureValue) ||
-       NextFeatureValue != FeatureValue || (kbts__Glyph(Storage, Next)->Flags & Filter) != Filter)
+       !kbts__GsubLookupEnabled(Config, kbts__Glyph(Storage, Next), (kbts_u32)SequentialLookupIndex, Filter, &NextFeatureValue) ||
+       NextFeatureValue != FeatureValue)
       break;
     Last = Next;
     ++Count;
@@ -1498,7 +1498,6 @@ static int kbts__WouldSubstitute(kbts_shape_scratchpad *Scratchpad, kbts_shape_c
   Temporary.End = KBTS__GLYPH_END;
   Temporary.Ordered = 1;
   Temporary.Capacity = 4;
-  Temporary.FixedMemory = 1;
   KBTS__FOR(GlyphIndex, 0, GlyphCount)
   {
     Scratch[GlyphIndex] = Glyphs[GlyphIndex];
@@ -1553,26 +1552,31 @@ static kbts_glyph kbts__Substitute1(kbts_shape_scratchpad *Scratchpad, kbts_shap
   kbts_glyph Result = *Glyph;
   kbts_glyph_ref OriginalRef = Glyph->Ref;
   kbts_glyph_ref OriginalAttachment = Glyph->AttachGlyph;
-  kbts_glyph ProbeGlyphs[4];
-  kbts__glyph_link ProbeLinks[4];
-  kbts_u32 ProbeFreeSlots[4];
   kbts_glyph_storage Temporary = KBTS__ZERO;
   kbts_glyph_storage *Storage = ProbeStorage ? ProbeStorage : &Temporary;
   if(ProbeStorage)
   {
     /* Config construction advertises and lends this complete fixed workspace. */
-    KBTS_ASSERT(Storage->FixedMemory && !Storage->LiveCount && Storage->Capacity);
+    KBTS_ASSERT(!Storage->LiveCount && Storage->Capacity);
     KBTS_ASSERT(Storage->Glyphs && Storage->Links && Storage->FreeSlots);
   }
   else
   {
-    Temporary.Allocator = Scratchpad->Allocator;
-    Temporary.AllocatorData = Scratchpad->AllocatorData;
-    Temporary.Glyphs = ProbeGlyphs;
-    Temporary.Links = ProbeLinks;
-    Temporary.FreeSlots = ProbeFreeSlots;
-    Temporary.Capacity = KBTS__ARRAY_LENGTH(ProbeGlyphs);
-    /* Only a subsequently grown backing block belongs to the allocator. */
+    kbts_un Capacity = 1;
+    if(Feature)
+    {
+      const kbts_u16 *Roots = KBTS__POINTER_AFTER(kbts_u16, Feature);
+      for(kbts_u32 I = 0; I < Feature->LookupIndexCount; ++I)
+      {
+        kbts_u32 Inserted = Config->Font->CompiledContexts->LookupSummaries[Roots[I]].MaxInserted;
+        if(Inserted > 0xfffffffeu - Capacity)
+        { Scratchpad->Error = KBTS_SHAPE_ERROR_OUT_OF_MEMORY; return Result; }
+        Capacity += Inserted;
+      }
+    }
+    if(Capacity > Scratchpad->ProbeCapacity || !Scratchpad->ProbeMemory)
+    { Scratchpad->Error = KBTS_SHAPE_ERROR_OUT_OF_MEMORY; return Result; }
+    kbts__BindGlyphStorage(&Temporary, Scratchpad->ProbeMemory, (kbts_u32)Scratchpad->ProbeCapacity);
   }
   Storage->Count = Storage->LiveCount = 1;
   Storage->First = Storage->Tail = 0;
@@ -1615,8 +1619,6 @@ static kbts_glyph kbts__Substitute1(kbts_shape_scratchpad *Scratchpad, kbts_shap
     Storage->Count = Storage->LiveCount = Storage->FreeSlotCount = 0;
     Storage->First = Storage->Tail = Storage->End = KBTS__GLYPH_END;
   }
-  else
-    kbts_FreeAllGlyphs(&Temporary);
   Scratchpad->Storage = SavedStorage;
   Scratchpad->LookupOnePastLastGlyph = SavedOnePast;
   Scratchpad->LookupOnePastLastGlyphIndex = SavedOnePastIndex;

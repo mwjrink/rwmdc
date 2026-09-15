@@ -60,7 +60,7 @@ typedef struct kbts__context_group
 
 typedef struct kbts__context_builder
 {
-  kbts_arena Arena;
+  kbts__arena Arena;
   kbts__context_predicate *Predicates, *LastPredicate;
   kbts__context_predicate **PredicateHash;
   kbts__context_source **SourceHash;
@@ -74,40 +74,11 @@ typedef struct kbts__context_builder
 static void *kbts__ContextMemory(kbts__context_builder *Builder, kbts_un Count, kbts_un Size, kbts_un Align)
 {
   if(Builder->Error) return 0;
-  kbts_un Limit = (kbts_u32)-1;
-  kbts_un Overhead = sizeof(kbts__arena_block) + KBTS_ALIGNOF(kbts__arena_block) + Align - 1;
-  if(!Size || Count > (Limit - Overhead) / Size)
-  {
-    Builder->Error = 1;
-    return 0;
-  }
+  if(!Size || Count > (kbts_un)-1 / Size)
+  { Builder->Error = 1; if(Builder->Arena.Memory) Builder->Arena.Memory->Error = 1; return 0; }
   Size *= Count;
-  kbts_arena *Arena = &Builder->Arena;
-  kbts__EnsureArenaInitialized(Arena);
-  kbts__arena_block *Block = (kbts__arena_block *)Arena->BlockSentinel.Prev;
-  void *Result = 0;
-  if(kbts__ArenaBlockIsValid(Arena, Block))
-  {
-    char *Memory = KBTS__POINTER_AFTER(char, Block);
-    char *Aligned = KBTS__ALIGN_POINTER(char, Memory + Block->Used, Align);
-    kbts_un Used = (kbts_un)(Aligned - Memory);
-    if(Used <= Block->Size && Size <= Block->Size - Used) Result = Aligned;
-  }
-  if(!Result)
-  {
-    kbts_un BlockSize = Size + Overhead;
-    if(BlockSize < KBTS_ARENA_MIN_BLOCK_SIZE) BlockSize = KBTS_ARENA_MIN_BLOCK_SIZE;
-    void *Allocation = kbts__AllocatorAllocate(Arena->Allocator, Arena->AllocatorData, BlockSize);
-    if(!Allocation) {Builder->Error = 1; return 0;}
-    /* Link only successfully allocated blocks, so failure leaves every block freeable. */
-    Block = KBTS__ALIGN_POINTER(kbts__arena_block, Allocation, KBTS_ALIGNOF(kbts__arena_block));
-    KBTS_MEMSET(Block, 0, sizeof(*Block));
-    Block->BaseAllocation = Allocation;
-    Block->Size = (kbts_un)((char *)Allocation + BlockSize - KBTS__POINTER_AFTER(char, Block));
-    KBTS__DLLIST_INSERT_BEFORE(&Block->Header, &Arena->BlockSentinel);
-    Result = KBTS__ALIGN_POINTER(char, KBTS__POINTER_AFTER(char, Block), Align);
-  }
-  Block->Used = (kbts_un)((char *)Result + Size - KBTS__POINTER_AFTER(char, Block));
+  void *Result = kbts__PushSize(&Builder->Arena, Size, Align);
+  if(!Result) { Builder->Error = 1; return 0; }
   KBTS_MEMSET(Result, 0, Size);
   return Result;
 }
