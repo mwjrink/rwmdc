@@ -5,3 +5,10 @@ tests/*
 bench/*
 docs/*
 assets/**/*.spv
+assets/**/*.ttf
+assets/**/*.otf
+
+# executables
+rwmd-debug
+rwmd-x11
+rwmd
