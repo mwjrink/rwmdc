@@ -1,0 +1,133 @@
+{
+  "purpose": "One ready group exceeds remaining reservation by multiple chunks; correctness only, not benchmark samples",
+  "results": [
+    {
+      "command": [
+        "/home/max/dev/c/rwmd/.rwmd-allocation-edge-svb_bkam/storage-bench",
+        "bench",
+        "/home/max/dev/c/rwmd/.rwmd-allocation-edge-svb_bkam",
+        "wal-packed",
+        "1048576",
+        "2000",
+        "2000",
+        "chunked-64k"
+      ],
+      "exit_code": 0,
+      "result": {
+        "experiment": "storage-bench",
+        "mode": "wal-packed",
+        "sandbox": "/home/max/dev/c/rwmd/.rwmd-allocation-edge-svb_bkam/storage-bench-K2WAdL",
+        "preallocation": "chunked-64k",
+        "allocation": {
+          "chunk_bytes": 65536,
+          "allocation_calls": 2,
+          "growth_calls": 1,
+          "initial_allocation_ns": 1780,
+          "allocation_ns_total": 4700,
+          "allocation_ns_max": 2920,
+          "reserved_bytes": 262144,
+          "initial_size_before": 0,
+          "initial_size_after": 0,
+          "initial_blocks_before": 1,
+          "initial_blocks_after": 1
+        },
+        "status": "ok",
+        "document_bytes": 1048576,
+        "iterations": 2000,
+        "batch": 2000,
+        "groups": 1,
+        "bytes_written": 240000,
+        "file_flushes": 1,
+        "directory_flushes": 0,
+        "latency_us": {
+          "p50": 958.95,
+          "p95": 1370.265,
+          "p99": 1406.745,
+          "max": 1415.475,
+          "mean": 946.776
+        },
+        "wall_seconds": 0.001417675,
+        "cpu_seconds": 0.000995209,
+        "phase_seconds": {
+          "materialization": 4.4852e-05,
+          "encoding_checksum": 0.000700709,
+          "data_write": 4.9039e-05,
+          "file_sync": 0.000430406,
+          "rename_dirsync": 0.0
+        },
+        "validation_seconds": 0.014313228,
+        "validation": true,
+        "validation_kind": "fresh-open replay",
+        "durability": "checked fdatasync, framed prefix recovery",
+        "retains_branch_history": true,
+        "materialization": "warm-memory",
+        "latency_definition": "edit-start to group durable completion, batch wait included",
+        "limitations": "owned0600 fixtures; no metadata preservation; full-file modes exclude history pipeline; warm page-cache reopen is not cold-start recovery"
+      }
+    },
+    {
+      "command": [
+        "/home/max/dev/c/rwmd/.rwmd-allocation-edge-svb_bkam/storage-bench",
+        "bench",
+        "/home/max/dev/c/rwmd/.rwmd-allocation-edge-svb_bkam",
+        "wal-aligned",
+        "1048576",
+        "2000",
+        "2000",
+        "chunked-64k"
+      ],
+      "exit_code": 0,
+      "result": {
+        "experiment": "storage-bench",
+        "mode": "wal-aligned",
+        "sandbox": "/home/max/dev/c/rwmd/.rwmd-allocation-edge-svb_bkam/storage-bench-GFHYwq",
+        "preallocation": "chunked-64k",
+        "allocation": {
+          "chunk_bytes": 65536,
+          "allocation_calls": 2,
+          "growth_calls": 1,
+          "initial_allocation_ns": 1700,
+          "allocation_ns_total": 2840,
+          "allocation_ns_max": 1700,
+          "reserved_bytes": 262144,
+          "initial_size_before": 0,
+          "initial_size_after": 0,
+          "initial_blocks_before": 1,
+          "initial_blocks_after": 1
+        },
+        "status": "ok",
+        "document_bytes": 1048576,
+        "iterations": 2000,
+        "batch": 2000,
+        "groups": 1,
+        "bytes_written": 241584,
+        "file_flushes": 1,
+        "directory_flushes": 0,
+        "latency_us": {
+          "p50": 897.06,
+          "p95": 1296.616,
+          "p99": 1336.965,
+          "max": 1345.465,
+          "mean": 894.607
+        },
+        "wall_seconds": 0.001346325,
+        "cpu_seconds": 0.000945482,
+        "phase_seconds": {
+          "materialization": 4.4397e-05,
+          "encoding_checksum": 0.000677133,
+          "data_write": 2.4759e-05,
+          "file_sync": 0.000417396,
+          "rename_dirsync": 0.0
+        },
+        "validation_seconds": 0.013441938,
+        "validation": true,
+        "validation_kind": "fresh-open replay",
+        "durability": "checked fdatasync, framed prefix recovery",
+        "retains_branch_history": true,
+        "materialization": "warm-memory",
+        "latency_definition": "edit-start to group durable completion, batch wait included",
+        "limitations": "owned0600 fixtures; no metadata preservation; full-file modes exclude history pipeline; warm page-cache reopen is not cold-start recovery"
+      }
+    }
+  ]
+}

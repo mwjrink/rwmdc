@@ -77,7 +77,7 @@ internal f32 slug_curve_min(SlugCrv c, u32 axis) {
 internal void slug_preprocess_glyph(rop(rw Arena) scratch, rop(rw SlugCtx) sc,
                                     rop(ro TTFont) font, u32 gi) {
     tt_require(gi < sc->glyph_c, "Slug glyph cache index");
-    TTGlyph g = tt_get_glyph(scratch, font, font->glyph_ids[gi]);
+    TTGlyph g = tt_get_glyph(scratch, font, gi);
     if (g.nc == 0) return;
 
     u32 curve_cap = 0;

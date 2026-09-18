@@ -1,25 +1,367 @@
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <sys/resource.h>
+#include <time.h>
 
 #define RWMD_MARKDOWN_IMPLEMENTATION
 #include <lib/grim/gfx/internal_graphics.h>
 #include <lib/grim/markdown/layout.h>
 
+typedef struct AppOptions {
+    u32         frames, warmup, width, height, columns, rows;
+    f32         font_size, font_pt;
+    bool        grid, animate, fullscreen, update_every_frame, benchmark, profile_parser;
+    const char* file;
+} AppOptions;
+
+typedef struct StartupStamp {
+    f64 wall, cpu;
+} StartupStamp;
+
+static f64 monotonic_ms(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (f64)t.tv_sec * 1000.0 + (f64)t.tv_nsec / 1e6;
+}
+
+static StartupStamp startup_stamp(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &t);
+    return (StartupStamp){monotonic_ms(), (f64)t.tv_sec * 1000.0 + (f64)t.tv_nsec / 1e6};
+}
+
+static void startup_phase(const char* name, StartupStamp before, StartupStamp after) {
+    printf(
+        "Startup %-22s wall %8.3f ms | process CPU %8.3f ms\n", name, after.wall - before.wall, after.cpu - before.cpu);
+}
+
+static void report_memory(const TextRenderState* trs, const Arena* arena) {
+    struct rusage usage;
+    getrusage(RUSAGE_SELF, &usage);
+    printf("Memory: arena used %.3f MiB | process peak RSS %.3f MiB\n",
+           (f64)arena->len / 1048576.0,
+           (f64)usage.ru_maxrss / 1024.0);
+    printf("Text Vulkan allocations: assets %.3f MiB | draw buffers %.3f MiB | staging %.3f MiB\n",
+           (f64)trs->asset_bytes / 1048576.0,
+           (f64)trs->draw_buffer_bytes / 1048576.0,
+           (f64)trs->staging_bytes / 1048576.0);
+    printf("Allocation sizes exclude swapchain/driver internals and are not physical VRAM residency.\n");
+}
+
+static int compare_ms(const void* a, const void* b) {
+    f64 x = *(const f64*)a, y = *(const f64*)b;
+    return (x > y) - (x < y);
+}
+
+static void report_samples(const char* label, f64* values, u32 count) {
+    if (!count) {
+        printf("%s: no measured frames\n", label);
+        return;
+    }
+    f64 sum    = 0;
+    u32 misses = 0;
+    for (u32 i = 0; i < count; i++) {
+        sum += values[i];
+        misses += values[i] >= 1.0;
+    }
+    qsort(values, count, sizeof(*values), compare_ms);
+    printf("%s (%u): mean %.4f ms | p50 %.4f | p95 %.4f | p99 %.4f | max %.4f | >=1ms %u (%.2f%%)\n",
+           label,
+           count,
+           sum / count,
+           values[(count - 1) / 2],
+           values[(u32)ceil(0.95 * count) - 1],
+           values[(u32)ceil(0.99 * count) - 1],
+           values[count - 1],
+           misses,
+           100.0 * misses / count);
+}
+
+static void collect_gpu(
+    const GraphicsContext* gc, VkQueryPool pool, u32 slot, u64 mask, f64 period, f64* samples, u32* count) {
+    u64 ticks[2];
+    check_vkresult(
+        vkGetQueryPoolResults(gc->device, pool, slot * 2, 2, sizeof(ticks), ticks, sizeof(u64), VK_QUERY_RESULT_64_BIT),
+        SCOPE_GFX_COMMAND_BUFFER,
+        "Read completed GPU timestamps");
+    samples[(*count)++] = (f64)((ticks[1] - ticks[0]) & mask) * period / 1e6;
+}
+
+static u32 layout_benchmark(const AppOptions* opt,
+                            const FontState*  font,
+                            FontShape*        shape,
+                            GlyphDrawCmd*     draws,
+                            u32               capacity,
+                            u32               width,
+                            u32               height) {
+    const char* corpus  = "# WYSIWYG Markdown - GPU text rendering\n"
+                          "The quick brown fox jumps over the lazy dog. 0123456789\n"
+                          "ABCDEFGHIJKLMNOPQRSTUVWXYZ abcdefghijklmnopqrstuvwxyz\n"
+                          "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~\n"
+                          "**Bold** _italic_ [link](url) `code` - cached outlines\n";
+    u32         n       = 0;
+    f32         advance = font->metrics[font_glyph(font, 'M')].advance_width;
+    if (opt->grid) {
+        f32 cw = (f32)width / (f32)opt->columns, ch = (f32)height / (f32)opt->rows;
+        f32 scale = min(cw * 0.9f / advance, ch * 0.9f / font->font->line_height);
+        for (u32 row = 0; row < opt->rows; row++)
+            for (u32 col = 0; col < opt->columns; col++) {
+                u32 cp     = 33 + (row * opt->columns + col) % 94;
+                draws[n++] = (GlyphDrawCmd){.x         = (f32)col * cw + (cw - advance * scale) * 0.5f,
+                                            .y         = (f32)row * ch + (ch - font->font->line_height * scale) * 0.5f +
+                                                         font->font->ascent * scale,
+                                            .sx        = scale,
+                                            .sy        = -scale,
+                                            .glyph_idx = font_glyph(font, (i32)cp),
+                                            .color     = 0xffffffff};
+            }
+        return n;
+    }
+    f32         y = 12 + font->font->ascent;
+    const char* p = corpus;
+    while (y - font->font->descent <= (f32)height - 12 && n < capacity) {
+        if (!*p)
+            p = corpus;
+        i32 codepoints[128];
+        u32 count         = 0;
+        f32 nominal_width = 0;
+        while (p[count] && p[count] != '\n' && count < 128) {
+            f32 next = font->metrics[font_glyph(font, (u8)p[count])].advance_width;
+            if (count && nominal_width + next > (f32)width - 24)
+                break;
+            codepoints[count] = (u8)p[count];
+            ++count;
+            nominal_width += next;
+        }
+        if (count) {
+            for (;;) {
+                if (!font_shape(shape, font, codepoints, count, true)) {
+                    fprintf(stderr, "rwmd: benchmark shaping failed: %s\n", shape->error);
+                    exit(1);
+                }
+                if (shape->width <= (f32)width - 24 || count == 1)
+                    break;
+                --count;
+            }
+            for (u32 i = 0; i < shape->count && n < capacity; ++i) {
+                const FontShapeGlyph* g = &shape->glyphs[i];
+                draws[n++]              = (GlyphDrawCmd){
+                    .x = 12 + g->x, .y = y - g->y, .sx = 1, .sy = -1, .glyph_idx = g->glyph, .color = 0xffffffff};
+            }
+            p += count;
+        }
+        if (*p == '\n')
+            ++p;
+        y += font->font->line_height;
+    }
+    return n;
+}
+
+static int run_benchmark(const AppOptions* opt) {
+    StartupStamp launch = startup_stamp();
+    Arena        arena  = arena_create();
+    RenderTarget target = window_create(&arena, opt->width, opt->height);
+    if (opt->fullscreen)
+        window_set_fullscreen(target.window);
+    GraphicsContext gc           = graphics_context_create(&arena, &target);
+    StartupStamp    device_ready = startup_stamp();
+    RenderContext   rc           = render_context_create(&arena, &gc, &target);
+    RenderState     rs           = create_render_state(&arena, &rc);
+    StartupStamp    frame_ready  = startup_stamp();
+    FontState       font         = font_load(&arena,
+                                             "assets/fonts/JetBrainsMonoNerdFontMono-Regular.ttf",
+                                             opt->font_pt > 0 ? opt->font_pt : opt->font_size,
+                                             opt->font_pt > 0);
+    StartupStamp    font_ready   = startup_stamp();
+    FontShape       shape        = {0};
+    TextRenderState trs;
+    text_render_init(&arena, &rc, &font, &trs);
+    StartupStamp  text_ready = startup_stamp();
+    GlyphDrawCmd* draws      = arena_alloc_aligned(&arena, GlyphDrawCmd, trs.max_draws);
+    f64*          gpu_ms     = arena_alloc_aligned(&arena, f64, opt->frames);
+    f64*          cpu_ms     = arena_alloc_aligned(&arena, f64, opt->frames);
+    f64*          wall_ms    = arena_alloc_aligned(&arena, f64, opt->frames);
+    u32           gpu_n = 0, sample_n = 0, submitted = 0;
+    u64           measured_upload = 0, warmup_upload = 0, revision = 0;
+    bool          pending[16] = {0};
+    assert(SCOPE_GFX_INIT, rc.frames_in_flight <= 16);
+    u32 bits = gc.timestamp_bits;
+    if (!bits) {
+        fprintf(stderr, "Graphics queue does not support GPU timestamps\n");
+        return 1;
+    }
+    u64                   mask = bits == 64 ? UINT64_MAX : ((UINT64_C(1) << bits) - 1);
+    VkQueryPoolCreateInfo qi   = {.sType      = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+                                  .queryType  = VK_QUERY_TYPE_TIMESTAMP,
+                                  .queryCount = 2 * rc.frames_in_flight};
+    check_vkresult(vkCreateQueryPool(gc.device, &qi, NULL, &trs.timestamp_pool),
+                   SCOPE_GFX_COMMAND_BUFFER,
+                   "Create benchmark timestamp pool");
+    u32               last_w = 0, last_h = 0, draw_count = 0;
+    bool              resized         = false;
+    TextPushConstants pc              = {0};
+    TextFrameStyle    style           = {.text_color = {1, 1, 1, 1}};
+    f64               animation_start = monotonic_ms();
+    while (submitted < opt->warmup + opt->frames) {
+        f64 frame_start = monotonic_ms();
+        window_poll_events(target.window);
+        for (u32 e = 0; e < target.window->events.count; e++) {
+            WindowEvent event = target.window->events.items[e];
+            if (event.type == WINDOW_KEY && event.pressed && event.key == WKEY_ESCAPE)
+                target.window->request_close = true;
+        }
+        window_clear_events(target.window);
+        if (target.window->request_close)
+            break;
+        if (!target.window->width || !target.window->height) {
+            struct timespec delay = {.tv_nsec = 10000000};
+            nanosleep(&delay, NULL);
+            continue;
+        }
+        if (target.window->width != target.extent.width || target.window->height != target.extent.height)
+            rc.render_target_resized = true;
+        if (!start_frame(&arena, &rs))
+            continue;
+        u32 slot = (u32)(rs.frame_count % rc.frames_in_flight);
+        if (pending[slot]) {
+            collect_gpu(&gc, trs.timestamp_pool, slot, mask, gc.properties.limits.timestampPeriod, gpu_ms, &gpu_n);
+            pending[slot] = false;
+        }
+        bool size_changed = last_w != target.extent.width || last_h != target.extent.height;
+        f64  cpu_start    = monotonic_ms();
+        if (size_changed) {
+            resized |= sample_n > 0;
+            last_w               = target.extent.width;
+            last_h               = target.extent.height;
+            style.viewport_scale = (Vec2){2.0f / (f32)last_w, 2.0f / (f32)last_h};
+        }
+        if (size_changed || opt->update_every_frame) {
+            draw_count = layout_benchmark(opt, &font, &shape, draws, trs.max_draws, last_w, last_h);
+            revision++;
+        }
+        if (opt->animate)
+            pc.scroll_offset.y = 4.0f * (f32)sin((frame_start - animation_start) * 0.001);
+        trs.timestamp_base = slot * 2;
+        text_render_frame(&rs, &trs, draws, draw_count, NULL, 0, style, pc, revision);
+        f64  cpu_end  = monotonic_ms();
+        bool measured = submitted >= opt->warmup;
+        pending[slot] = measured;
+        end_frame(&arena, &rs);
+        f64 frame_end = monotonic_ms();
+        if (measured) {
+            cpu_ms[sample_n]    = cpu_end - cpu_start;
+            wall_ms[sample_n++] = frame_end - frame_start;
+            measured_upload += trs.last_upload_bytes;
+        } else
+            warmup_upload += trs.last_upload_bytes;
+        if (!submitted) {
+            StartupStamp first_present = startup_stamp();
+            printf("Renderer: Slug | GPU: %s | scene: %s | font height: %.3f px\n",
+                   gc.properties.deviceName,
+                   opt->grid ? "grid" : "text",
+                   (double)(font.font->ascent - font.font->descent));
+            if (opt->font_pt > 0)
+                printf("Font: %.2f pt at 96 DPI, %.3f pixels/em, line height %.3f pixels\n",
+                       (double)opt->font_pt,
+                       (double)(font.font->scale * font.font->upem),
+                       (double)font.font->line_height);
+            printf("Warmup: %u | samples: %u | frames in flight: %u | present: %s\n",
+                   opt->warmup,
+                   opt->frames,
+                   rc.frames_in_flight,
+                   present_mode_to_str(target.swapchain.present_mode));
+            printf("Draw updates: %s | animation: %s\n",
+                   opt->update_every_frame ? "full rebuild/upload every frame" : "cached until resize",
+                   opt->animate ? "push-constant subpixel scroll" : "off");
+            startup_phase("window/device", launch, device_ready);
+            startup_phase("frame state", device_ready, frame_ready);
+            startup_phase("font parse/metrics", frame_ready, font_ready);
+            startup_phase("glyphs/text pipeline", font_ready, text_ready);
+            startup_phase("init -> first present", launch, first_present);
+            printf("Init excludes executable loading; first present is submission, not scanout.\n");
+        }
+        if (size_changed) {
+            printf("Surface: %ux%u pixels\n", last_w, last_h);
+            fflush(stdout);
+        }
+        submitted++;
+    }
+    check_vkresult(vkDeviceWaitIdle(gc.device), SCOPE_GFX_COMMAND_QUEUE, "Drain benchmark");
+    for (u32 slot = 0; slot < rc.frames_in_flight; slot++)
+        if (pending[slot])
+            collect_gpu(&gc, trs.timestamp_pool, slot, mask, gc.properties.limits.timestampPeriod, gpu_ms, &gpu_n);
+    printf("Final workload: %u glyph draws, %ux%u pixels%s\n",
+           draw_count,
+           last_w,
+           last_h,
+           resized ? " (RESIZED during measurement; rerun at fixed extent)" : "");
+    report_samples("GPU render", gpu_ms, gpu_n);
+    report_samples("CPU preparation", cpu_ms, sample_n);
+    report_samples("Wall frame", wall_ms, sample_n);
+    printf("Draw uploads: warmup %.3f KiB | measured %.3f KiB | average %.3f KiB/measured frame\n",
+           (f64)warmup_upload / 1024.0,
+           (f64)measured_upload / 1024.0,
+           sample_n ? (f64)measured_upload / sample_n / 1024.0 : 0.0);
+    report_memory(&trs, &arena);
+    printf("Glyph construction storage: %.3f MiB (released; excludes font mapping and driver allocations)\n",
+           (f64)trs.construction_bytes / 1048576.0);
+    printf("A finite redraw benchmark does not establish an always-<1ms or input-to-photon bound.\n");
+    vkDestroyQueryPool(gc.device, trs.timestamp_pool, NULL);
+    text_render_cleanup(&gc, &trs);
+    cleanup_render_state(&rs);
+    cleanup_render_context(&rc);
+    cleanup_render_target(&gc, &target);
+    cleanup_graphics_ctx(&gc);
+    close_window(target.window);
+    font_shape_destroy(&shape);
+    font_destroy(&font);
+    arena_destroy(&arena);
+    return 0;
+}
+
+typedef struct Metric {
+    u64 count, over_budget;
+    f64 sum, maximum;
+} Metric;
+static void metric_add(Metric* metric, f64 ms) {
+    metric->count++;
+    metric->sum += ms;
+    if (ms > metric->maximum)
+        metric->maximum = ms;
+    metric->over_budget += ms >= 1.0;
+}
+static void metric_report(const char* name, const Metric* metric) {
+    printf("%s: %lu samples | mean %.4f ms | max %.4f ms | >=1ms %lu\n",
+           name,
+           metric->count,
+           metric->count ? metric->sum / (f64)metric->count : 0,
+           metric->maximum,
+           metric->over_budget);
+}
+static void metric_add_ns(Metric* metric, u64 ns) {
+    metric_add(metric, (f64)ns / 1e6);
+}
+
 typedef struct Editor {
-    Document        document;
-    LayoutState     layout;
-    FontState       font;
-    GrimWindow      window;
-    u64             saved_state;
-    u32             selection_anchor;
-    u32             event_index;
-    bool            paste_pending;
-    bool            selecting, dragging_scrollbar, close_armed, title_dirty;
-    f32             drag_offset, preferred_x;
-    f64             last_input;
-    GpuRect*        rects;
-    u32             rect_capacity;
-    MdParserProfile parser_counters;
-    u64             full_parses, local_parses, largest_parse_update;
+    Document         document;
+    LayoutState      layout;
+    const FontState* font;
+    GrimWindow*      window;
+    const char*      path;
+    u64              saved_state;
+    u32              selection_anchor;
+    u32              event_index;
+    bool             paste_pending;
+    bool             selecting, dragging_scrollbar, close_armed, title_dirty;
+    f32              drag_offset, preferred_x;
+    f64              last_input;
+    GpuRect*         rects;
+    u32              rect_capacity;
+    Metric           edits, mirror, invalidation, parsing, parser_total, block_scan, inline_events;
+    Metric           callbacks, index_finalization, graphemes, cache_publication, layout_time;
+    MdParserProfile  parser_counters;
+    u64              full_parses, local_parses, largest_parse_update;
 } Editor;
 
 static bool editor_dirty(const Editor* editor) {
@@ -784,6 +1126,23 @@ int main(int argc, char** argv) {
     if ((u64)opt.columns * opt.rows > 65536 || opt.width < 64 || opt.height < 64 || opt.width > 16384 ||
         opt.height > 16384 || (opt.font_pt == 0 && (opt.font_size < 4 || opt.font_size > 512))) {
         fprintf(stderr, "Limits: grid <=65536 cells, extent64..16384, pixel font size4..512\n");
+        return 2;
+    }
+    if (opt.benchmark) {
+        if (opt.file) {
+            fprintf(stderr, "Use document mode with --frames to measure a file\n");
+            return 2;
+        }
+        if (opt.profile_parser) {
+            fprintf(stderr, "--profile-parser requires document mode\n");
+            return 2;
+        }
+        if (!opt.frames)
+            opt.frames = 2000;
+        return run_benchmark(&opt);
+    }
+    if (opt.grid || opt.animate || opt.update_every_frame) {
+        fprintf(stderr, "Synthetic scene/update options require --benchmark\n");
         return 2;
     }
     if (!size_set)

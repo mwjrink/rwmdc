@@ -1,0 +1,43 @@
+BasedOnStyle: LLVM
+IndentWidth: 4
+Language: C
+AlignConsecutiveDeclarations:
+  Enabled: true
+  AcrossEmptyLines: false
+  AcrossComments: true
+AlignConsecutiveAssignments:
+  Enabled: true
+  AcrossEmptyLines: false
+  AcrossComments: true
+AlignConsecutiveBitFields:
+  Enabled: true
+  AcrossEmptyLines: false
+  AcrossComments: true
+AlignConsecutiveMacros:
+  Enabled: true
+  AcrossEmptyLines: false
+  AcrossComments: true
+AlignConsecutiveShortCaseStatements:
+  Enabled: true
+  AcrossEmptyLines: false
+  AcrossComments: true
+  AlignCaseColons: true
+AlignConsecutiveTableGenBreakingDAGArgColons:
+  Enabled: true
+  AcrossEmptyLines: false
+  AcrossComments: true
+PointerAlignment: Left
+ColumnLimit: 120
+RequiresExpressionIndentation: OuterScope
+LambdaBodyIndentation: OuterScope
+UseTab: Never
+AlignTrailingComments:
+  Kind: Always
+  OverEmptyLines: 2
+EnumTrailingComma: Insert
+BinPackArguments: false
+BinPackParameters: false
+InsertTrailingCommas: Wrapped
+IndentCaseLabels: true
+PenaltyReturnTypeOnItsOwnLine: 9000
+AllowShortFunctionsOnASingleLine: None

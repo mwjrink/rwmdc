@@ -45,8 +45,6 @@ benchmark *args: build
 # Deterministic CPU regressions; no display or Vulkan device is opened.
 check:
     @just _test config_test
-    @just _test kb_profile_test
-    @just _test kb_context_test
     @just _test document
     @just _test parser_test
     @just _test layout_test
@@ -71,26 +69,6 @@ gen-xdg-shell:
     @wayland-scanner client-header /usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml src/lib/wayland/xdg-shell.h
     @wayland-scanner private-code /usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml src/lib/wayland/xdg-shell.c
 
-# Isolated CPU shaping comparisons; HarfBuzz is required only by these recipes.
-shaping-bench isa="avx2" *args:
-    @bash bench/shaping-build.sh bench {{quote(isa)}} {{args}}
-
-# Observer timings are diagnostic; use shaping-bench for production measurements.
-shaping-profile isa="avx2" *args:
-    @bash bench/shaping-build.sh profile {{quote(isa)}} {{args}}
-
-
-# RDTSCP stage/lookup scopes only; micro-helper hooks compile out.
-shaping-core isa="avx2" *args:
-    @bash bench/shaping-build.sh core {{quote(isa)}} {{args}}
-# Exact selected-reference equality (--reference upstream|harfbuzz).
-shaping-verify isa="avx2" *args:
-    @bash bench/shaping-build.sh verify {{quote(isa)}} {{args}}
-
-# Deterministic multi-font/script differential diagnostics and JSONL report.
-shaping-stress isa="avx2" *args:
-    @bash bench/shaping-build.sh stress {{quote(isa)}} {{args}}
-
-# Canonical CPU shaping language/font/length matrix, machine-readable results.
-shaping-suite command="list" *args:
-    @python3 bench/shaping-suite.py {{quote(command)}} {{args}}
+# Refresh the checked-in vendor pin; normal app builds do not need this checkout.
+update-fontshaper source="../fontshaper":
+    @python3 "{{source}}/tools/vendor.py" src/lib/fontshaper

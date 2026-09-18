@@ -30,8 +30,22 @@ typedef struct LayoutProfile {
     u32 full_parses, local_parses;
 } LayoutProfile;
 typedef struct LayoutEditProfile { u64 mirror_ns, invalidation_ns; } LayoutEditProfile;
+typedef struct LayoutCursor { u32 run, at; } LayoutCursor;
+typedef struct LayoutAtom {
+    u32 begin, end, first, count, style;
+    LayoutCursor cursor;
+    f32 a, b;
+    bool safe, tab, positioned;
+} LayoutAtom;
+typedef struct LayoutCluster { f32 left, right; bool present, rtl; } LayoutCluster;
 typedef struct LayoutState {
     RenderWindow window;
+    FontShape shape;
+    i32 *codepoints;
+    u32 *owners;
+    LayoutAtom *atoms;
+    LayoutCluster *clusters;
+    u32 codepoint_count, codepoint_cap, owner_cap, atom_count, atom_cap, cluster_cap;
     f32 scroll_y, width, height;
     u32 anchor_byte;
     u64 parse_ns, layout_ns, last_parsed_bytes;
@@ -72,6 +86,8 @@ internal void layout_destroy(LayoutState *s) {
     free(s->mirror); md_index_destroy(&s->index); md_index_destroy(&s->scratch);
     md_parser_destroy(&s->parser);
     free(s->window.glyphs); free(s->window.rects); free(s->window.lines); free(s->window.stops);
+    font_shape_destroy(&s->shape);
+    free(s->codepoints); free(s->owners); free(s->atoms); free(s->clusters);
     *s = (LayoutState){0};
 }
 internal const MdIndex *layout_block_index(const LayoutState *s, u32 block) {
@@ -288,11 +304,6 @@ internal bool layout_parse(LayoutState *s) {
     return success;
 }
 
-internal u32 layout_glyph(const FontState *font, i32 cp) {
-    if (cp < 32 || cp > 126) return 0;
-    i32 index = font->font->glyph_map[cp];
-    return index >= 0 && (u32)index < font->glyph_count ? (u32)index : 0;
-}
 internal bool layout_stop(RenderWindow *w, u32 byte, f32 x) {
     if (w->stop_count && w->stops[w->stop_count - 1].byte == byte &&
         w->stops[w->stop_count - 1].x == x && w->line_count &&
@@ -304,13 +315,14 @@ internal bool layout_rect(RenderWindow *w, GpuRect rect) {
     if (!md_reserve((void **)&w->rects, &w->rect_cap, w->rect_count + 1, sizeof(GpuRect))) return false;
     w->rects[w->rect_count++] = rect; return true;
 }
-internal bool layout_draw(RenderWindow *w, const FontState *font, i32 cp, f32 x, f32 y, f32 scale, u32 style) {
-    if (cp == ' ' || cp == '\t' || cp == '\n' || cp == '\r') return true;
+internal bool layout_draw(RenderWindow *w, const FontState *font, const FontShapeGlyph *g,
+                          f32 x, f32 y, f32 scale, u32 style) {
     if (!md_reserve((void **)&w->glyphs, &w->glyph_cap, w->glyph_count + 1, sizeof(GlyphDrawCmd))) return false;
-    u32 glyph = layout_glyph(font, cp);
+    u32 glyph = g->glyph;
     if (style & MD_STYLE_BOLD) glyph |= GLYPH_STYLE_BOLD;
     if (style & MD_STYLE_ITALIC) glyph |= GLYPH_STYLE_ITALIC;
-    w->glyphs[w->glyph_count++] = (GlyphDrawCmd){.x=x, .y=y + font->font->ascent * scale,
+    w->glyphs[w->glyph_count++] = (GlyphDrawCmd){.x=x + g->x * scale,
+        .y=y + (font->font->ascent - g->y) * scale,
         .sx=scale, .sy=-scale, .glyph_idx=glyph, .color=style & MD_STYLE_LINK ? 0xffffc080u : 0xffffffffu};
     return true;
 }
@@ -393,16 +405,133 @@ internal bool layout_unit(const LayoutState *s, const Document *doc, const MdRun
     if (!u->cp[0]) u->cp[0] = 0xfffd;
     return true;
 }
-internal f32 layout_unit_width(const LayoutUnit *u, const FontState *font, f32 scale, f32 x, f32 left) {
-    if (u->hard) return 0;
-    f32 space = max(1.0f, font->metrics[layout_glyph(font, ' ')].advance_width * scale);
-    if (u->cp[0] == '\t') return space * 4 - fmodf(x - left, space * 4);
-    f32 width = 0;
-    for (u32 i = 0; i < u->count; ++i) {
-        if (utf8proc_category(u->cp[i]) == UTF8PROC_CATEGORY_MN) continue;
-        width += max(1.0f, font->metrics[layout_glyph(font, u->cp[i])].advance_width * scale);
+/* A candidate contains complete source graphemes, not just their first scalar.
+ * The two inline scalars above are only for decoded HTML entities. */
+internal bool layout_append_atom(LayoutState *s, const LayoutUnit *u, const MdRun *run,
+                                 LayoutCursor cursor, const Document *doc) {
+    if (!md_reserve((void **)&s->atoms, &s->atom_cap, s->atom_count + 1, sizeof(LayoutAtom))) return false;
+    LayoutAtom atom = {
+        .begin=u->begin == run->begin ? layout_snap(s, doc, u->begin) : u->begin,
+        .end=u->end == run->end ? layout_snap(s, doc, u->end) : u->end,
+        .first=s->codepoint_count, .style=u->style, .cursor=cursor, .tab=u->cp[0] == '\t'};
+    atom.safe = atom.end == u->end;
+    bool decoded = run->synthetic || (run->type == MD_TEXT_ENTITY && u->end == run->end) ||
+        (u->cp[0] == ' ' && (s->mirror[u->begin] == '\r' || s->mirror[u->begin] == '\n'));
+    u32 at = u->begin, repeat = decoded ? u->repeat : 1;
+    for (u32 rep = 0; rep < repeat; ++rep) {
+        u32 ci = 0;
+        do {
+            i32 cp;
+            if (decoded) cp = u->cp[ci++];
+            else {
+                utf8proc_ssize_t n = utf8proc_iterate(s->mirror + at, u->end - at, &cp);
+                if (n < 1) { n = 1; cp = 0xfffd; }
+                at += (u32)n;
+                if (!cp) cp = 0xfffd;
+            }
+            if (s->codepoint_count == UINT32_MAX ||
+                !md_reserve((void **)&s->codepoints, &s->codepoint_cap, s->codepoint_count + 1, sizeof(i32)) ||
+                !md_reserve((void **)&s->owners, &s->owner_cap, s->codepoint_count + 1, sizeof(u32))) return false;
+            s->codepoints[s->codepoint_count] = cp;
+            s->owners[s->codepoint_count++] = s->atom_count;
+        } while (decoded ? ci < u->count : at < u->end);
     }
-    return width * u->repeat;
+    atom.count = s->codepoint_count - atom.first;
+    s->atoms[s->atom_count++] = atom;
+    return true;
+}
+internal bool layout_next_unit(const LayoutState *s, const Document *doc, u32 bi, bool blank,
+                               u32 rend, LayoutCursor *cursor, MdRun *run, LayoutUnit *unit) {
+    while (cursor->run < rend) {
+        MdBlock b = layout_block_view(s, bi);
+        *run = blank ? (MdRun){.begin=b.begin, .end=b.end, .block=bi, .type=MD_TEXT_NORMAL} :
+            layout_run_view(s, bi, cursor->run);
+        u32 at = max(cursor->at, run->begin);
+        if (run->type == MD_TEXT_ENTITY && at < run->end) at = run->begin;
+        if ((at < run->end || (run->synthetic && at == run->begin)) &&
+            layout_unit(s, doc, run, at, unit)) {
+            cursor->at = unit->end;
+            if (unit->end >= run->end || unit->end <= at) ++cursor->run;
+            return true;
+        }
+        ++cursor->run;
+    }
+    return false;
+}
+/* Shape each compatible style span as a whole. Measurement and final emission
+ * use the same path; every soft-wrap prefix is reshaped with its true EOL.
+ * Cluster provenance provides grapheme carets even inside a GSUB ligature.
+ * Fontshaper does not expose GDEF carets, so those interior stops interpolate. */
+internal bool layout_shape_atoms(LayoutState *s, const FontState *font, u32 count,
+                                 f32 scale, f32 left, f32 y, f32 height, bool code_block,
+                                 bool emit, f32 *right) {
+    f32 x = left;
+    for (u32 i = 0; i < count; ++i) s->atoms[i].positioned = false;
+    for (u32 ai = 0; ai < count;) {
+        LayoutAtom *atom = &s->atoms[ai];
+        if (atom->tab) {
+            f32 space = max(1.0f, font->metrics[font_glyph(font, ' ')].advance_width * scale);
+            atom->a = x; x += space * 4 - fmodf(x - left, space * 4);
+            atom->b = x; atom->positioned = true;
+            if (emit && (atom->style & MD_STYLE_CODE) && !code_block &&
+                !layout_rect(&s->window, (GpuRect){.x=atom->a, .y=y, .width=atom->b-atom->a,
+                    .height=height, .color=0xff302b27u})) return false;
+            ++ai; continue;
+        }
+        u32 end = ai + 1;
+        while (end < count && !s->atoms[end].tab && s->atoms[end].style == atom->style) ++end;
+        u32 first = atom->first, n = s->atoms[end - 1].first + s->atoms[end - 1].count - first;
+        if (!font_shape(&s->shape, font, s->codepoints + first, n, true) ||
+            !md_reserve((void **)&s->clusters, &s->cluster_cap, n, sizeof(LayoutCluster))) return false;
+        memset(s->clusters, 0, n * sizeof(LayoutCluster));
+        for (u32 gi = 0; gi < s->shape.count; ++gi) {
+            const FontShapeGlyph *g = &s->shape.glyphs[gi];
+            if (g->source >= n || g->glyph >= font->glyph_count) return false;
+            LayoutCluster *c = &s->clusters[g->source];
+            f32 a = g->pen_begin, b = g->pen_end;
+            if (!c->present) *c = (LayoutCluster){min(a,b), max(a,b), true, g->rtl};
+            else { c->left = min(c->left, min(a,b)); c->right = max(c->right, max(a,b)); }
+            i32 cp = s->codepoints[first + g->source];
+            if (emit && cp != ' ' && cp != '\t' && cp != '\r' && cp != '\n' &&
+                !layout_draw(&s->window, font, g, x, y, scale, atom->style)) return false;
+        }
+        for (u32 cp = 0; cp < n;) {
+            if (!s->clusters[cp].present) { ++cp; continue; }
+            LayoutCluster c = s->clusters[cp];
+            u32 next = cp + 1;
+            while (next < n && !s->clusters[next].present) ++next;
+            u32 a = s->owners[first + cp], b = s->owners[first + next - 1];
+            f32 start = x + (c.rtl ? c.right : c.left) * scale;
+            f32 finish = x + (c.rtl ? c.left : c.right) * scale;
+            for (u32 k = a; k <= b; ++k) {
+                LayoutAtom *part = &s->atoms[k];
+                f32 p = start + (finish - start) * (f32)(k - a) / (f32)(b - a + 1);
+                f32 q = start + (finish - start) * (f32)(k - a + 1) / (f32)(b - a + 1);
+                if (!part->positioned) { part->a = p; part->b = q; part->positioned = true; }
+                else if (c.rtl) { part->a = max(part->a,p); part->b = min(part->b,q); }
+                else { part->a = min(part->a,p); part->b = max(part->b,q); }
+            }
+            cp = next;
+        }
+        f32 finish = x + s->shape.width * scale;
+        for (u32 k = ai; k < end; ++k)
+            if (!s->atoms[k].positioned) s->atoms[k].a = s->atoms[k].b = x;
+        if (emit && atom->style & MD_STYLE_CODE && !code_block && finish > x &&
+            !layout_rect(&s->window, (GpuRect){.x=x, .y=y, .width=finish-x,
+                .height=height, .color=0xff302b27u})) return false;
+        x = finish; ai = end;
+    }
+    if (emit) {
+        LayoutLine *line = &s->window.lines[s->window.line_count - 1];
+        if (count) s->window.stops[line->first_stop].x = s->atoms[0].a;
+        for (u32 i = 0; i < count; ++i) {
+            LayoutAtom *a = &s->atoms[i];
+            if (!layout_stop(&s->window, a->begin, a->a) ||
+                !layout_stop(&s->window, a->end, a->b)) return false;
+        }
+    }
+    *right = x;
+    return true;
 }
 internal bool layout_build(LayoutState *s, const Document *doc, const FontState *font, u32 begin, f32 target_bottom) {
     RenderWindow *w = &s->window;
@@ -426,11 +555,13 @@ internal bool layout_build(LayoutState *s, const Document *doc, const FontState 
         if (b->bullet && byte <= b->begin) {
             char bullet[32];
             if (b->ordered) snprintf(bullet, sizeof(bullet), "%u.", b->number); else strcpy(bullet, "-");
-            f32 bx = left - (f32)strlen(bullet) * font->metrics[layout_glyph(font, '0')].advance_width * scale - 6;
-            for (char *p = bullet; *p; ++p) {
-                if (!layout_draw(w, font, *p, bx, y, scale, 0)) return false;
-                bx += font->metrics[layout_glyph(font, *p)].advance_width * scale;
-            }
+            i32 cps[32];
+            u32 length = (u32)strlen(bullet);
+            for (u32 i = 0; i < length; ++i) cps[i] = (u8)bullet[i];
+            if (!font_shape(&s->shape, font, cps, length, true)) return false;
+            f32 bx = left - s->shape.width * scale - 6;
+            for (u32 i = 0; i < s->shape.count; ++i)
+                if (!layout_draw(w, font, &s->shape.glyphs[i], bx, y, scale, 0)) return false;
         }
         if (b->type == MD_BLOCK_HR) {
             if (!layout_rect(w, (GpuRect){.x=left, .y=y + height * .5f, .width=max(1.0f,s->width - left - 12),
@@ -448,53 +579,90 @@ internal bool layout_build(LayoutState *s, const Document *doc, const FontState 
             const MdRun *r = &run;
             if (r->end < byte || (r->end == byte && !r->synthetic)) lo = mid + 1; else hi = mid;
         }
-        ri = lo;
-        for (; ri < rend; ++ri) {
-            MdRun run = blank ? blank_run : layout_run_view(s, bi, ri);
-            const MdRun *r = &run;
-            u32 at = max(byte, r->begin);
-            if (r->type == MD_TEXT_ENTITY && at < r->end) at = r->begin;
-            while (at < r->end || (r->synthetic && at == r->begin)) {
-                LayoutUnit unit;
-                if (!layout_unit(s, doc, r, at, &unit)) break;
-                /* Terminal source breaks are laid out below even when MD4C
-                 * omits them; don't also create rows from code/HTML callbacks. */
-                if (unit.hard && unit.begin >= s->trailing_begin) goto finish_leaf;
-                u32 map_begin = unit.begin == r->begin ? layout_snap(s, doc, unit.begin) : unit.begin;
-                u32 map_end = unit.end == r->end ? layout_snap(s, doc, unit.end) : unit.end;
-                f32 advance = layout_unit_width(&unit, font, scale, x, left);
-                if (!unit.hard && map_begin == unit.begin && x > left && x + advance > max(left + 1, s->width - 12)) {
-                    if (!layout_end_line(s, map_begin, x)) return false;
-                    y += height; x = left;
-                    if (!layout_begin_line(s, map_begin, bi, y, height, left)) return false;
+        LayoutCursor cursor = {lo, byte};
+        while (cursor.run < rend) {
+            s->atom_count = s->codepoint_count = 0;
+            f32 available = max(1.0f, s->width - 12 - left), estimate = 0;
+            f32 estimate_limit = available * 2;
+            u32 text_end = byte, hard_end = byte;
+            bool hard = false, exhausted = false;
+            for (;;) {
+                while (cursor.run < rend) {
+                    LayoutCursor before = cursor;
+                    MdRun run; LayoutUnit unit;
+                    if (!layout_next_unit(s, doc, bi, blank, rend, &cursor, &run, &unit)) {
+                        exhausted = true; break;
+                    }
+                    if (unit.hard) {
+                        hard = unit.begin < s->trailing_begin;
+                        hard_end = unit.end;
+                        exhausted = !hard;
+                        break;
+                    }
+                    u32 first_cp = s->codepoint_count;
+                    if (!layout_append_atom(s, &unit, &run, before, doc)) return false;
+                    text_end = unit.end;
+                    for (u32 cp = first_cp; cp < s->codepoint_count; ++cp) {
+                        i32 value = s->codepoints[cp];
+                        utf8proc_category_t category = utf8proc_category(value);
+                        if (category != UTF8PROC_CATEGORY_MN && category != UTF8PROC_CATEGORY_ME)
+                            estimate += max(0.0f, font->metrics[font_glyph(font, value)].advance_width * scale);
+                    }
+                    /* A bounded candidate ends only at a source grapheme
+                     * boundary. The atom budget also bounds zero-width text;
+                     * an indivisible oversized grapheme remains indivisible. */
+                    if (s->atoms[s->atom_count - 1].safe &&
+                        (estimate >= estimate_limit || s->atom_count >= 4096)) break;
                 }
-                if (!anchor_seen && unit.end >= s->anchor_byte) {
-                    anchor_seen = true;
-                    target_bottom += y;
-                }
-                if (anchor_seen && y > target_bottom) { finished = false; goto done; }
-                if (!layout_stop(w, map_begin, x)) return false;
-                if (r->style & MD_STYLE_CODE && b->type != MD_BLOCK_CODE && advance > 0 &&
-                    !layout_rect(w, (GpuRect){.x=x, .y=y, .width=advance, .height=height, .color=0xff302b27u})) return false;
-                f32 dx = x;
-                for (u32 ci = 0; ci < unit.count; ++ci) {
-                    if (!unit.hard && !layout_draw(w, font, unit.cp[ci], dx, y, scale, r->style)) return false;
-                    if (utf8proc_category(unit.cp[ci]) != UTF8PROC_CATEGORY_MN)
-                        dx += font->metrics[layout_glyph(font, unit.cp[ci])].advance_width * scale;
-                }
-                x += advance;
-                if (!unit.hard && !layout_stop(w, map_end, x)) return false;
-                byte = unit.end;
-                if (unit.hard) {
-                    if (!layout_end_line(s, unit.end, x)) return false;
-                    y += height; x = left;
-                    if (!layout_begin_line(s, unit.end, bi, y, height, left)) return false;
-                }
-                if (unit.end <= at) break;
-                at = unit.end;
+                if (cursor.run >= rend) exhausted = true;
+                if (!layout_shape_atoms(s, font, s->atom_count, scale, left, y, height,
+                    b->type == MD_BLOCK_CODE, false, &x)) return false;
+                if (x - left > available || exhausted || hard || s->atom_count >= 4096) break;
+                estimate_limit = max(estimate_limit * 2, estimate + available);
             }
+            u32 take = s->atom_count;
+            if (x - left > available && take) {
+                f32 used = 0;
+                u32 fit = 0, first_safe = 0;
+                for (u32 i = 0; i < take; ++i) {
+                    used += fabsf(s->atoms[i].b - s->atoms[i].a);
+                    if (!s->atoms[i].safe) continue;
+                    if (!first_safe) first_safe = i + 1;
+                    if (used <= available) fit = i + 1;
+                }
+                take = fit ? fit : (first_safe ? first_safe : take);
+                /* A contextual EOL substitution can be wider than the
+                 * candidate glyph. Halve the prefix on overflow rather than
+                 * reshaping once per removed character (quadratic work). */
+                for (;;) {
+                    if (!layout_shape_atoms(s, font, take, scale, left, y, height,
+                        b->type == MD_BLOCK_CODE, false, &x)) return false;
+                    if (x - left <= available || take <= first_safe || !first_safe) break;
+                    u32 shorter = max(first_safe, take / 2);
+                    while (shorter > first_safe && !s->atoms[shorter - 1].safe) --shorter;
+                    take = shorter;
+                }
+            }
+            bool wrapped = take < s->atom_count || (!exhausted && !hard);
+            if (take < s->atom_count) {
+                cursor = s->atoms[take].cursor;
+                byte = s->atoms[take].begin;
+            } else byte = text_end;
+            if (!anchor_seen && (byte >= s->anchor_byte || (hard && hard_end >= s->anchor_byte))) {
+                anchor_seen = true; target_bottom += y;
+            }
+            if (anchor_seen && y > target_bottom) { finished = false; goto done; }
+            if (!layout_shape_atoms(s, font, take, scale, left, y, height,
+                b->type == MD_BLOCK_CODE, true, &x)) return false;
+            if (wrapped) {
+                if (!layout_end_line(s, byte, x)) return false;
+            } else if (hard) {
+                byte = hard_end;
+                if (!layout_end_line(s, byte, x)) return false;
+            } else break;
+            y += height; x = left;
+            if (!layout_begin_line(s, byte, bi, y, height, left)) return false;
         }
-finish_leaf:
         /* Avoid an extra empty visual line after MD4C's trailing code newline. */
         if (w->line_count > 1 && w->lines[w->line_count - 1].begin == byte && x == left &&
             w->lines[w->line_count - 2].block == bi &&
@@ -611,17 +779,38 @@ internal u32 layout_selection_rects(const LayoutState *s, u32 begin, u32 end, Gp
     for (u32 i = 0; i < s->window.line_count; ++i) {
         const LayoutLine *line = &s->window.lines[i];
         if (end <= line->begin || begin >= line->end) continue;
-        f32 left = line->left, right = line->right;
-        for (u32 j = 0; j < line->stop_count; ++j) {
-            const LayoutStop *stop = &s->window.stops[line->first_stop + j];
-            if (stop->byte <= begin) left = stop->x;
-            if (stop->byte < end) right = stop->x;
-            else { right = stop->x; break; }
+        /* Logical source order is not visual x order in RTL/mixed runs.
+         * Select source intervals individually, coalescing only touching
+         * visual intervals instead of painting across unselected bidi text. */
+        f32 left = 0, right = 0;
+        bool pending = false;
+        for (u32 j = 1; j <= line->stop_count; ++j) {
+            f32 a, b;
+            if (j < line->stop_count) {
+                const LayoutStop *p = &s->window.stops[line->first_stop + j - 1];
+                const LayoutStop *q = p + 1;
+                if (q->byte <= p->byte || end <= p->byte || begin >= q->byte) continue;
+                a = min(p->x, q->x); b = max(p->x, q->x);
+                if (a == b) continue;
+            } else {
+                if (end <= line->end && pending) continue;
+                a = line->right; b = a + (end > line->end ? 4 : 2);
+            }
+            if (pending && a <= right + .01f && b >= left - .01f) {
+                left = min(left, a); right = max(right, b); continue;
+            }
+            if (pending) {
+                if (out && count < capacity) out[count] = (GpuRect){.x=left, .y=line->y,
+                    .width=max(2.0f,right-left), .height=line->height, .color=0x805a87c8u};
+                ++count;
+            }
+            left = a; right = b; pending = true;
         }
-        if (end > line->end) right = max(right, line->right + 4);
-        if (count < capacity && out) out[count] = (GpuRect){.x=left, .y=line->y,
-            .width=max(2.0f,right-left), .height=line->height, .color=0x805a87c8u};
-        ++count;
+        if (pending) {
+            if (out && count < capacity) out[count] = (GpuRect){.x=left, .y=line->y,
+                .width=max(2.0f,right-left), .height=line->height, .color=0x805a87c8u};
+            ++count;
+        }
     }
     return count;
 }
@@ -709,7 +898,7 @@ internal bool layout_update(LayoutState *s, const Document *doc, const FontState
     if (s->parse_dirty && !layout_parse(s)) { s->failed = true; return false; }
     u64 start = md_clock_ns();
     s->anchor_byte = min(s->anchor_byte, s->mirror_len);
-    f32 advance = max(1.0f,font->metrics[layout_glyph(font, 'M')].advance_width);
+    f32 advance = max(1.0f,font->metrics[font_glyph(font, 'M')].advance_width);
     f32 line_height = max(1.0f,font->font->line_height);
     u32 budget = (u32)min(1048576.0f, max(256.0f, (width / advance + 1) * (s->overscan / line_height + 3)));
     u32 begin = s->anchor_byte > budget ? s->anchor_byte - budget : 0;

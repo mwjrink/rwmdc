@@ -1,0 +1,29 @@
+{
+  "schema": 1,
+  "started_utc": "2026-09-16T19:31:07.620201+00:00",
+  "kernel": "7.2.3-1-cachyos",
+  "machine": "x86_64",
+  "compiler": "clang version 22.1.8",
+  "compile_flags": [
+    "-std=gnu17",
+    "-O2",
+    "-g",
+    "-Wall",
+    "-Wextra",
+    "-Werror"
+  ],
+  "data_directory": "/home/max/dev/c/rwmd",
+  "quick_smoke": true,
+  "matrix": "queue-prealloc",
+  "repetitions": 1,
+  "io_iterations": 16,
+  "source_sha256": {
+    "run.py": "275ac65c492737131b510866a4039775c107f27ea0d16b17b01d45eb5b5b5f72",
+    "io_bench.c": "804c36b701bf5f2bf47e43357e100e2b9f60b65ac6f885f814f76c7a664a905b"
+  },
+  "scope": "QD1 serial durable transactions; API submission separate from persistence; no cold-cache or physical power-loss claim",
+  "percentiles": "Each result reports its own samples. Compare per-run percentiles; do not merge percentiles as if they were raw samples.",
+  "load_control": "No CPU pinning, frequency lock, cache dropping or control of unrelated system workloads.",
+  "filesystem": "zfs rw,relatime,xattr,noacl,casesensitive",
+  "finished_utc": "2026-09-16T19:31:12.205639+00:00"
+}

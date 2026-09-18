@@ -1,0 +1,35 @@
+{
+  "generator_sha256": "bb0ffbb5eab1cd6897f68904a779bcaf80e654300b01896ef280b3928827f4e1",
+  "header": "fontshaper.h",
+  "header_sha256": "53215920827a9827a66f1f559468193c259ceb928f29cf2887bfe15c2b74a9f8",
+  "note": "Initial commit intentionally deferred by the user. Source and generated header are checksum-pinned; no Git revision is claimed. After the first commit, tools/vendor.py replaces this snapshot with a committed revision pin.",
+  "project": "Fontshaper",
+  "revision": null,
+  "schema": 1,
+  "snapshot_sha256": "33e7fed87fda66fcdcc69defca04a3ddec22466b03a7afbd961618b6a9de3a33",
+  "source_sha256": {
+    "src/fontshaper.h": "9174c05ffb8154db94a8a6f27bfd2ed111bc379803799f853e82c0980a256dc7",
+    "src/fontshaper_compiled_context.h": "f6c8c0c8eec0f0c5215af563ec5b7a84fb76679c2e795a599f7026837fa676e7",
+    "src/fontshaper_context_compile.inc": "a091052521728a5476a0afc2a2dc85a679a847d0f30cd7e2f095dc7831e086ed",
+    "src/fontshaper_context_fuse.inc": "0e9f2608843e0afdcae6aa5da10180aa8f78717c2731a47990aab7782204bdbb",
+    "src/fontshaper_context_match.inc": "dcb6a001ebde68b6a0bf7af000c882afa687df3b48493eac59989a8d53459043",
+    "src/fontshaper_execute_op.inc": "b001d71b4a999e001249952063ccbe188253632ee7e70b65678da0e7b283338c",
+    "src/fontshaper_font_tables.inc": "e165dfb8b5c112ea5796ce5ba8f9a0e28bd1829e642b496cfd137ab395f98fe5",
+    "src/fontshaper_glyph_actions.inc": "749a355ee32a355f44d84ae66e4863db3493955b45b693355c045dcc4af6d4bf",
+    "src/fontshaper_glyph_storage.inc": "12975c6c81c38e0fab5d2144bd267d34456d2549c75c3f4ee7ecbefea37dc16a",
+    "src/fontshaper_gsub_gate.inc": "01899ee61caae5a34209e23c13c7c424a048804919d7b00d1fb70a99dc7914a8",
+    "src/fontshaper_gsub_plan.inc": "655018f95026ce185ff83c0cfd379a1b8e45ba8c1eef97ca7d4db6cca391ac95",
+    "src/fontshaper_gsub_stream.h": "4838b650babd917075ea177ba38eeffac37a87165210962afb113c6fa441597f",
+    "src/fontshaper_gsub_stream.inc": "145a31f7fdfe1b64b70c52a0a7bb6dc701bea37fbb93ba3d85462ef780bc4fc7",
+    "src/fontshaper_memory_sizes.inc": "591ccf5e191561f92adec9d0dcf72f03b99b9880fabeadb11ab0817244b7ab62",
+    "src/fontshaper_normalize.inc": "b9d0303574ba4490d33eced4a8ed36b0b5c826937febf8801712b81768e7275e",
+    "src/fontshaper_profile.h": "a7f74ec8b0e25582e49b762ffbaeb231fbe68e7475ce0b1acf03d1b459844cd2",
+    "src/fontshaper_script_shape.inc": "f0ddd52f8097acc96fbe1aa7ac2a395fb6d80110017953f64c947b969c06982a"
+  },
+  "state": "uncommitted-extraction-snapshot",
+  "upstream": {
+    "license": "Zlib",
+    "project": "https://github.com/JimmyLefevre/kb",
+    "revision": "b07373ded395b61d33a290181b957994db8edcfb"
+  }
+}
