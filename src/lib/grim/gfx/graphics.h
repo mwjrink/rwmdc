@@ -93,12 +93,9 @@ Image create_image(rop(ro GraphicsContext) ctx,
 RenderContext render_context_create(rop(rw Arena) arena,
                                     rop(ro GraphicsContext) ctx,
                                     rop(rw RenderTarget) render_target);
-RenderState   create_render_state(rop(rw Arena) arena, rop(rw RenderContext) r_ctx);
-AssetHandle   load_model(rop(rw RenderState) render_state, rop(ro Model) model);
+RenderState   create_render_state(rop(rw Arena) arena, rop(rw RenderContext) r_ctx, rop(ro FontAtlas) font_atlas);
 
 u8   start_frame(rop(rw Arena) arena, rop(rw RenderState) render_state);
-u8   update_cam_ubo_frame(rop(rw Arena) arena, rop(rw RenderState) render_state, rop(ro CameraUbo) ubo);
-u8   update_model_ubos_frame(rop(rw Arena) arena, rop(rw RenderState) render_state, AllocDynList ubo);
 void draw_frame(rop(rw RenderState) render_state);
 void end_frame(rop(rw Arena) arena, rop(rw RenderState) render_state);
 

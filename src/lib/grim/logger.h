@@ -111,6 +111,7 @@ typedef enum Severity {
     X(LOAD, LEVEL_WARNING)                                                                                             \
                                                                                                                        \
     X(FONT_LOAD, LEVEL_WARNING)                                                                                        \
+    X(CONFIG, LEVEL_WARNING)                                                                                           \
                                                                                                                        \
     X(INPUT_LINUX, LEVEL_WARNING)                                                                                      \
     X(PERF_LINUX, LEVEL_WARNING)                                                                                       \
@@ -436,17 +437,17 @@ u64 _clock_nano() {
 #define time_checkpoint(scope, ckpt, start)                                                                            \
     do {                                                                                                               \
         u64 now = _clock_nano();                                                                                       \
-        u64 dt  = now - start;                                                                                         \
+        u64 _dt = now - start;                                                                                         \
         start   = now;                                                                                                 \
                                                                                                                        \
-        DEBUG_LOG(scope, ckpt " took: %lu ns", dt);                                                                    \
+        DEBUG_LOG(scope, ckpt " took: %lu ns", _dt);                                                                   \
     } while (0)
 
 #define time_end(scope, start)                                                                                         \
     do {                                                                                                               \
-        u64 now = _clock_nano();                                                                                       \
-        u64 dt  = now - start;                                                                                         \
-        DEBUG_LOG(scope, "Took: %lu ns", dt);                                                                          \
+        u64 _now = _clock_nano();                                                                                      \
+        u64 _dt  = _now - start;                                                                                       \
+        DEBUG_LOG(scope, "Took: %lu ns", _dt);                                                                         \
     } while (0)
 
 #endif

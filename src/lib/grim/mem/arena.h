@@ -333,8 +333,6 @@ void* scratch_alloc_align(rop(rw ScratchArena) scratch, usize align, usize size)
 
     scratch->len += size + partial;
 
-    memset(result, 0, size);
-
     return result;
 }
 

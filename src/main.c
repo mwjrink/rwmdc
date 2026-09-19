@@ -4,6 +4,8 @@
 #include <lib/grim/logger.h>
 #include <lib/grim/mem/arena.h>
 #include <lib/grim/os/input_linux.h>
+#include <lib/grim/text/font.h>
+#include <lib/grim/text/slug.h>
 
 // FIXME TEMP
 #include <lib/grim/gfx/internal_graphics.h>
@@ -13,6 +15,16 @@
 #undef RWMD_MARKDOWN_IMPLEMENTATION
 
 int main(int argc, char** argv) {
+    u64 app_profiling_time = time_start();
+
+    for (int i = 1; i < argc; i++) {
+        const char* arg = argv[i];
+        if (strcmp(arg, "--help") == 0) {
+            printf("Usage: %s [file.md]", argv[0]);
+            return 0;
+        }
+    }
+
     Arena        general_arena = arena_create();
     ScratchArena scratch_arena = scratch_create();
 
@@ -24,20 +36,31 @@ int main(int argc, char** argv) {
 
     RenderContext render_ctx = render_context_create(&general_arena, &gfx_ctx, &render_target);
 
-    InputState  input_state  = input_create_state(&input_ctx);
-    RenderState render_state = create_render_state(&general_arena, &render_ctx);
+    // TODO list:
+    // - load/parse the config
+    //   - use config to load font
+    // - create editor context/state
+    // - load file
+    // - create document
+    // - set up saving thread
 
-    for (int i = 1; i < argc; i++) {
-        const char* arg = argv[i];
-        if (strcmp(arg, "--help") == 0) {
-            printf("Usage: %s [file.md]", argv[0]);
-            return 0;
-        }
-    }
+    arena_ckpt(&general_arena);
+    // TODO use a loading arena here which is separate.
+    TTFont    font  = font_load(&general_arena, &scratch_arena, "");
+    FontAtlas atlas = slug_build_atlas(&general_arena, &scratch_arena, &font, 1.0f);
+
+    InputState  input_state  = input_create_state(&input_ctx);
+    RenderState render_state = create_render_state(&general_arena, &render_ctx, &atlas);
+
+    // TODO technically this is unsafe because arena was used in create_render_state but in this case,
+    // I know it wasn't used in there for anything.
+    arena_pop(&general_arena);
+
     // TODO these should return a checkpoint I can pass back in at rollback/pop stage
     arena_ckpt(&general_arena);
 
-    // TODO check fps before descriptor set commit & after, feels like MASSIVE regression
+    // TODO NEVER call scratch_reset if you don't own scratch arena
+    // It's the owner's job to reset it at logical points
 
     u64 frame_start_arena_len = general_arena.len;
     f32 dt;

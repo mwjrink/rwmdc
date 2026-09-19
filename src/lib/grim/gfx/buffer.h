@@ -70,6 +70,8 @@ VkDeviceMemory buffer_alloc_memory(rop(ro GraphicsContext) ctx, VkBuffer handle,
 }
 
 void buffer_copy(rop(rw Arena) arena, rop(ro GraphicsContext) ctx, Buffer dst, Buffer src, u64 size, u64 offset) {
+    arena_ckpt(arena);
+
     // TODO make like 5 of these and rotate between/check if they are being used
     CommandPool*   pool           = &ctx->queue_families.families[ctx->queue_families.transfer_idx].command_pool;
     CommandBuffer* command_buffer = create_command_buffers(arena, ctx, pool, 1);
@@ -94,6 +96,8 @@ void buffer_copy(rop(rw Arena) arena, rop(ro GraphicsContext) ctx, Buffer dst, B
     vkQueueWaitIdle(ctx->queue_families.queues[ctx->queue_families.transfer_idx]);
 
     vkFreeCommandBuffers(ctx->device, pool->handle, 1, &command_buffer->handle);
+
+    arena_rollback(arena);
 }
 
 Buffer buffer_create(rop(ro GraphicsContext) ctx,

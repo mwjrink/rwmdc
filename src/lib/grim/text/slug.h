@@ -5,265 +5,261 @@
 #include <lib/grim/mem/arena.h>
 #include <lib/grim/text/font.h>
 
-// Slug quadratic outlines and conservative, sorted band lists.
+// Slug glyph preprocessing.
 //
-// Turns parsed TrueType outlines (TTFont) into a FontAtlas: per-glyph bounds,
-// per-glyph band transforms, packed quadratic curves, and the shared band word
-// lists. All four regions are written into one contiguous block ready for a
-// verbatim GPU upload.
+// Flattens TrueType quadratic outlines into conservative, sorted band lists so
+// the fragment shader can evaluate analytic coverage with a handful of curve
+// tests instead of walking every contour. The result is a FontAtlas ready for
+// a verbatim GPU upload (bounds, bands, curves, band words, in that order).
 
 #define SLUG_BAND_EPS  (1.0f / 1024.0f)
 #define SLUG_MAX_BANDS 16
 
 typedef struct {
-    f32 x0, y0, x1, y1, x2, y2;
+    f32 x0;
+    f32 y0;
+    f32 x1;
+    f32 y1;
+    f32 x2;
+    f32 y2;
 } SlugCrv;
 
-typedef struct {
-    u32 band_origin;
-    u32 hband_n;
-    u32 vband_n; // Counts, not last band indexes.
-} SlugGlyphMeta;
+// Flattens one glyph into quadratic Bézier curves, scaled and rounded to the
+// half-float grid the shader fetches. Returns the curve count; writes curves
+// into scratch and the glyph's ink bounds (scaled pixel space) into bounds.
+internal u32 slug_flatten_glyph(rop(rw ScratchArena) scratch,
+                                rop(ro TTGlyph) glyph,
+                                f32 scale,
+                                rop(rw SlugCrv) curves,
+                                rop(rw f32) bounds_min,
+                                rop(rw f32) bounds_max) {
 
-typedef struct {
-    SlugGlyphMeta* meta;
-    u32            glyph_n;
-    u32            glyph_c;
-    u32*           curves; // Three packed half2 words per quadratic, no padding.
-    u32*           bands;  // Two-word (count, relative word offset) headers, then curve indexes.
-    u32            curve_capacity;
-    u32            band_capacity; // Allocated words.
-    u32            curve_count;
-    u32            band_words;
-    f32*           glyph_bbox_min_x;
-    f32*           glyph_bbox_min_y;
-    f32*           glyph_bbox_max_x;
-    f32*           glyph_bbox_max_y;
-} SlugCtx;
+    bounds_min[0] = 1e10f;
+    bounds_min[1] = 1e10f;
+    bounds_max[0] = -1e10f;
+    bounds_max[1] = -1e10f;
 
-internal void slug_reserve_words(u32** data, u32* capacity, u32 needed) {
-    if (needed <= *capacity) return;
-    u32 cap = *capacity ? *capacity : 1024;
-    while (cap < needed) cap = cap > UINT32_MAX / 2 ? needed : cap * 2;
-    tt_require((u64)cap * sizeof(u32) <= SIZE_MAX, "Slug buffer size overflow");
-    u32* grown = realloc(*data, (usize)cap * sizeof(u32));
-    tt_require(grown != NULL, "Slug buffer allocation");
-    *data     = grown;
-    *capacity = cap;
-}
+    u32 curve_count = 0;
+    for (u32 contour_idx = 0; contour_idx < glyph->contours_count; contour_idx++) {
+        TTContour* contour     = &glyph->contours[contour_idx];
+        u32        point_count = contour->pts_count;
+        if (point_count < 2)
+            continue;
 
-internal u16 slug_half_bits(f32 value) {
-    _Float16 half = (_Float16)value;
-    u16       bits;
-    memory_copy(&bits, &half, sizeof(bits));
-    return bits;
-}
+        TTPoint* pts = contour->pts;
+        for (u32 i = 0; i < point_count; i++) {
+            TTPoint p    = pts[i];
+            TTPoint next = pts[(i + 1) % point_count];
 
-internal u32 slug_half2(f32 x, f32 y) {
-    return (u32)slug_half_bits(x) | ((u32)slug_half_bits(y) << 16);
-}
-
-internal void slug_ctx_init(rop(rw Arena) a, rop(rw SlugCtx) sc, u32 glyph_count) {
-    memory_zero_struct(sc);
-    sc->glyph_c = glyph_count;
-    sc->meta    = arena_alloc_aligned(a, SlugGlyphMeta, (usize)glyph_count);
-    sc->glyph_bbox_min_x = arena_alloc_aligned(a, f32, (usize)glyph_count);
-    sc->glyph_bbox_min_y = arena_alloc_aligned(a, f32, (usize)glyph_count);
-    sc->glyph_bbox_max_x = arena_alloc_aligned(a, f32, (usize)glyph_count);
-    sc->glyph_bbox_max_y = arena_alloc_aligned(a, f32, (usize)glyph_count);
-    memory_zero(sc->meta, (usize)glyph_count * sizeof(*sc->meta));
-}
-
-internal f32 slug_curve_max(SlugCrv c, u32 axis) {
-    return axis ? fmaxf(c.y0, fmaxf(c.y1, c.y2)) : fmaxf(c.x0, fmaxf(c.x1, c.x2));
-}
-
-internal f32 slug_curve_min(SlugCrv c, u32 axis) {
-    return axis ? fminf(c.y0, fminf(c.y1, c.y2)) : fminf(c.x0, fminf(c.x1, c.x2));
-}
-
-// The caller resets scratch after each glyph; only packed data survives.
-internal void slug_preprocess_glyph(rop(rw Arena) scratch, rop(rw SlugCtx) sc, rop(ro TTFont) font, u32 gi) {
-    tt_require(gi < sc->glyph_c, "Slug glyph cache index");
-    TTGlyph g = tt_get_glyph(scratch, font, gi);
-    if (g.nc == 0) return;
-
-    u32 curve_cap = 0;
-    for (u32 ci = 0; ci < g.nc; ci++) curve_cap += g.cs[ci].n;
-    SlugCrv* curves = arena_alloc_aligned(scratch, SlugCrv, (usize)curve_cap);
-    u32      curve_n = 0;
-    f32      bounds_min[2] = {1e10f, 1e10f};
-    f32      bounds_max[2] = {-1e10f, -1e10f};
-
-    for (u32 ci = 0; ci < g.nc; ci++) {
-        TTContour* contour = &g.cs[ci];
-        if (contour->n < 2) continue;
-        for (u32 i = 0; i < contour->n; i++) {
-            TTPoint p    = contour->pts[i];
-            TTPoint next = contour->pts[(i + 1) % contour->n];
-            SlugCrv c;
+            SlugCrv curve;
             if (!p.on) {
-                TTPoint prev = contour->pts[(i + contour->n - 1) % contour->n];
-                c = (SlugCrv){prev.on ? prev.x : (prev.x + p.x) * 0.5f,
-                              prev.on ? prev.y : (prev.y + p.y) * 0.5f,
-                              p.x, p.y,
-                              next.on ? next.x : (p.x + next.x) * 0.5f,
-                              next.on ? next.y : (p.y + next.y) * 0.5f};
+                TTPoint prev = pts[(i + point_count - 1) % point_count];
+                curve        = (SlugCrv){
+                    prev.on ? prev.x : (prev.x + p.x) * 0.5f,
+                    prev.on ? prev.y : (prev.y + p.y) * 0.5f,
+                    p.x,
+                    p.y,
+                    next.on ? next.x : (p.x + next.x) * 0.5f,
+                    next.on ? next.y : (p.y + next.y) * 0.5f,
+                };
             } else if (next.on) {
-                c = (SlugCrv){p.x, p.y, (p.x + next.x) * 0.5f, (p.y + next.y) * 0.5f, next.x, next.y};
+                curve = (SlugCrv){p.x, p.y, (p.x + next.x) * 0.5f, (p.y + next.y) * 0.5f, next.x, next.y};
             } else {
                 continue;
             }
-            c.x0 = (f32)(_Float16)c.x0;
-            c.y0 = (f32)(_Float16)c.y0;
-            c.x1 = (f32)(_Float16)c.x1;
-            c.y1 = (f32)(_Float16)c.y1;
-            c.x2 = (f32)(_Float16)c.x2;
-            c.y2 = (f32)(_Float16)c.y2;
-            tt_require(isfinite(c.x0) && isfinite(c.y0) && isfinite(c.x1) && isfinite(c.y1) && isfinite(c.x2) &&
-                           isfinite(c.y2),
-                       "outline exceeds half-float range");
-            if (c.x0 == c.x1 && c.x1 == c.x2 && c.y0 == c.y1 && c.y1 == c.y2) continue;
-            curves[curve_n++] = c;
-            for (u32 axis = 0; axis < 2; axis++) {
-                bounds_min[axis] = fminf(bounds_min[axis], slug_curve_min(c, axis));
-                bounds_max[axis] = fmaxf(bounds_max[axis], slug_curve_max(c, axis));
-            }
-        }
-    }
-    if (!curve_n) return;
 
-    u32 band_n = (u32)sqrtf((f32)curve_n);
-    if (band_n < 2) band_n = 2;
-    if (band_n > SLUG_MAX_BANDS) band_n = SLUG_MAX_BANDS;
-    u32 counts[SLUG_MAX_BANDS * 2] = {0};
-    u32* sorted = arena_alloc_aligned(scratch, u32, (usize)curve_n * 2);
-    f32  band_size[2] = {(bounds_max[0] - bounds_min[0] + SLUG_BAND_EPS) / band_n,
-                         (bounds_max[1] - bounds_min[1] + SLUG_BAND_EPS) / band_n};
-    u64  band_words = band_n * 4;
-    for (u32 axis = 0; axis < 2; axis++) {
-        u32* order = sorted + axis * curve_n;
-        for (u32 i = 0; i < curve_n; i++) {
-            u32 j   = i;
-            f32 key = slug_curve_max(curves[i], axis);
-            while (j && slug_curve_max(curves[order[j - 1]], axis) < key) {
-                order[j] = order[j - 1];
-                j--;
-            }
-            order[j] = i;
-        }
-        u32 bin_axis = 1 - axis;
-        for (u32 band = 0; band < band_n; band++) {
-            f32 low  = bounds_min[bin_axis] + band * band_size[bin_axis] - SLUG_BAND_EPS;
-            f32 high = bounds_min[bin_axis] + (band + 1) * band_size[bin_axis] + SLUG_BAND_EPS;
-            u32 count = 0;
-            for (u32 i = 0; i < curve_n; i++) {
-                SlugCrv c = curves[i];
-                if (slug_curve_max(c, bin_axis) >= low && slug_curve_min(c, bin_axis) <= high) count++;
-            }
-            counts[axis * band_n + band] = count;
-            band_words += count;
-        }
-    }
+            curve.x0 = (f32)(_Float16)(curve.x0 * scale);
+            curve.y0 = (f32)(_Float16)(curve.y0 * scale);
+            curve.x1 = (f32)(_Float16)(curve.x1 * scale);
+            curve.y1 = (f32)(_Float16)(curve.y1 * scale);
+            curve.x2 = (f32)(_Float16)(curve.x2 * scale);
+            curve.y2 = (f32)(_Float16)(curve.y2 * scale);
 
-    tt_require(curve_n <= UINT32_MAX / 3 - sc->curve_count &&
-                   band_words <= UINT32_MAX - sc->band_words,
-               "glyph exceeds Slug buffer limits");
-    slug_reserve_words(&sc->curves, &sc->curve_capacity, (sc->curve_count + curve_n) * 3);
-    slug_reserve_words(&sc->bands, &sc->band_capacity, sc->band_words + (u32)band_words);
-    SlugGlyphMeta* meta = &sc->meta[gi];
-    meta->band_origin   = sc->band_words;
-    meta->hband_n       = meta->vband_n = band_n;
-    sc->glyph_bbox_min_x[gi] = bounds_min[0];
-    sc->glyph_bbox_min_y[gi] = bounds_min[1];
-    sc->glyph_bbox_max_x[gi] = bounds_max[0];
-    sc->glyph_bbox_max_y[gi] = bounds_max[1];
-
-    u32 location = band_n * 4;
-    for (u32 axis = 0; axis < 2; axis++) {
-        u32 bin_axis = 1 - axis;
-        for (u32 band = 0; band < band_n; band++) {
-            u32 header = sc->band_words + (axis * band_n + band) * 2;
-            sc->bands[header]      = counts[axis * band_n + band];
-            sc->bands[header + 1]  = location;
-            f32 low  = bounds_min[bin_axis] + band * band_size[bin_axis] - SLUG_BAND_EPS;
-            f32 high = bounds_min[bin_axis] + (band + 1) * band_size[bin_axis] + SLUG_BAND_EPS;
-            for (u32 i = 0; i < curve_n; i++) {
-                u32 curve = sorted[axis * curve_n + i];
-                SlugCrv c = curves[curve];
-                if (slug_curve_max(c, bin_axis) < low || slug_curve_min(c, bin_axis) > high) continue;
-                sc->bands[sc->band_words + location++] = sc->curve_count + curve;
+            if (curve.x0 == curve.x1 && curve.x1 == curve.x2 && curve.y0 == curve.y1 && curve.y1 == curve.y2) {
+                continue;
             }
+
+            curves[curve_count++] = curve;
+
+            bounds_min[0] = min(bounds_min[0], min(curve.x0, min(curve.x1, curve.x2)));
+            bounds_min[1] = min(bounds_min[1], min(curve.y0, min(curve.y1, curve.y2)));
+            bounds_max[0] = max(bounds_max[0], max(curve.x0, max(curve.x1, curve.x2)));
+            bounds_max[1] = max(bounds_max[1], max(curve.y0, max(curve.y1, curve.y2)));
         }
     }
-    for (u32 i = 0; i < curve_n; i++) {
-        SlugCrv c = curves[i];
-        u32* dst = sc->curves + (sc->curve_count + i) * 3;
-        dst[0] = slug_half2(c.x0, c.y0);
-        dst[1] = slug_half2(c.x1, c.y1);
-        dst[2] = slug_half2(c.x2, c.y2);
-    }
-    sc->curve_count += curve_n;
-    sc->band_words += (u32)band_words;
-    sc->glyph_n++;
+    return curve_count;
 }
 
-// Preprocess all glyphs, then pack them into a single contiguous FontAtlas
-// block (bounds, bands, curves, band words, in that order).
-internal FontAtlas slug_build_atlas(rop(rw Arena) a, rop(ro TTFont) font) {
-    Arena scratch = arena_create();
-    SlugCtx slug;
-    slug_ctx_init(a, &slug, font->glyph_count);
-    for (u32 gi = 0; gi < font->glyph_count; gi++) {
-        slug_preprocess_glyph(&scratch, &slug, font, gi);
-        scratch.len = 0;
-    }
-    arena_destroy(&scratch);
+internal FontAtlas slug_build_atlas(rop(rw Arena) arena, rop(rw ScratchArena) scratch, rop(ro TTFont) font, f32 scale) {
+    u32 glyph_count = font->glyph_count;
 
-    u64 bounds_bytes   = (u64)font->glyph_count * sizeof(GlyphBounds);
-    u64 bands_bytes    = (u64)font->glyph_count * sizeof(GlyphBands);
-    u64 curves_bytes   = (u64)slug.curve_count * sizeof(PackedCurve);
-    u64 bandwords_bytes = (u64)slug.band_words * sizeof(u32);
-    u64 bounds_off     = 0;
-    u64 bands_off      = (bounds_off + bounds_bytes + 15) & ~(u64)15;
-    u64 curves_off     = (bands_off + bands_bytes + 15) & ~(u64)15;
-    u64 bandwords_off  = (curves_off + curves_bytes + 15) & ~(u64)15;
-    u64 total_bytes    = (bandwords_off + bandwords_bytes + 15) & ~(u64)15;
+    // Upper bound on curves: each contour point emits at most one quadratic.
+    // Computed once during font load.
+    u64 curve_upper = font->total_points;
+
+    // Loose upper bound for the band-word region: each curve can land in at
+    // most 2 * SLUG_MAX_BANDS bands across both axes.
+    u64 band_upper = (u64)glyph_count * SLUG_MAX_BANDS * 4 + curve_upper * 2 * SLUG_MAX_BANDS;
+
+    // Build in scratch first (loose bounds for the growable regions), then
+    // copy the exact used bytes into a tightly-sized atlas at the end.
+    GlyphBounds* bounds = scratch_alloc_aligned(scratch, GlyphBounds, glyph_count);
+    GlyphBands*  bands  = scratch_alloc_aligned(scratch, GlyphBands, glyph_count);
+    PackedCurve* packed = scratch_alloc_aligned(scratch, PackedCurve, curve_upper);
+    u32*         words  = scratch_alloc_aligned(scratch, u32, band_upper);
+
+    u32 curve_cursor = 0;
+    u32 band_cursor  = 0;
+
+    for (u32 gi = 0; gi < glyph_count; gi++) {
+        rop(ro TTGlyph) glyph = &font->glyphs[gi];
+        bounds[gi]            = (GlyphBounds){0};
+        bands[gi]             = (GlyphBands){0};
+
+        if (!glyph->contours_count)
+            continue;
+
+        u32 curve_cap = 0;
+        for (u32 ci = 0; ci < glyph->contours_count; ci++) {
+            curve_cap += glyph->contours[ci].pts_count;
+        }
+        SlugCrv* curves = scratch_alloc_aligned(scratch, SlugCrv, curve_cap);
+        f32      bounds_min[2];
+        f32      bounds_max[2];
+        u32      curve_count = slug_flatten_glyph(scratch, glyph, scale, curves, bounds_min, bounds_max);
+        if (!curve_count)
+            continue;
+
+        u32 band_count = (u32)sqrtf((f32)curve_count);
+        band_count     = clamp(band_count, 2u, (u32)SLUG_MAX_BANDS);
+
+        f32 span_x = bounds_max[0] - bounds_min[0] + SLUG_BAND_EPS;
+        f32 span_y = bounds_max[1] - bounds_min[1] + SLUG_BAND_EPS;
+        f32 sx     = (f32)band_count / span_x;
+        f32 sy     = (f32)band_count / span_y;
+
+        bounds[gi] = (GlyphBounds){bounds_min[0], bounds_min[1], bounds_max[0], bounds_max[1]};
+        bands[gi]  = (GlyphBands){
+            .scale_x  = sx,
+            .scale_y  = sy,
+            .offset_x = -bounds_min[0] * sx,
+            .offset_y = -bounds_min[1] * sy,
+            .origin   = band_cursor,
+            .counts   = ((u32)band_count << 16) | band_count, // v | h << 16
+        };
+
+        // Headers first (band_count*2 words per axis), then curve-index lists.
+        u32 header_words = band_count * 4;
+        u32 list_cursor  = header_words;
+
+        for (u32 axis = 0; axis < 2; axis++) {
+            u32 bin_axis = 1 - axis; // sorted by `axis`, binned by `bin_axis`
+            f32 span     = bin_axis ? span_y : span_x;
+            f32 lo       = bin_axis ? bounds_min[1] : bounds_min[0];
+
+            // Sort curve indices descending by max extent along `axis`, so the
+            // shader's early-out (`max(...) < -0.5 -> break`) is valid.
+            u32* order = scratch_alloc_aligned(scratch, u32, curve_count);
+            for (u32 i = 0; i < curve_count; i++)
+                order[i] = i;
+            for (u32 i = 1; i < curve_count; i++) {
+                u32 key_idx = i;
+                f32 key     = axis ? max(curves[i].y0, max(curves[i].y1, curves[i].y2))
+                                   : max(curves[i].x0, max(curves[i].x1, curves[i].x2));
+                u32 j       = i;
+                while (j > 0) {
+                    u32 prev = order[j - 1];
+                    f32 pk   = axis ? max(curves[prev].y0, max(curves[prev].y1, curves[prev].y2))
+                                    : max(curves[prev].x0, max(curves[prev].x1, curves[prev].x2));
+                    if (pk >= key)
+                        break;
+                    order[j] = prev;
+                    j--;
+                }
+                order[j] = key_idx;
+            }
+
+            for (u32 band = 0; band < band_count; band++) {
+                f32 low  = lo + (f32)band * span / (f32)band_count - SLUG_BAND_EPS;
+                f32 high = lo + ((f32)band + 1.0f) * span / (f32)band_count + SLUG_BAND_EPS;
+
+                u32 header     = band_cursor + (axis * band_count + band) * 2;
+                u32 list_start = band_cursor + list_cursor;
+                u32 count      = 0;
+
+                for (u32 i = 0; i < curve_count; i++) {
+                    u32     idx  = order[i];
+                    SlugCrv c    = curves[idx];
+                    f32     cmax = bin_axis ? max(c.y0, max(c.y1, c.y2)) : max(c.x0, max(c.x1, c.x2));
+                    f32     cmin = bin_axis ? min(c.y0, min(c.y1, c.y2)) : min(c.x0, min(c.x1, c.x2));
+                    if (cmax < low || cmin > high)
+                        continue;
+                    words[list_start + count] = curve_cursor + idx;
+                    count++;
+                }
+
+                words[header]     = count;
+                words[header + 1] = list_cursor; // relative offset from origin
+                list_cursor += count;
+            }
+        }
+
+        // Pack curves into half2 triplets.
+        for (u32 i = 0; i < curve_count; i++) {
+            SlugCrv  c = curves[i];
+            u16      x0, y0, x1, y1, x2, y2;
+            _Float16 h;
+            h = (_Float16)c.x0;
+            memory_copy(&x0, &h, 2);
+            h = (_Float16)c.y0;
+            memory_copy(&y0, &h, 2);
+            h = (_Float16)c.x1;
+            memory_copy(&x1, &h, 2);
+            h = (_Float16)c.y1;
+            memory_copy(&y1, &h, 2);
+            h = (_Float16)c.x2;
+            memory_copy(&x2, &h, 2);
+            h = (_Float16)c.y2;
+            memory_copy(&y2, &h, 2);
+            packed[curve_cursor + i] = (PackedCurve){
+                .p0 = ((u32)y0 << 16) | x0,
+                .p1 = ((u32)y1 << 16) | x1,
+                .p2 = ((u32)y2 << 16) | x2,
+            };
+        }
+
+        curve_cursor += curve_count;
+        band_cursor += header_words + (list_cursor - header_words);
+    }
+
+    // Exact-sized atlas: bounds, bands, curves, band words, contiguous.
+    u64 bounds_bytes = (u64)glyph_count * sizeof(GlyphBounds);
+    u64 bands_bytes  = (u64)glyph_count * sizeof(GlyphBands);
+    u64 curves_bytes = (u64)curve_cursor * sizeof(PackedCurve);
+    u64 band_bytes   = (u64)band_cursor * sizeof(u32);
+
+    u64 bounds_off = 0;
+    u64 bands_off  = (bounds_off + bounds_bytes + 15) & ~(u64)15;
+    u64 curves_off = (bands_off + bands_bytes + 15) & ~(u64)15;
+    u64 band_off   = (curves_off + curves_bytes + 15) & ~(u64)15;
+    u64 total      = (band_off + band_bytes + 15) & ~(u64)15;
+
+    u8* font_data = arena_alloc_aligned(arena, u8, total);
+
+    memory_copy(font_data + bounds_off, bounds, bounds_bytes);
+    memory_copy(font_data + bands_off, bands, bands_bytes);
+    memory_copy(font_data + curves_off, packed, curves_bytes);
+    memory_copy(font_data + band_off, words, band_bytes);
+
+    scratch_reset(scratch);
 
     FontAtlas atlas = {
-        .data            = arena_alloc_aligned(a, u8, total_bytes),
-        .total_bytes     = total_bytes,
-        .glyph_count     = font->glyph_count,
-        .curve_count     = slug.curve_count,
-        .band_word_count = slug.band_words,
+        .data            = font_data,
+        .total_bytes     = total,
+        .glyph_count     = glyph_count,
+        .curve_count     = curve_cursor,
+        .band_word_count = band_cursor,
     };
-
-    GlyphBounds* bounds = (GlyphBounds*)(atlas.data + bounds_off);
-    GlyphBands*  bands  = (GlyphBands*)(atlas.data + bands_off);
-    PackedCurve* curves = (PackedCurve*)(atlas.data + curves_off);
-    u32*         bandwords = (u32*)(atlas.data + bandwords_off);
-
-    for (u32 gi = 0; gi < font->glyph_count; gi++) {
-        SlugGlyphMeta meta = slug.meta[gi];
-        bounds[gi] = (GlyphBounds){0};
-        bands[gi]  = (GlyphBands){0};
-        if (!meta.hband_n) continue;
-        f32 lo_x = slug.glyph_bbox_min_x[gi];
-        f32 lo_y = slug.glyph_bbox_min_y[gi];
-        f32 hi_x = slug.glyph_bbox_max_x[gi];
-        f32 hi_y = slug.glyph_bbox_max_y[gi];
-        f32 sx = meta.vband_n / (hi_x - lo_x + SLUG_BAND_EPS);
-        f32 sy = meta.hband_n / (hi_y - lo_y + SLUG_BAND_EPS);
-        bounds[gi] = (GlyphBounds){lo_x, lo_y, hi_x, hi_y};
-        bands[gi]  = (GlyphBands){sx, sy, -lo_x * sx, -lo_y * sy, meta.band_origin, meta.vband_n | (meta.hband_n << 16)};
-    }
-
-    // The curves and band words were appended linearly by slug_preprocess_glyph;
-    // copy them verbatim into their regions of the contiguous atlas block.
-    memory_copy(curves, slug.curves, curves_bytes);
-    memory_copy(bandwords, slug.bands, bandwords_bytes);
-    free(slug.curves);
-    free(slug.bands);
 
     return atlas;
 }

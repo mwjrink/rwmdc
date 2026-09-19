@@ -8,15 +8,10 @@
 #include <lib/grim/logger.h>
 #include <lib/grim/math.h>
 #include <lib/grim/mem/arena.h>
+#include <lib/grim/mem/bitarray.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
-
-// TrueType outline parsing.
-//
-// A font is mmap'd once, parsed into a TTFont, and its glyph outlines are
-// turned into a FontAtlas by slug.h. The mmap'd file is released once
-// preprocessing is done.
 
 #define TT_TAG_head 0x68656164
 #define TT_TAG_maxp 0x6D617870
@@ -48,29 +43,32 @@
 
 #define TT_F2DOT14_SCALE (1.0f / 16384.0f)
 
-// TODO rename to Reader or Cursor or something
 typedef struct {
     const u8* d;
     u32       len;
     u32       pos;
-} TTFile;
+} TTCursor;
 
 typedef struct {
     const u8* data;
     u32       data_len;
-    u32       glyph_count;
-    u16       upem;
-    u16       num_hmetrics;
-    i16       loca_fmt; // 0 = short offsets, 1 = long.
-    f32       scale;
-    f32       ascent;
-    f32       descent;
-    f32       line_gap;
-    f32       line_height;
-    TTFile    loca;
-    TTFile    glyf;
-    TTFile    hmtx;
-} TTFont;
+
+    u32 glyph_count;
+
+    i16 loca_fmt; // 0 = short offsets, 1 = long.
+
+    u16 upem;
+    u16 num_hmetrics;
+
+    f32 ascent;
+    f32 descent;
+    f32 line_gap;
+    f32 line_height;
+
+    TTCursor loca;
+    TTCursor glyf;
+    TTCursor hmtx;
+} TTFontLoader;
 
 typedef struct {
     f32 x;
@@ -85,77 +83,60 @@ typedef struct {
 
 typedef struct {
     TTContour* contours;
-    u32        contours_count;
+    union {
+        u32 contours_count; // when processed (simple or empty)
+        u32 file_off;       // when unprocessed (compound, awaiting resolution)
+    };
 } TTGlyph;
 
-internal u32 tt_read_u32(TTFile* font) {
-    assert(SCOPE_FONT_LOAD, font->pos <= font->len && font->len - font->pos >= 4);
-    const u8* p = font->d + font->pos;
-    font->pos += 4;
+typedef struct {
+    rop(ro TTGlyph) glyphs;
+    u32 glyph_count;
+
+    u32 total_points; // cumulative contour point count across all glyphs
+
+    u16 upem;
+    u16 num_hmetrics;
+
+    f32 ascent;
+    f32 descent;
+    f32 line_gap;
+    f32 line_height;
+} TTFont;
+
+internal u32 tt_read_u32(rop(rw TTCursor) file) {
+    assert(SCOPE_FONT_LOAD, file->pos <= file->len && file->len - file->pos >= 4);
+    const u8* p = file->d + file->pos;
+    file->pos += 4;
     u32 value;
     memcpy(&value, p, 4);
     return __builtin_bswap32(value);
 }
 
-internal u16 tt_read_u16(TTFile* font) {
-    assert(SCOPE_FONT_LOAD, font->pos <= font->len && font->len - font->pos >= 2);
-    const u8* p = font->d + font->pos;
-    font->pos += 2;
+internal u16 tt_read_u16(rop(rw TTCursor) file) {
+    assert(SCOPE_FONT_LOAD, file->pos <= file->len && file->len - file->pos >= 2);
+    const u8* p = file->d + file->pos;
+    file->pos += 2;
     u16 value;
     memcpy(&value, p, 2);
     return __builtin_bswap16(value);
 }
 
-internal i16 tt_read_i16(TTFile* font) {
-    return (i16)tt_read_u16(font);
+internal i16 tt_read_i16(rop(rw TTCursor) file) {
+    return (i16)tt_read_u16(file);
 }
 
-internal u8 tt_read_u8(TTFile* font) {
-    assert(SCOPE_FONT_LOAD, font->pos < font->len);
-    return font->d[font->pos++];
+internal u8 tt_read_u8(rop(rw TTCursor) file) {
+    assert(SCOPE_FONT_LOAD, file->pos < file->len);
+    return file->d[file->pos++];
 }
 
-internal TTFile tt_slice(TTFile font, u32 off, u32 len) {
+internal TTCursor tt_slice(TTCursor font, u32 off, u32 len) {
     assert(SCOPE_FONT_LOAD, off <= font.len && len <= font.len - off);
-    return (TTFile){font.d + off, len, 0};
+    return (TTCursor){font.d + off, len, 0};
 }
 
-// tables must be able to fit 6 TTFiles
-// [0] = loca, [1] = glyf, [2] = hmtx, [3] = head, [4] = maxp, [5] = hhea
-internal void tt_table_load(TTFile file, rop(rw TTFile) tables) {
-    TTFile dir = file;
-    assert(SCOPE_FONT_LOAD, tt_read_u32(&dir) == 0x00010000);
-    u16 count = tt_read_u16(&dir);
-    dir.pos += 6; // searchRange/entrySelector/rangeShift
-    assert(SCOPE_FONT_LOAD, (u32)count * 16 <= dir.len - dir.pos);
-
-    u32 tables_found = 0;
-
-    for (u32 i = 0; i < count; i++) {
-        // Each directory record is 16 contiguous bytes: tag, checkSum, offset, length.
-        // Full reverse swaps the field order too, so read them back-to-front.
-        u32 record[4];
-        simd_byte_reverse(dir.d + dir.pos, (u8*)record, 16);
-        dir.pos += 16;
-
-        // clang-format off
-        if (record[3] == TT_TAG_loca) { tables[0] = tt_slice(file, record[1], record[0]); tables_found |= 1 << 0; }
-        if (record[3] == TT_TAG_glyf) { tables[1] = tt_slice(file, record[1], record[0]); tables_found |= 1 << 1; }
-        if (record[3] == TT_TAG_hmtx) { tables[2] = tt_slice(file, record[1], record[0]); tables_found |= 1 << 2; }
-        if (record[3] == TT_TAG_head) { tables[3] = tt_slice(file, record[1], record[0]); tables_found |= 1 << 3; }
-        if (record[3] == TT_TAG_maxp) { tables[4] = tt_slice(file, record[1], record[0]); tables_found |= 1 << 4; }
-        if (record[3] == TT_TAG_hhea) { tables[5] = tt_slice(file, record[1], record[0]); tables_found |= 1 << 5; }
-        // clang-format on
-
-        if (tables_found == 0b111111) {
-            return;
-        }
-    }
-
-    assert(SCOPE_FONT_LOAD, false);
-}
-
-internal TTFont* tt_open(Arena* a, const char* path, f32 size, u32 points) {
+internal TTFontLoader tt_open(const char* path) {
     i32 fd = open(path, O_RDONLY | O_CLOEXEC);
     assert(SCOPE_FONT_LOAD, fd >= 0);
 
@@ -165,81 +146,83 @@ internal TTFont* tt_open(Arena* a, const char* path, f32 size, u32 points) {
     close(fd);
     assert(SCOPE_FONT_LOAD, data != MAP_FAILED);
 
-    TTFont* font = arena_alloc_aligned(a, TTFont, 1);
-    *font        = (TTFont){.data = data, .data_len = (u32)st.st_size};
-    TTFile file  = {data, font->data_len, 0};
+    TTFontLoader font = (TTFontLoader){.data = data, .data_len = (u32)st.st_size};
+    TTCursor     file = {data, font.data_len, 0};
 
-    TTFile tables[6] = {0};
+    TTCursor dir = file;
+    assert(SCOPE_FONT_LOAD, tt_read_u32(&dir) == 0x00010000);
+    u16 count = tt_read_u16(&dir);
+    dir.pos += 6; // searchRange/entrySelector/rangeShift
+    assert(SCOPE_FONT_LOAD, (u32)count * 16 <= dir.len - dir.pos);
 
-    tt_table_load(file, tables);
+    u32 tables_found = 0;
 
-    TTFile head = tables[3];
-    TTFile maxp = tables[4];
-    TTFile hhea = tables[5];
+    TTCursor loca = {0};
+    TTCursor glyf = {0};
+    TTCursor hmtx = {0};
+    TTCursor head = {0};
+    TTCursor maxp = {0};
+    TTCursor hhea = {0};
+
+    for (u32 i = 0; i < count; i++) {
+        // Each directory record is 16 contiguous bytes: tag, checkSum, offset, length.
+        // Full reverse swaps the field order too, so read them back-to-front.
+        u32 record[4];
+        simd_byte_reverse(dir.d + dir.pos, (u8*)record, 16);
+        dir.pos += 16;
+
+        // clang-format off
+        if (record[3] == TT_TAG_loca) { loca = tt_slice(file, record[1], record[0]); tables_found |= 1 << 0; }
+        if (record[3] == TT_TAG_glyf) { glyf = tt_slice(file, record[1], record[0]); tables_found |= 1 << 1; }
+        if (record[3] == TT_TAG_hmtx) { hmtx = tt_slice(file, record[1], record[0]); tables_found |= 1 << 2; }
+        if (record[3] == TT_TAG_head) { head = tt_slice(file, record[1], record[0]); tables_found |= 1 << 3; }
+        if (record[3] == TT_TAG_maxp) { maxp = tt_slice(file, record[1], record[0]); tables_found |= 1 << 4; }
+        if (record[3] == TT_TAG_hhea) { hhea = tt_slice(file, record[1], record[0]); tables_found |= 1 << 5; }
+        // clang-format on
+
+        if (tables_found == 0b111111) {
+            break;
+        }
+    }
+
+    assert(SCOPE_FONT_LOAD, tables_found == 0b111111);
 
     head.pos += 18;
-    font->upem = tt_read_u16(&head);
+    font.upem = tt_read_u16(&head);
     head.pos += 30;
-    font->loca_fmt = tt_read_i16(&head);
-    assert(SCOPE_FONT_LOAD, font->upem >= 16 && font->upem <= 16384 && (font->loca_fmt == 0 || font->loca_fmt == 1));
+    font.loca_fmt = tt_read_i16(&head);
+    assert(SCOPE_FONT_LOAD, font.upem >= 16 && font.upem <= 16384 && (font.loca_fmt == 0 || font.loca_fmt == 1));
 
     maxp.pos += 4;
-    font->glyph_count = tt_read_u16(&maxp);
+    font.glyph_count = tt_read_u16(&maxp);
 
     hhea.pos += 4;
     i16 asc  = tt_read_i16(&hhea);
     i16 desc = tt_read_i16(&hhea);
     i16 gap  = tt_read_i16(&hhea);
     hhea.pos += 24;
-    font->num_hmetrics = tt_read_u16(&hhea);
+    font.num_hmetrics = tt_read_u16(&hhea);
     assert(SCOPE_FONT_LOAD,
-           font->glyph_count && font->num_hmetrics && font->num_hmetrics <= font->glyph_count && asc > desc &&
-               isfinite(size) && size > 0);
+           font.glyph_count && font.num_hmetrics && font.num_hmetrics <= font.glyph_count && asc > desc);
 
-    font->scale       = points ? (size * (96.0f / 72.0f)) / font->upem : size / (f32)(asc - desc);
-    font->ascent      = asc * font->scale;
-    font->descent     = desc * font->scale;
-    font->line_gap    = gap * font->scale;
-    font->line_height = font->ascent - font->descent + font->line_gap;
-    assert(SCOPE_FONT_LOAD, isfinite(font->line_height) && font->line_height > 0);
+    font.ascent      = (f32)asc;
+    font.descent     = (f32)desc;
+    font.line_gap    = (f32)gap;
+    font.line_height = font.ascent - font.descent + font.line_gap;
+    assert(SCOPE_FONT_LOAD, isfinite(font.line_height) && font.line_height > 0);
 
-    font->loca = tables[0];
-    font->glyf = tables[1];
-    font->hmtx = tables[2];
+    font.loca = loca;
+    font.glyf = glyf;
+    font.hmtx = hmtx;
 
-    assert(SCOPE_FONT_LOAD, (font->glyph_count + 1) * (font->loca_fmt ? 4 : 2) <= font->loca.len - font->loca.pos);
+    assert(SCOPE_FONT_LOAD, (font.glyph_count + 1) * (font.loca_fmt ? 4 : 2) <= font.loca.len - font.loca.pos);
     assert(SCOPE_FONT_LOAD,
-           font->num_hmetrics * 4 + (font->glyph_count - font->num_hmetrics) * 2 <= font->hmtx.len - font->hmtx.pos);
+           font.num_hmetrics * 4 + (font.glyph_count - font.num_hmetrics) * 2 <= font.hmtx.len - font.hmtx.pos);
     return font;
 }
 
-internal u32 tt_glyph_offset(rop(ro TTFont) font, u32 gi) {
-    assert(SCOPE_FONT_LOAD, gi <= font->glyph_count);
-
-    u32 offset = 0;
-    if (font->loca_fmt) {
-        memcpy(&offset, font->loca.d + gi * 4, 4);
-        offset = __builtin_bswap32(offset);
-    } else {
-        u16 half;
-        memcpy(&half, font->loca.d + gi * 2, 2);
-        offset = __builtin_bswap16(half) * 2;
-    }
-
-    assert(SCOPE_FONT_LOAD, offset <= font->glyf.len);
-
-    return offset;
-}
-
-internal TTGlyph
-tt_load_glyph_raw(rop(rw Arena) arena, rop(rw ScratchArena) scratch, rop(ro TTFont) font, u32 gi, u32 depth);
 internal TTGlyph tt_load_simple_glyph(
-    rop(rw Arena) arena, rop(rw ScratchArena) scratch, rop(ro TTFont) font, TTFile file, u32 contours_count);
-internal TTGlyph
-tt_load_compound_glyph(rop(rw Arena) arena, rop(rw ScratchArena) scratch, rop(ro TTFont) font, TTFile file, u32 depth);
-
-internal TTGlyph tt_load_simple_glyph(
-    rop(rw Arena) arena, rop(rw ScratchArena) scratch, rop(ro TTFont) font, TTFile file, u32 contours_count) {
+    rop(rw Arena) arena, rop(rw ScratchArena) scratch, rop(ro TTFontLoader) loader, TTCursor file, u32 contours_count) {
 
     TTContour* contours = arena_alloc_aligned(arena, TTContour, contours_count);
 
@@ -353,8 +336,28 @@ internal TTGlyph tt_load_simple_glyph(
     };
 }
 
-internal TTGlyph
-tt_load_compound_glyph(rop(rw Arena) arena, rop(rw ScratchArena) scratch, rop(ro TTFont) font, TTFile file, u32 depth) {
+internal void tt_release_data(rop(rw TTFontLoader) loader) {
+    if (loader->data) {
+        munmap((void*)loader->data, loader->data_len);
+    }
+    loader->data     = NULL;
+    loader->data_len = 0;
+    loader->loca     = (TTCursor){0};
+    loader->glyf     = (TTCursor){0};
+    loader->hmtx     = (TTCursor){0};
+}
+
+// Resolves one compound glyph in post-order: every component child is resolved
+// (recursively) before its contours are merged here.
+internal void tt_resolve_compound(
+    rop(rw Arena) arena, rop(ro TTFontLoader) loader, rop(rw TTGlyph) glyphs, rop(rw u32) processed, u32 gi) {
+    if (bitarray_test(processed, gi)) {
+        return;
+    }
+
+    TTCursor file = tt_slice(loader->glyf, glyphs[gi].file_off, loader->glyf.len - glyphs[gi].file_off);
+    file.pos += sizeof(i16) + 8; // contours_count (-1) + bbox
+
     TTGlyph glyph       = {0};
     u32     cap         = 8;
     glyph.contours      = arena_alloc_aligned(arena, TTContour, cap);
@@ -363,6 +366,12 @@ tt_load_compound_glyph(rop(rw Arena) arena, rop(rw ScratchArena) scratch, rop(ro
     do {
         component_flags = tt_read_u16(&file);
         u32 child       = tt_read_u16(&file);
+
+        // Resolve the child first so its contours are ready to borrow.
+        if (!bitarray_test(processed, child)) {
+            tt_resolve_compound(arena, loader, glyphs, processed, child);
+        }
+
         i32 arg1, arg2;
         if (component_flags & TT_COMP_ARG_WORDS) {
             arg1 = component_flags & TT_COMP_ARGS_XY ? tt_read_i16(&file) : tt_read_u16(&file);
@@ -372,8 +381,8 @@ tt_load_compound_glyph(rop(rw Arena) arena, rop(rw ScratchArena) scratch, rop(ro
             arg2 = component_flags & TT_COMP_ARGS_XY ? (i8)tt_read_u8(&file) : tt_read_u8(&file);
         }
 
-        f32 dx = component_flags & TT_COMP_ARGS_XY ? arg1 : 0;
-        f32 dy = component_flags & TT_COMP_ARGS_XY ? arg2 : 0;
+        f32 dx = component_flags & TT_COMP_ARGS_XY ? (f32)arg1 : 0;
+        f32 dy = component_flags & TT_COMP_ARGS_XY ? (f32)arg2 : 0;
         f32 xx = 1, xy = 0, yx = 0, yy = 1;
 
         u32 transform_count = !!(component_flags & TT_COMP_SCALE) + !!(component_flags & TT_COMP_X_SCALE) +
@@ -398,7 +407,7 @@ tt_load_compound_glyph(rop(rw Arena) arena, rop(rw ScratchArena) scratch, rop(ro
             dy    = xy * x + yy * dy;
         }
 
-        TTGlyph sub = tt_load_glyph_raw(arena, scratch, font, child, depth + 1);
+        TTGlyph sub = glyphs[child];
 
         if (!(component_flags & TT_COMP_ARGS_XY)) {
             TTPoint* parent    = NULL;
@@ -436,6 +445,7 @@ tt_load_compound_glyph(rop(rw Arena) arena, rop(rw ScratchArena) scratch, rop(ro
             glyph.contours = arena_alloc_aligned(arena, TTContour, cap);
             memory_copy(glyph.contours, old, glyph.contours_count * sizeof(*old));
         }
+
         for (u32 ci = 0; ci < sub.contours_count; ci++) {
             for (u32 pi = 0; pi < sub.contours[ci].pts_count; pi++) {
                 TTPoint* p = &sub.contours[ci].pts[pi];
@@ -450,118 +460,89 @@ tt_load_compound_glyph(rop(rw Arena) arena, rop(rw ScratchArena) scratch, rop(ro
     if (component_flags & TT_COMP_INSTRUCTIONS) {
         file.pos += tt_read_u16(&file);
     }
-    return glyph;
+    glyphs[gi] = glyph;
+    bitarray_set(processed, gi);
 }
 
-internal TTGlyph
-tt_load_glyph_raw(rop(rw Arena) arena, rop(rw ScratchArena) scratch, rop(ro TTFont) font, u32 gi, u32 depth) {
-    assert(SCOPE_FONT_LOAD, gi < font->glyph_count && depth <= 16);
+TTFont font_load(rop(rw Arena) arena, rop(rw ScratchArena) scratch, const char* path) {
+    TTFontLoader loader = tt_open(path);
 
-    u32 off = tt_glyph_offset(font, gi);
-    u32 end = tt_glyph_offset(font, gi + 1);
-
-    assert(SCOPE_FONT_LOAD, end >= off);
-
-    if (off == end) {
-        return (TTGlyph){0}; // empty glyph (e.g. space)
-    }
-
-    TTFile file           = tt_slice(font->glyf, off, end - off);
-    i16    contours_count = tt_read_i16(&file);
-    file.pos += 8; // xMin/yMin/xMax/yMax, already in bounds above.
-
-    if (contours_count > 0) {
-        return tt_load_simple_glyph(arena, scratch, font, file, (u32)contours_count);
-    } else if (contours_count == -1) {
-        return tt_load_compound_glyph(arena, scratch, font, file, depth);
-    }
-    assert(SCOPE_FONT_LOAD, contours_count == 0);
-    return (TTGlyph){0};
-}
-
-internal TTGlyph tt_get_glyph(rop(rw Arena) arena, rop(rw ScratchArena) scratch, rop(ro TTFont) font, u32 gi) {
-    TTGlyph glyph = tt_load_glyph_raw(arena, scratch, font, gi, 0);
-    for (u32 ci = 0; ci < glyph.contours_count; ci++) {
-        for (u32 pi = 0; pi < glyph.contours[ci].pts_count; pi++) {
-            glyph.contours[ci].pts[pi].x *= font->scale;
-            glyph.contours[ci].pts[pi].y *= font->scale;
-        }
-    }
-    return glyph;
-}
-
-internal void tt_release_data(rop(rw TTFont) font) {
-    if (font->data) {
-        munmap((void*)font->data, font->data_len);
-    }
-    font->data     = NULL;
-    font->data_len = 0;
-    font->loca     = (TTFile){0};
-    font->glyf     = (TTFile){0};
-    font->hmtx     = (TTFile){0};
-}
-
-typedef struct _CompoundQueueElement {
-    u32 dst_idx;
-    u32 glyph_idx;
-} _CompoundQueueElement;
-
-TTGlyph* tt_load_font(rop(rw Arena) arena, rop(rw ScratchArena) scratch, rop(rw TTFont) font) {
-    u32                    queue_length   = 0;
-    _CompoundQueueElement* compound_queue = scratch_alloc_aligned(scratch, _CompoundQueueElement, font->glyph_count);
-    TTGlyph*               glyphs         = arena_alloc_aligned(arena, TTGlyph, font->glyph_count);
+    TTGlyph* glyphs           = arena_alloc_aligned(arena, TTGlyph, loader.glyph_count);
+    u32*     processed        = scratch_alloc_aligned(scratch, u32, bitarray_calc_size(loader.glyph_count));
+    u32*     compound_indices = scratch_alloc_aligned(scratch, u32, loader.glyph_count);
+    u32      compound_count   = 0;
 
     // NOTE local const to avoid pointer aliasing interfering with loop unswitching
-    const u32 loca_fmt = font->loca_fmt;
+    const u32 loca_fmt = loader.loca_fmt;
 
     u32 current_offset = 0;
-    for (u32 glyph_idx = 0; glyph_idx < font->glyph_count; glyph_idx++) {
+    for (u32 glyph_idx = 0; glyph_idx < loader.glyph_count; glyph_idx++) {
         u32 off = current_offset;
         u32 end = 0;
 
         // PERF make sure this is unswitched by the compiler
         if (loca_fmt) {
-            memcpy(&end, font->loca.d + glyph_idx * 4, 4);
+            memcpy(&end, loader.loca.d + glyph_idx * 4, 4);
             end = __builtin_bswap32(end);
         } else {
             u16 half;
-            memcpy(&half, font->loca.d + glyph_idx * 2, 2);
+            memcpy(&half, loader.loca.d + glyph_idx * 2, 2);
             end = __builtin_bswap16(half) * 2;
         }
 
         current_offset = end;
 
         if (off == end) {
-            // NOTE we do a trick here where we set the pointer to != 0 so we can verify we've touched this glyph
-            glyphs[glyph_idx] = (TTGlyph){.contours = (void*)1}; // empty glyph (e.g. space)
+            bitarray_set(processed, glyph_idx);
             continue;
         }
 
-        TTFile file           = tt_slice(font->glyf, off, end - off);
-        i16    contours_count = tt_read_i16(&file);
-        file.pos += 8; // xMin/yMin/xMax/yMax, already in bounds above.
+        TTCursor file           = tt_slice(loader.glyf, off, end - off);
+        i16      contours_count = tt_read_i16(&file);
+        file.pos += 8; // xMin/yMin/xMax/yMax
 
         if (contours_count > 0) {
-            glyphs[glyph_idx] = tt_load_simple_glyph(arena, scratch, font, file, (u32)contours_count);
+            glyphs[glyph_idx] = tt_load_simple_glyph(arena, scratch, &loader, file, (u32)contours_count);
+            bitarray_set(processed, glyph_idx);
         } else if (contours_count == -1) {
-            compound_queue[queue_length] = (_CompoundQueueElement){
-                .dst_idx   = glyph_idx,
-                .glyph_idx = 0,
-            };
-            queue_length += 1;
+            glyphs[glyph_idx].file_off       = off;
+            compound_indices[compound_count] = glyph_idx;
+            compound_count += 1;
         } else {
-            // NOTE we do a trick here where we set the pointer to != 0 so we can verify we've touched this glyph
-            glyphs[glyph_idx] = (TTGlyph){.contours = (void*)1}; // empty glyph (e.g. space)
+            // contours_count == 0: no contours, no components (empty outline).
+            bitarray_set(processed, glyph_idx);
         }
     }
 
-    // TODO should this be a ring_buffer?
-    u32 queue_idx = 0;
-    u32 queue_end = queue_length;
-    while (queue_length > 0) {
-        // process compound
-        // if compound refers to an untouched glyph, requeue it
+    // Resolve compounds in post-order: recursing into each child first.
+    for (u32 i = 0; i < compound_count; i++) {
+        tt_resolve_compound(arena, &loader, glyphs, processed, compound_indices[i]);
     }
 
-    return glyphs;
+    u32 total_points = 0;
+    for (u32 gi = 0; gi < loader.glyph_count; gi++) {
+        TTGlyph* glyph = &glyphs[gi];
+        for (u32 ci = 0; ci < glyph->contours_count; ci++) {
+            total_points += glyph->contours[ci].pts_count;
+        }
+    }
+
+    TTFont font = {
+        .glyphs      = glyphs,
+        .glyph_count = loader.glyph_count,
+
+        .total_points = total_points,
+
+        .upem         = loader.upem,
+        .num_hmetrics = loader.num_hmetrics,
+
+        .ascent      = loader.ascent,
+        .descent     = loader.descent,
+        .line_gap    = loader.line_gap,
+        .line_height = loader.line_height,
+    };
+
+    tt_release_data(&loader);
+
+    return font;
 }
