@@ -1,127 +1,324 @@
 #pragma once
 
-static void cleanup_swapchain(const GraphicsContext *ctx, Swapchain *swapchain) {
-    for (u32 i = 0; i < swapchain->image_count; i++) {
-        vkDestroyImageView(ctx->device, swapchain->images[i].view, NULL);
-        vkDestroySemaphore(ctx->device, swapchain->render_finished[i], NULL);
+#include <lib/grim/gfx/internal_graphics.h>
+
+void swapchain_get_images(rop(rw Arena) arena, rop(ro GraphicsContext) ctx, rop(rw RenderTarget) render_target) {
+    u32 swapchain_image_count = 0;
+    {
+        VkResult result =
+            vkGetSwapchainImagesKHR(ctx->device, render_target->swapchain.handle, &swapchain_image_count, NULL);
+        check_vkresult(result, SCOPE_GFX_SWAPCHAIN, "Failed to get swapchain images count.");
+    };
+
+    Image* images = arena_alloc(arena, sizeof(Image) * swapchain_image_count);
+
+    arena_ckpt(arena);
+    VkImage* swapchain_images = arena_alloc(arena, sizeof(VkImage) * swapchain_image_count);
+    {
+        VkResult result = vkGetSwapchainImagesKHR(
+            ctx->device, render_target->swapchain.handle, &swapchain_image_count, swapchain_images);
+        check_vkresult(result, SCOPE_GFX_SWAPCHAIN, "Failed to get swapchain images.");
+    };
+
+    for (u32 idx = 0; idx < swapchain_image_count; idx++) {
+        images[idx].handle = swapchain_images[idx];
+        images[idx].view   = create_image_view(ctx, swapchain_images[idx], render_target->format);
     }
-    if (swapchain->handle) vkDestroySwapchainKHR(ctx->device, swapchain->handle, NULL);
-    free(swapchain->images);
-    free(swapchain->render_finished);
-    *swapchain = (Swapchain){0};
+
+    arena_pop(arena);
+
+    render_target->swapchain.image_count = swapchain_image_count;
+    render_target->swapchain.images      = images;
 }
 
-static VkSurfaceFormatKHR select_surface_format(const GraphicsContext *ctx, const RenderTarget *target) {
-    u32 count = 0;
-    check_vkresult(vkGetPhysicalDeviceSurfaceFormatsKHR(ctx->physical_device, target->surface, &count, NULL), SCOPE_GFX_SWAPCHAIN, "Count surface formats");
-    VkSurfaceFormatKHR *formats = graphics_alloc(count, sizeof(*formats));
-    check_vkresult(vkGetPhysicalDeviceSurfaceFormatsKHR(ctx->physical_device, target->surface, &count, formats), SCOPE_GFX_SWAPCHAIN, "Read surface formats");
-    if (!count) {
-        fprintf(stderr, "Surface has no supported formats\n");
-        exit(EXIT_FAILURE);
+SwapchainGarbage recreate_swapchain(rop(rw Arena) arena,
+                                    rop(ro GraphicsContext) ctx,
+                                    rop(rw RenderTarget) render_target) {
+
+    // TODO we need to update this based on window size
+    // render_target->extent = ;
+    // TODO special case of 0 when minimized, something like this:
+    // glfwGetFramebufferSize(window, &width, &height);
+    // while (width == 0 || height == 0) {
+    //     glfwGetFramebufferSize(window, &width, &height);
+    //     glfwWaitEvents();
+    // }
+
+    VkSurfaceCapabilitiesKHR surface_capabilities;
+    {
+        VkResult result = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
+            ctx->physical_device.handle, render_target->surface, &surface_capabilities);
+        check_vkresult(result, SCOPE_GFX_SWAPCHAIN, "Failed to get surface capabilities.");
     }
-    VkSurfaceFormatKHR selected = formats[0];
-    if (count == 1 && selected.format == VK_FORMAT_UNDEFINED) {
-        selected.format = target->format ? target->format : VK_FORMAT_B8G8R8A8_SRGB;
-    } else if (target->format) {
-        // A dynamic-rendering pipeline's attachment format must remain compatible.
-        bool found = false;
-        for (u32 i = 0; i < count; i++)
-            if (formats[i].format == target->format && formats[i].colorSpace == target->color_space) {
-                selected = formats[i];
-                found = true;
-                break;
-            }
-        if (!found) {
-            fprintf(stderr, "Surface format changed; restart rwmd for the new display format\n");
-            exit(EXIT_FAILURE);
-        }
+
+    VkSwapchainCreateInfoKHR create_info = {0};
+    create_info.sType                    = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
+    create_info.surface                  = render_target->surface;
+    // TODO these should change if settings are changed in the game: double buffering etc
+    create_info.minImageCount            = render_target->swapchain.image_count;
+    create_info.imageFormat              = render_target->format;
+    create_info.imageColorSpace          = render_target->color_space;
+    // TODO check if extent 0 at the top of the func and DO NOT recreate if it is, will fail
+    if (surface_capabilities.currentExtent.width == u32_MAX) {
+        create_info.imageExtent = render_target->extent;
     } else {
-        const VkFormat preferred[] = {VK_FORMAT_B8G8R8A8_SRGB, VK_FORMAT_R8G8B8A8_SRGB};
-        bool found = false;
-        for (u32 p = 0; p < 2 && !found; p++)
-            for (u32 i = 0; i < count; i++)
-                if (formats[i].format == preferred[p] && formats[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
-                    selected = formats[i];
-                    found = true;
-                    break;
-                }
+        create_info.imageExtent = surface_capabilities.currentExtent;
     }
-    free(formats);
-    return selected;
-}
+    create_info.imageArrayLayers = 1;
+    create_info.imageUsage       = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
 
-static VkPresentModeKHR select_present_mode(const GraphicsContext *ctx, VkSurfaceKHR surface) {
-    u32 count = 0;
-    check_vkresult(vkGetPhysicalDeviceSurfacePresentModesKHR(ctx->physical_device, surface, &count, NULL), SCOPE_GFX_SWAPCHAIN, "Count present modes");
-    VkPresentModeKHR *modes = graphics_alloc(count, sizeof(*modes));
-    check_vkresult(vkGetPhysicalDeviceSurfacePresentModesKHR(ctx->physical_device, surface, &count, modes), SCOPE_GFX_SWAPCHAIN, "Read present modes");
-    VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;
-    for (u32 i = 0; i < count; i++)
-        if (modes[i] == VK_PRESENT_MODE_MAILBOX_KHR) mode = VK_PRESENT_MODE_MAILBOX_KHR;
-    for (u32 i = 0; i < count; i++)
-        if (modes[i] == VK_PRESENT_MODE_IMMEDIATE_KHR) mode = VK_PRESENT_MODE_IMMEDIATE_KHR;
-    free(modes);
-    return mode;
-}
+    // TODO do this properly
+    // uint32_t queueFamilyIndices[] = {indices.graphicsFamily.value(), indices.presentFamily.value()};
+    // if (indices.graphicsFamily != indices.presentFamily) {
+    //     createInfo.imageSharingMode = VK_SHARING_MODE_CONCURRENT;
+    //     createInfo.queueFamilyIndexCount = 2;
+    //     createInfo.pQueueFamilyIndices = queueFamilyIndices;
+    // } else {
+    create_info.imageSharingMode      = VK_SHARING_MODE_EXCLUSIVE;
+    // optional when exclusive
+    create_info.queueFamilyIndexCount = 0;
+    create_info.pQueueFamilyIndices   = NULL;
+    // }
 
-static u32 surface_dimension(u32 requested, u32 minimum, u32 maximum) {
-    return requested < minimum ? minimum : requested > maximum ? maximum : requested;
-}
+    create_info.preTransform   = surface_capabilities.currentTransform;
+    create_info.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    // For compositors with alpha windowing support
+    // create_info.compositeAlpha = VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR;
 
-static bool create_swapchain(const GraphicsContext *ctx, RenderTarget *target) {
-    VkSurfaceCapabilitiesKHR caps;
-    check_vkresult(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(ctx->physical_device, target->surface, &caps), SCOPE_GFX_SWAPCHAIN, "Query surface capabilities");
-    VkExtent2D extent = caps.currentExtent;
-    if (extent.width == UINT32_MAX) {
-        extent.width = surface_dimension(target->window->width, caps.minImageExtent.width, caps.maxImageExtent.width);
-        extent.height = surface_dimension(target->window->height, caps.minImageExtent.height, caps.maxImageExtent.height);
+    // TODO these should change if settings are changed in the game: vsync
+    VkPresentModeKHR present_mode = VK_PRESENT_MODE_IMMEDIATE_KHR;
+    create_info.presentMode       = present_mode;
+    create_info.clipped           = VK_TRUE;
+    create_info.oldSwapchain      = render_target->swapchain.handle;
+
+    VkSwapchainKHR swapchain;
+    {
+        VkResult result = vkCreateSwapchainKHR(ctx->device, &create_info, NULL, &swapchain);
+        check_vkresult(result, SCOPE_GFX_SWAPCHAIN, "Failed to create swapchain.");
     }
-    if (!extent.width || !extent.height || !target->window->width || !target->window->height) return false;
-    VkSurfaceFormatKHR format = select_surface_format(ctx, target);
-    VkPresentModeKHR mode = select_present_mode(ctx, target->surface);
-    u32 image_count = caps.minImageCount < 3 ? 3 : caps.minImageCount;
-    if (caps.maxImageCount && image_count > caps.maxImageCount) image_count = caps.maxImageCount;
-    VkCompositeAlphaFlagBitsKHR alpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-    const VkCompositeAlphaFlagBitsKHR alpha_modes[] = {VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
-        VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR, VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR, VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR};
-    for (u32 i = 0; i < 4; i++)
-        if (caps.supportedCompositeAlpha & alpha_modes[i]) { alpha = alpha_modes[i]; break; }
-    u32 families[] = {ctx->graphics_family, ctx->present_family};
-    bool separate = ctx->graphics_family != ctx->present_family;
-    VkSwapchainCreateInfoKHR info = {.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
-        .surface = target->surface, .minImageCount = image_count, .imageFormat = format.format,
-        .imageColorSpace = format.colorSpace, .imageExtent = extent, .imageArrayLayers = 1,
-        .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
-        .imageSharingMode = separate ? VK_SHARING_MODE_CONCURRENT : VK_SHARING_MODE_EXCLUSIVE,
-        .queueFamilyIndexCount = separate ? 2u : 0u, .pQueueFamilyIndices = separate ? families : NULL,
-        .preTransform = caps.currentTransform, .compositeAlpha = alpha, .presentMode = mode,
-        .clipped = VK_TRUE, .oldSwapchain = target->swapchain.handle};
-    Swapchain next = {.present_mode = mode};
-    check_vkresult(vkCreateSwapchainKHR(ctx->device, &info, NULL, &next.handle), SCOPE_GFX_SWAPCHAIN, "Create swapchain");
-    check_vkresult(vkGetSwapchainImagesKHR(ctx->device, next.handle, &next.image_count, NULL), SCOPE_GFX_SWAPCHAIN, "Count swapchain images");
-    VkImage *handles = graphics_alloc(next.image_count, sizeof(*handles));
-    check_vkresult(vkGetSwapchainImagesKHR(ctx->device, next.handle, &next.image_count, handles), SCOPE_GFX_SWAPCHAIN, "Read swapchain images");
-    next.images = graphics_alloc(next.image_count, sizeof(*next.images));
-    next.render_finished = graphics_alloc(next.image_count, sizeof(*next.render_finished));
-    VkSemaphoreCreateInfo semaphore_info = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
-    for (u32 i = 0; i < next.image_count; i++) {
-        next.images[i] = (Image){.handle = handles[i]};
-        next.images[i].view = create_image_view(ctx, handles[i], format.format);
-        check_vkresult(vkCreateSemaphore(ctx->device, &semaphore_info, NULL, &next.render_finished[i]), SCOPE_GFX_SWAPCHAIN, "Create image presentation semaphore");
+
+    // TODO these should change if settings are changed in the game?
+    // These are not changing here.
+    // render_target->format = format;
+    // render_target->color_space = color_space;
+    assert(SCOPE_GFX_SWAPCHAIN, render_target->swapchain.image_count <= 3);
+    SwapchainGarbage garbage = (SwapchainGarbage){
+        .swapchain   = render_target->swapchain.handle,
+        .garbage_len = render_target->swapchain.image_count,
+    };
+
+    for (u32 idx = 0; idx < garbage.garbage_len; idx++) {
+        garbage.image_views[idx] = render_target->swapchain.images[idx].view;
+
+        garbage.signal_on_render_finishes[idx]  = render_target->swapchain.sync_objects[idx].signal_on_render_finish;
+        garbage.signal_on_image_availables[idx] = render_target->swapchain.sync_objects[idx].signal_on_image_available;
+        garbage.open_on_present_complete[idx]   = render_target->swapchain.sync_objects[idx].open_on_present_complete;
     }
-    free(handles);
-    cleanup_swapchain(ctx, &target->swapchain);
-    target->swapchain = next;
-    target->format = format.format;
-    target->color_space = format.colorSpace;
-    target->extent = extent;
-    return true;
+
+    arena_ckpt(arena);
+
+    render_target->swapchain.handle  = swapchain;
+    rop(rw VkImage) swapchain_images = arena_alloc(arena, sizeof(VkImage) * render_target->swapchain.image_count);
+    {
+        VkResult result =
+            vkGetSwapchainImagesKHR(ctx->device, swapchain, &render_target->swapchain.image_count, swapchain_images);
+        check_vkresult(result, SCOPE_GFX_SWAPCHAIN, "Failed to get swapchain images.");
+    };
+
+    for (u32 idx = 0; idx < render_target->swapchain.image_count; idx++) {
+        recreate_sync_objects_semaphores(ctx, render_target->swapchain.sync_objects + idx);
+        recreate_present_complete(ctx, render_target->swapchain.sync_objects + idx);
+        render_target->swapchain.images[idx].handle = swapchain_images[idx];
+        render_target->swapchain.images[idx].view =
+            create_image_view(ctx, swapchain_images[idx], render_target->format);
+    }
+
+    arena_pop(arena);
+
+    return garbage;
 }
 
-void cleanup_render_target(const GraphicsContext *ctx, RenderTarget *target) {
-    check_vkresult(vkDeviceWaitIdle(ctx->device), SCOPE_GFX_SWAPCHAIN, "Wait before surface cleanup");
-    cleanup_swapchain(ctx, &target->swapchain);
-    if (target->surface) vkDestroySurfaceKHR(ctx->instance, target->surface, NULL);
-    target->surface = VK_NULL_HANDLE;
+u8 check_dispose_ready(rop(ro GraphicsContext) ctx, rop(ro SwapchainGarbage) garbage) {
+    VkResult result = vkWaitForFences(ctx->device, garbage->garbage_len, garbage->open_on_present_complete, VK_TRUE, 0);
+    // TODO use fence status instead? Not sure if it matters since timeout 0 is a special case.
+    // Can I even effectively performance test this?
+    // vkGetFenceStatus(ctx->device, garbage->open_on_present_complete);
+    return result == VK_SUCCESS;
+}
+
+void dispose_swapchain_garbage(rop(ro GraphicsContext) ctx, rop(rw SwapchainGarbage) garbage) {
+    // we target 3 buffers always so unroll 3 here
+#pragma unroll 3
+    for (u32 idx = 0; idx < garbage->garbage_len; idx++) {
+        vkDestroyImageView(ctx->device, garbage->image_views[idx], NULL);
+        garbage->image_views[idx] = VK_NULL_HANDLE;
+
+        vkDestroySemaphore(ctx->device, garbage->signal_on_render_finishes[idx], NULL);
+        garbage->signal_on_render_finishes[idx] = VK_NULL_HANDLE;
+
+        vkDestroySemaphore(ctx->device, garbage->signal_on_image_availables[idx], NULL);
+        garbage->signal_on_image_availables[idx] = VK_NULL_HANDLE;
+
+        vkDestroyFence(ctx->device, garbage->open_on_present_complete[idx], NULL);
+        garbage->open_on_present_complete[idx] = VK_NULL_HANDLE;
+    }
+    vkDestroySwapchainKHR(ctx->device, garbage->swapchain, NULL);
+    garbage->swapchain = VK_NULL_HANDLE;
+}
+
+void create_swapchain(rop(rw Arena) arena,
+                      rop(ro GraphicsContext) ctx,
+                      ro VkSurfaceKHR surface,
+                      rop(rw RenderTarget) render_target) {
+    VkSurfaceCapabilitiesKHR surface_capabilities;
+    vkGetPhysicalDeviceSurfaceCapabilitiesKHR(ctx->physical_device.handle, surface, &surface_capabilities);
+
+    arena_ckpt(arena);
+
+    u32                 format_count;
+    VkSurfaceFormatKHR* formats = NULL;
+    {
+        {
+            VkResult result =
+                vkGetPhysicalDeviceSurfaceFormatsKHR(ctx->physical_device.handle, surface, &format_count, NULL);
+            check_vkresult(
+                result, SCOPE_GFX_SWAPCHAIN, "Failed to queury supported physical device surface format count.");
+        }
+
+        formats = arena_alloc(arena, sizeof(VkSurfaceFormatKHR) * format_count);
+        if (format_count != 0) {
+            VkResult result =
+                vkGetPhysicalDeviceSurfaceFormatsKHR(ctx->physical_device.handle, surface, &format_count, formats);
+            check_vkresult(result, SCOPE_GFX_SWAPCHAIN, "Failed to queury physical device surface formats.");
+        }
+    }
+
+    u32               present_mode_count;
+    VkPresentModeKHR* present_modes = NULL;
+    {
+        {
+            VkResult result = vkGetPhysicalDeviceSurfacePresentModesKHR(
+                ctx->physical_device.handle, surface, &present_mode_count, NULL);
+            check_vkresult(
+                result, SCOPE_GFX_SWAPCHAIN, "Failed to queury supported physical device surface format count.");
+        }
+
+        present_modes = arena_alloc(arena, sizeof(VkPresentModeKHR) * present_mode_count);
+        if (present_mode_count != 0) {
+            VkResult result = vkGetPhysicalDeviceSurfacePresentModesKHR(
+                ctx->physical_device.handle, surface, &present_mode_count, present_modes);
+            check_vkresult(
+                result, SCOPE_GFX_SWAPCHAIN, "Failed to queury supported physical device surface format count.");
+        }
+    }
+
+    INFO_LOG(SCOPE_GFX_SWAPCHAIN, "Supported Color Spaces: ");
+    INFO_LOG(SCOPE_GFX_SWAPCHAIN, "Supported Surface Format: ");
+    for (u32 idx = 0; idx < format_count; idx++) {
+        const char* color_space    = colorspace_to_str(formats[idx].colorSpace);
+        const char* surface_format = surface_format_to_str(formats[idx].format);
+        INFO_LOG(SCOPE_GFX_SWAPCHAIN, "    %s & %s", surface_format, color_space);
+    }
+    INFO_LOG(SCOPE_GFX_SWAPCHAIN, "");
+
+    INFO_LOG(SCOPE_GFX_SWAPCHAIN, "Supported Present Modes: ");
+    for (u32 idx = 0; idx < present_mode_count; idx++) {
+        const char* present_mode = present_mode_to_str(present_modes[idx]);
+        INFO_LOG(SCOPE_GFX_SWAPCHAIN, "    %s", present_mode);
+    }
+    INFO_LOG(SCOPE_GFX_SWAPCHAIN, "");
+
+    INFO_LOG(SCOPE_GFX_SWAPCHAIN,
+             "Surface Extent: %u x %u",
+             surface_capabilities.currentExtent.width,
+             surface_capabilities.currentExtent.height);
+    INFO_LOG(SCOPE_GFX_SWAPCHAIN,
+             "Min Surface Extent: %u x %u",
+             surface_capabilities.minImageExtent.width,
+             surface_capabilities.minImageExtent.height);
+    INFO_LOG(SCOPE_GFX_SWAPCHAIN,
+             "Max Surface Extent: %u x %u",
+             surface_capabilities.maxImageExtent.width,
+             surface_capabilities.maxImageExtent.height);
+
+    // TODO pick these properly
+    // VkFormat         format       = VK_FORMAT_A2R10G10B10_UNORM_PACK32;
+    VkFormat         format       = VK_FORMAT_B8G8R8A8_SRGB;
+    // VK_FORMAT_B8G8R8A8_UNORM
+    VkColorSpaceKHR  color_space  = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+    // Mailbox is what you probably want if it exists
+    // VkPresentModeKHR present_mode = VK_PRESENT_MODE_MAILBOX_KHR;
+    VkPresentModeKHR present_mode = VK_PRESENT_MODE_IMMEDIATE_KHR;
+    // We want 3 but are limited by driver, get closest supported value
+    INFO_LOG(SCOPE_GFX_SWAPCHAIN,
+             "We can have %u - %u images.",
+             surface_capabilities.minImageCount,
+             surface_capabilities.maxImageCount);
+    u32 swapchain_image_count = clamp(surface_capabilities.minImageCount, 3, surface_capabilities.maxImageCount);
+
+    VkSwapchainCreateInfoKHR create_info = {0};
+    create_info.sType                    = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
+    create_info.surface                  = surface;
+    create_info.minImageCount            = swapchain_image_count;
+    create_info.imageFormat              = format;
+    create_info.imageColorSpace          = color_space;
+    create_info.imageExtent              = render_target->extent;
+    create_info.imageArrayLayers         = 1;
+    create_info.imageUsage               = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+
+    // TODO do this properly
+    // uint32_t queueFamilyIndices[] = {indices.graphicsFamily.value(), indices.presentFamily.value()};
+    // if (indices.graphicsFamily != indices.presentFamily) {
+    //     createInfo.imageSharingMode = VK_SHARING_MODE_CONCURRENT;
+    //     createInfo.queueFamilyIndexCount = 2;
+    //     createInfo.pQueueFamilyIndices = queueFamilyIndices;
+    // } else {
+    create_info.imageSharingMode      = VK_SHARING_MODE_EXCLUSIVE;
+    // optional when exclusive
+    create_info.queueFamilyIndexCount = 0;
+    create_info.pQueueFamilyIndices   = NULL;
+    // }
+
+    create_info.preTransform   = surface_capabilities.currentTransform;
+    create_info.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    // For compositors with alpha windowing support
+    // create_info.compositeAlpha = VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR;
+
+    create_info.presentMode  = present_mode;
+    create_info.clipped      = VK_TRUE;
+    // TODO do you have to clean this up?
+    create_info.oldSwapchain = render_target->swapchain.handle;
+
+    VkSwapchainKHR swapchain;
+    VkResult       result = vkCreateSwapchainKHR(ctx->device, &create_info, NULL, &swapchain);
+    check_vkresult(result, SCOPE_GFX_SWAPCHAIN, "Failed to create swapchain.");
+
+    render_target->format      = format;
+    render_target->color_space = color_space;
+
+    arena_pop(arena);
+
+    SyncObjects* sync_objects = arena_alloc_align(arena, sizeof(void*), sizeof(SyncObjects) * swapchain_image_count);
+    for (u32 idx = 0; idx < swapchain_image_count; idx++) {
+        sync_objects[idx] = create_sync_objects(ctx);
+    }
+
+    Swapchain swapchain_wrapper    = {0};
+    swapchain_wrapper.handle       = swapchain;
+    swapchain_wrapper.sync_objects = sync_objects;
+    render_target->swapchain       = swapchain_wrapper;
+
+    swapchain_get_images(arena, ctx, render_target);
+}
+
+void cleanup_swapchain(rop(ro GraphicsContext) ctx, rop(rw Swapchain) swapchain) {
+    for (u32 idx = 0; idx < swapchain->image_count; idx++) {
+        cleanup_image_view(ctx, swapchain->images + idx);
+        cleanup_sync_objects(ctx, swapchain->sync_objects + idx);
+    }
+    // TODO these were allocated by the arena... damn
+    // swapchain->images = NULL;
+    // swapchain->sync_objects = NULL;
+
+    vkDestroySwapchainKHR(ctx->device, swapchain->handle, NULL);
 }

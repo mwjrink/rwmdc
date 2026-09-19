@@ -1,33 +1,56 @@
 #pragma once
 
-void enqueue_submit_graphics(RenderState *rs) {
-    RenderContext *rc = rs->r_ctx;
-    const GraphicsContext *ctx = rc->ctx;
-    FrameSlot *slot = &rc->slots[rs->frame_count % rc->frames_in_flight];
-    VkSemaphoreSubmitInfo wait = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
-        .semaphore = slot->image_available, .stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT};
-    VkSemaphoreSubmitInfo signal = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
-        .semaphore = rc->target->swapchain.render_finished[rs->image_idx], .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
-    VkCommandBufferSubmitInfo command = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
-        .commandBuffer = slot->command_buffer};
-    VkSubmitInfo2 submit = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
-        .waitSemaphoreInfoCount = 1, .pWaitSemaphoreInfos = &wait,
-        .commandBufferInfoCount = 1, .pCommandBufferInfos = &command,
-        .signalSemaphoreInfoCount = 1, .pSignalSemaphoreInfos = &signal};
-    // Reset only when a successful acquire will actually be submitted.
-    check_vkresult(vkResetFences(ctx->device, 1, &slot->fence), SCOPE_GFX_COMMAND_QUEUE, "Reset submission fence");
-    check_vkresult(vkQueueSubmit2(ctx->graphics_queue, 1, &submit, slot->fence), SCOPE_GFX_COMMAND_QUEUE, "Submit text frame");
+#include <lib/grim/gfx/internal_graphics.h>
+
+VkResult enqueue_present(rop(ro GraphicsContext) ctx, rop(ro RenderTarget) render_target, ro u32 image_idx) {
+    VkPresentInfoKHR present_info   = {0};
+    present_info.sType              = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+    present_info.waitSemaphoreCount = 1;
+    present_info.pWaitSemaphores    = &(render_target->swapchain.sync_objects[image_idx].signal_on_render_finish);
+    present_info.swapchainCount     = 1;
+    present_info.pSwapchains        = &(render_target->swapchain.handle);
+    present_info.pImageIndices      = &image_idx;
+    present_info.pResults           = NULL;
+
+    VkFence present_complete_fence = render_target->swapchain.sync_objects[image_idx].open_on_present_complete;
+    // TODO never wait
+    vkWaitForFences(ctx->device, 1, &present_complete_fence, VK_TRUE, u64_MAX);
+    vkResetFences(ctx->device, 1, &present_complete_fence);
+
+    VkSwapchainPresentFenceInfoKHR present_fence = {0};
+    present_fence.sType                          = VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_KHR;
+    present_fence.swapchainCount                 = 1;
+    present_fence.pFences                        = &present_complete_fence;
+
+    present_info.pNext = &present_fence;
+
+    VkResult result = vkQueuePresentKHR(ctx->queue_families.queues[ctx->queue_families.present_idx], &present_info);
+    // check_vkresult(result, "Failed to Present.");
+    // TODO this is a special case because this can return out_of_date framebuffer etc
+    return result;
 }
 
-void end_frame(Arena *arena, RenderState *rs) {
-    (void)arena;
-    RenderContext *rc = rs->r_ctx;
-    Swapchain *swapchain = &rc->target->swapchain;
-    VkPresentInfoKHR present = {.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
-        .waitSemaphoreCount = 1, .pWaitSemaphores = &swapchain->render_finished[rs->image_idx],
-        .swapchainCount = 1, .pSwapchains = &swapchain->handle, .pImageIndices = &rs->image_idx};
-    VkResult result = vkQueuePresentKHR(rc->ctx->present_queue, &present);
-    if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR) rc->render_target_resized = true;
-    else check_vkresult(result, SCOPE_GFX_PRESENT, "Present text frame");
-    rs->frame_count++;
+void enqueue_submit_graphics(rop(ro GraphicsContext) ctx,
+                             rop(ro RenderTarget) render_target,
+                             rop(ro CommandBuffer) buffers,
+                             ro u32 frame_idx,
+                             ro u32 image_idx) {
+    VkPipelineStageFlags wait_stages[] = {VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};
+
+    VkSubmitInfo submit_info         = {0};
+    submit_info.sType                = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit_info.waitSemaphoreCount   = 1;
+    submit_info.pWaitSemaphores      = &(render_target->swapchain.sync_objects[frame_idx].signal_on_image_available);
+    // this tells the GPU WHEN to wait on the semaphore which we want at present
+    submit_info.pWaitDstStageMask    = wait_stages;
+    submit_info.commandBufferCount   = 1;
+    submit_info.pCommandBuffers      = &(buffers[frame_idx].handle);
+    submit_info.signalSemaphoreCount = 1;
+    submit_info.pSignalSemaphores    = &(render_target->swapchain.sync_objects[image_idx].signal_on_render_finish);
+
+    VkResult result = vkQueueSubmit(ctx->queue_families.queues[ctx->queue_families.graphics_idx],
+                                    1,
+                                    &submit_info,
+                                    render_target->swapchain.sync_objects[frame_idx].open_on_render_finish);
+    check_vkresult(result, SCOPE_GFX_COMMAND_QUEUE, "Failed to submit queue for execution.");
 }

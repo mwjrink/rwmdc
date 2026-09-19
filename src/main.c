@@ -1,792 +1,248 @@
-#include <sys/resource.h>
+#include <lib/grim/assert.h>
+#include <lib/grim/bp.h>
+#include <lib/grim/gfx/graphics.h>
+#include <lib/grim/logger.h>
+#include <lib/grim/mem/arena.h>
+#include <lib/grim/os/input_linux.h>
+
+// FIXME TEMP
+#include <lib/grim/gfx/internal_graphics.h>
 
 #define RWMD_MARKDOWN_IMPLEMENTATION
-#include <lib/grim/gfx/internal_graphics.h>
 #include <lib/grim/markdown/layout.h>
-
-typedef struct Editor {
-    Document        document;
-    LayoutState     layout;
-    FontState       font;
-    GrimWindow      window;
-    u64             saved_state;
-    u32             selection_anchor;
-    u32             event_index;
-    bool            paste_pending;
-    bool            selecting, dragging_scrollbar, close_armed, title_dirty;
-    f32             drag_offset, preferred_x;
-    f64             last_input;
-    GpuRect*        rects;
-    u32             rect_capacity;
-    MdParserProfile parser_counters;
-    u64             full_parses, local_parses, largest_parse_update;
-} Editor;
-
-static bool editor_dirty(const Editor* editor) {
-    return document_state_id(&editor->document) != editor->saved_state;
-}
-static void editor_title(Editor* editor, const char* message) {
-    char title[2048];
-    snprintf(title,
-             sizeof(title),
-             "%s%s — rwmd%s%s",
-             editor_dirty(editor) ? "*" : "",
-             editor->path ? editor->path : "Untitled",
-             message ? " — " : "",
-             message ? message : "");
-    window_set_title(editor->window, title);
-}
-static void editor_error(Editor* editor, const char* message) {
-    fprintf(stderr, "rwmd: %s\n", message);
-    editor_title(editor, message);
-}
-static bool editor_update_layout(Editor* editor, f32 width, f32 height) {
-    bool changed = layout_update(&editor->layout, &editor->document, editor->font, max(width - 14.0f, 1.0f), height);
-    if (editor->layout.failed) {
-        fprintf(stderr,
-                "rwmd: Markdown layout failed%s%s\n",
-                editor->layout.shape.error ? ": " : "",
-                editor->layout.shape.error ? editor->layout.shape.error : "");
-        exit(1);
-    }
-    if (changed) {
-        const LayoutProfile* profile = &editor->layout.profile;
-        if (profile->mirror_ns)
-            metric_add_ns(&editor->mirror, profile->mirror_ns);
-        if (profile->full_parses || profile->local_parses) {
-            metric_add_ns(&editor->parsing, editor->layout.parse_ns);
-            metric_add_ns(&editor->parser_total, profile->parser.total_ns);
-            metric_add_ns(&editor->block_scan, profile->parser.block_ns);
-            metric_add_ns(&editor->inline_events, profile->parser.inline_ns);
-            if (editor->layout.parser.profile_callbacks)
-                metric_add_ns(&editor->callbacks, profile->parser.callback_ns);
-            metric_add_ns(&editor->index_finalization, profile->index_ns);
-            metric_add_ns(&editor->graphemes, profile->grapheme_ns);
-            metric_add_ns(&editor->cache_publication, profile->cache_ns);
-            editor->full_parses += profile->full_parses;
-            editor->local_parses += profile->local_parses;
-            editor->largest_parse_update = max(editor->largest_parse_update, profile->parser.input_bytes);
-            MdParserProfile* total       = &editor->parser_counters;
-            total->input_bytes += profile->parser.input_bytes;
-            total->event_count += profile->parser.event_count;
-            total->allocations += profile->parser.allocations;
-            total->reallocations += profile->parser.reallocations;
-            total->realloc_copied_bytes += profile->parser.realloc_copied_bytes;
-            total->arena_growths += profile->parser.arena_growths;
-            total->arena_peak_bytes     = max(total->arena_peak_bytes, profile->parser.arena_peak_bytes);
-            total->arena_capacity_bytes = max(total->arena_capacity_bytes, profile->parser.arena_capacity_bytes);
-        }
-        metric_add(&editor->layout_time, (f64)editor->layout.layout_ns / 1e6);
-    }
-    return changed;
-}
-static void editor_changed(Editor* editor) {
-    layout_apply_edit(&editor->layout, &editor->document, &editor->document.last_edit);
-    metric_add_ns(&editor->mirror, editor->layout.edit_profile.mirror_ns);
-    metric_add_ns(&editor->invalidation, editor->layout.edit_profile.invalidation_ns);
-    editor->selection_anchor = document_cursor(&editor->document);
-    layout_reveal(&editor->layout, &editor->document, editor->selection_anchor);
-    editor->last_input   = monotonic_ms();
-    editor->preferred_x  = NAN;
-    bool was_close_armed = editor->close_armed;
-    editor->close_armed  = false;
-    bool dirty           = editor_dirty(editor);
-    if (dirty != editor->title_dirty || was_close_armed)
-        editor_title(editor, NULL);
-    editor->title_dirty = dirty;
-}
-static bool editor_replace(Editor* editor, u32 offset, u32 removed, const u8* text, u32 length) {
-    u64  before = editor->document.revision;
-    f64  start  = monotonic_ms();
-    bool ok     = document_replace(&editor->document, offset, removed, text, length);
-    metric_add(&editor->edits, monotonic_ms() - start);
-    if (!ok) {
-        editor_error(editor, document_error(&editor->document));
-        return false;
-    }
-    if (editor->document.revision != before)
-        editor_changed(editor);
-    return editor->document.revision != before;
-}
-static bool editor_insert(Editor* editor, const u8* text, u32 length) {
-    u32 caret = document_cursor(&editor->document);
-    u32 begin = min(caret, editor->selection_anchor), end = max(caret, editor->selection_anchor);
-    return editor_replace(editor, begin, end - begin, text, length);
-}
-static bool editor_space(const Document* document, u32 offset) {
-    if (offset >= document_length(document))
-        return true;
-    u8 byte;
-    document_read(document, offset, 1, &byte);
-    return byte == ' ' || byte == '\t' || byte == '\r' || byte == '\n';
-}
-static u32 editor_word(const Document* document, u32 cursor, bool forward) {
-    u32 length = document_length(document);
-    if (forward) {
-        while (cursor < length && !editor_space(document, cursor))
-            cursor = document_next_grapheme(document, cursor);
-        while (cursor < length && editor_space(document, cursor))
-            cursor = document_next_grapheme(document, cursor);
-    } else {
-        while (cursor) {
-            u32 prev = document_prev_grapheme(document, cursor);
-            if (!editor_space(document, prev))
-                break;
-            cursor = prev;
-        }
-        while (cursor) {
-            u32 prev = document_prev_grapheme(document, cursor);
-            if (editor_space(document, prev))
-                break;
-            cursor = prev;
-        }
-    }
-    return cursor;
-}
-static void editor_move(Editor* editor, u32 cursor, bool extend) {
-    document_set_cursor(&editor->document, cursor);
-    cursor = document_cursor(&editor->document);
-    if (!extend)
-        editor->selection_anchor = cursor;
-    layout_reveal(&editor->layout, &editor->document, cursor);
-    editor->last_input = monotonic_ms();
-}
-static void editor_save(Editor* editor) {
-    if (!editor->path) {
-        editor_error(editor, "Open with a file path to save this document");
-        return;
-    }
-    if (!document_save(&editor->document, editor->path)) {
-        editor_error(editor, document_error(&editor->document));
-        return;
-    }
-    editor->saved_state = document_state_id(&editor->document);
-    editor->title_dirty = false;
-    editor->close_armed = false;
-    editor_title(editor, NULL);
-    printf("Saved %s (%u bytes)\n", editor->path, document_length(&editor->document));
-    fflush(stdout);
-}
-static void editor_copy(Editor* editor, bool cut) {
-    u32 caret = document_cursor(&editor->document);
-    u32 begin = min(caret, editor->selection_anchor), end = max(caret, editor->selection_anchor);
-    if (begin == end)
-        return;
-    u8* bytes = malloc(end - begin);
-    if (!bytes) {
-        editor_error(editor, "Clipboard allocation failed");
-        return;
-    }
-    document_read(&editor->document, begin, end - begin, bytes);
-    window_clipboard_set(editor->window, bytes, end - begin);
-    free(bytes);
-    if (cut)
-        editor_replace(editor, begin, end - begin, NULL, 0);
-}
-static bool editor_key(Editor* editor, const WindowEvent* event, f32 width, f32 height) {
-    if (!event->pressed)
-        return false;
-    bool ctrl  = (event->modifiers & WINDOW_CTRL) != 0;
-    bool shift = (event->modifiers & WINDOW_SHIFT) != 0;
-    u32  caret = document_cursor(&editor->document), next = caret;
-    if (ctrl) {
-        switch (event->key) {
-            case WKEY_S:
-                editor_save(editor);
-                return true;
-            case WKEY_A:
-                layout_clear_affinity(&editor->layout);
-                editor->selection_anchor = 0;
-                editor_move(editor, document_length(&editor->document), true);
-                return true;
-            case WKEY_C:
-                editor_copy(editor, false);
-                return true;
-            case WKEY_X:
-                editor_copy(editor, true);
-                return true;
-            case WKEY_V:
-                editor->paste_pending = true;
-                window_clipboard_request(editor->window);
-                return false;
-            case WKEY_Z:
-            case WKEY_Y: {
-                f64  start   = monotonic_ms();
-                bool redo    = event->key == WKEY_Y || shift;
-                bool changed = redo ? document_redo(&editor->document) : document_undo(&editor->document);
-                metric_add(&editor->edits, monotonic_ms() - start);
-                if (changed)
-                    editor_changed(editor);
-                return changed;
-            }
-            case WKEY_Q:
-                editor->window->request_close = true;
-                return false;
-            default:
-                break;
-        }
-    }
-    switch (event->key) {
-        case WKEY_ESCAPE:
-            editor->selection_anchor = caret;
-            editor->selecting = editor->dragging_scrollbar = false;
-            return true;
-        case WKEY_ENTER:
-            return editor_insert(
-                editor, (const u8*)(editor->document.crlf ? "\r\n" : "\n"), editor->document.crlf ? 2 : 1);
-        case WKEY_TAB:
-            return editor_insert(editor, (const u8*)"\t", 1);
-        case WKEY_BACKSPACE:
-        case WKEY_DELETE: {
-            u32 begin = min(caret, editor->selection_anchor), end = max(caret, editor->selection_anchor);
-            if (begin == end) {
-                if (event->key == WKEY_BACKSPACE)
-                    begin = ctrl ? editor_word(&editor->document, caret, false)
-                                 : document_prev_grapheme(&editor->document, caret);
-                else
-                    end = ctrl ? editor_word(&editor->document, caret, true)
-                               : document_next_grapheme(&editor->document, caret);
-            }
-            return begin != end && editor_replace(editor, begin, end - begin, NULL, 0);
-        }
-        case WKEY_LEFT:
-            layout_clear_affinity(&editor->layout);
-            next                = !shift && editor->selection_anchor != caret ? min(caret, editor->selection_anchor)
-                                  : ctrl ? editor_word(&editor->document, caret, false)
-                                         : document_prev_grapheme(&editor->document, caret);
-            editor->preferred_x = NAN;
-            break;
-        case WKEY_RIGHT:
-            layout_clear_affinity(&editor->layout);
-            next                = !shift && editor->selection_anchor != caret ? max(caret, editor->selection_anchor)
-                                  : ctrl ? editor_word(&editor->document, caret, true)
-                                         : document_next_grapheme(&editor->document, caret);
-            editor->preferred_x = NAN;
-            break;
-        case WKEY_HOME:
-        case WKEY_END:
-            if (ctrl)
-                layout_clear_affinity(&editor->layout);
-            if (!ctrl)
-                layout_reveal(&editor->layout, &editor->document, caret);
-            editor_update_layout(editor, width, height);
-            next                = ctrl ? (event->key == WKEY_HOME ? 0 : document_length(&editor->document))
-                                       : layout_line_edge(&editor->layout, caret, event->key == WKEY_END);
-            editor->preferred_x = NAN;
-            break;
-        case WKEY_UP:
-        case WKEY_DOWN:
-        case WKEY_PAGE_UP:
-        case WKEY_PAGE_DOWN: {
-            layout_reveal(&editor->layout, &editor->document, caret);
-            editor_update_layout(editor, width, height);
-            CaretVisual position = layout_caret(&editor->layout, caret);
-            if (!isfinite(editor->preferred_x))
-                editor->preferred_x = position.x;
-            i32 lines = (event->key == WKEY_UP || event->key == WKEY_PAGE_UP) ? -1 : 1;
-            if (event->key == WKEY_PAGE_UP || event->key == WKEY_PAGE_DOWN)
-                lines *= max(1, (i32)(height / editor->font->font->line_height) - 1);
-            next = layout_move_vertical(&editor->layout, caret, lines, editor->preferred_x);
-            break;
-        }
-        default:
-            return false;
-    }
-    editor_move(editor, next, shift);
-    return true;
-}
-static void editor_thumb(const Editor* editor, f32 height, f32* top, f32* size) {
-    u32 length = document_length(&editor->document);
-    u32 first  = layout_viewport_byte(&editor->layout);
-    u32 last   = first;
-    for (u32 i = 0; i < editor->layout.window.line_count; i++) {
-        const LayoutLine* line = &editor->layout.window.lines[i];
-        if (line->y + editor->layout.scroll_y >= height)
-            break;
-        if (line->y + line->height + editor->layout.scroll_y > 0)
-            last = line->end;
-    }
-    u32 visible = last >= first ? last - first : 0;
-    *size       = length ? clamp(24.0f, height * (f32)visible / (f32)length, height) : height;
-    *top        = length ? clamp(0.0f, (height - *size) * (f32)first / (f32)length, height - *size) : 0;
-    if (editor->layout.window.source_end == length && editor->layout.window.line_count) {
-        const LayoutLine* last_line = &editor->layout.window.lines[editor->layout.window.line_count - 1];
-        if (last_line->y + last_line->height + editor->layout.scroll_y <= height + 0.5f)
-            *top = height - *size;
-    }
-}
-static void editor_drag_thumb(Editor* editor, f32 y, f32 height) {
-    f32 top, size;
-    editor_thumb(editor, height, &top, &size);
-    f32 fraction = height > size ? clamp(0.0f, (y - editor->drag_offset) / (height - size), 1.0f) : 0;
-    u32 byte     = (u32)((f64)fraction * document_length(&editor->document));
-    layout_seek(&editor->layout, &editor->document, byte);
-}
-static bool editor_event(Editor* editor, const WindowEvent* event, f32 width, f32 height) {
-    if (event->type == WINDOW_TEXT) {
-        const u8* text = window_event_text(editor->window, event);
-        return editor_insert(editor, text, event->text_len);
-    }
-    if (event->type == WINDOW_KEY)
-        return editor_key(editor, event, width, height);
-    if (event->type == WINDOW_SCROLL) {
-        layout_scroll(&editor->layout, &editor->document, event->dy);
-        return true;
-    }
-    if (event->type == WINDOW_POINTER_BUTTON && event->button == 1) {
-        if (!event->pressed) {
-            editor->selecting = editor->dragging_scrollbar = false;
-            return false;
-        }
-        editor_update_layout(editor, width, height);
-        if (event->x >= width - 12) {
-            f32 top, size;
-            editor_thumb(editor, height, &top, &size);
-            editor->drag_offset        = event->y >= top && event->y <= top + size ? event->y - top : size * .5f;
-            editor->dragging_scrollbar = true;
-            editor_drag_thumb(editor, event->y, height);
-        } else {
-            u32 hit = layout_hit_test(&editor->layout, event->x, event->y);
-            document_set_cursor(&editor->document, hit);
-            if (!(event->modifiers & WINDOW_SHIFT))
-                editor->selection_anchor = document_cursor(&editor->document);
-            editor->selecting   = true;
-            editor->preferred_x = NAN;
-            editor->last_input  = monotonic_ms();
-        }
-        return true;
-    }
-    if (event->type == WINDOW_POINTER_MOVE) {
-        if (editor->dragging_scrollbar) {
-            editor_drag_thumb(editor, event->y, height);
-            return true;
-        }
-        if (editor->selecting) {
-            if (event->y < 0)
-                layout_scroll(&editor->layout, &editor->document, event->y);
-            else if (event->y > height)
-                layout_scroll(&editor->layout, &editor->document, event->y - height);
-            editor_update_layout(editor, width, height);
-            document_set_cursor(&editor->document, layout_hit_test(&editor->layout, event->x, event->y));
-            editor->last_input = monotonic_ms();
-            return true;
-        }
-    }
-    return false;
-}
-
-static bool editor_process_events(Editor* editor, f32 width, f32 height) {
-    bool          redraw = false;
-    WindowEvents* queue  = &editor->window->events;
-    for (;;) {
-        if (editor->paste_pending) {
-            // Preserve input order across asynchronous clipboard transfers:
-            // later typing/save commands remain queued, but rendering continues.
-            u32 index = editor->event_index;
-            while (index < queue->count && queue->items[index].type != WINDOW_PASTE)
-                index++;
-            if (index == queue->count)
-                break;
-            WindowEvent completion = queue->items[index];
-            if (completion.text_len)
-                redraw |= editor_insert(editor, window_event_text(editor->window, &completion), completion.text_len);
-            memmove(queue->items + index,
-                    queue->items + index + 1,
-                    (usize)(queue->count - index - 1) * sizeof(WindowEvent));
-            queue->count--;
-            editor->paste_pending = false;
-            continue;
-        }
-        if (editor->event_index == queue->count) {
-            window_clear_events(editor->window);
-            editor->event_index = 0;
-            break;
-        }
-        WindowEvent event = queue->items[editor->event_index++];
-        if (event.type != WINDOW_PASTE)
-            redraw |= editor_event(editor, &event, width, height);
-    }
-    return redraw;
-}
-static u32 editor_rectangles(Editor* editor, f32 width, f32 height) {
-    u32 caret = document_cursor(&editor->document);
-    u32 begin = min(caret, editor->selection_anchor), end = max(caret, editor->selection_anchor);
-    u32 selection_count = begin != end ? layout_selection_rects(&editor->layout, begin, end, NULL, 0) : 0;
-    u32 static_count    = editor->layout.window.rect_count;
-    u64 needed          = (u64)static_count + selection_count + 2;
-    if (needed > editor->rect_capacity) {
-        u32 cap = editor->rect_capacity ? editor->rect_capacity : 64;
-        while (cap < needed && cap < UINT32_MAX / 2)
-            cap *= 2;
-        if (cap < needed) {
-            fprintf(stderr, "Editor rectangle capacity overflow\n");
-            exit(1);
-        }
-        GpuRect* grown = realloc(editor->rects, (usize)cap * sizeof(*grown));
-        if (!grown) {
-            perror("editor rectangles");
-            exit(1);
-        }
-        editor->rects         = grown;
-        editor->rect_capacity = cap;
-    }
-    if (static_count)
-        memcpy(editor->rects, editor->layout.window.rects, (usize)static_count * sizeof(GpuRect));
-    u32 count = static_count;
-    if (selection_count)
-        count += layout_selection_rects(
-            &editor->layout, begin, end, editor->rects + count, editor->rect_capacity - count - 2);
-    f32 top, size;
-    editor_thumb(editor, height, &top, &size);
-    editor->rects[count++] = (GpuRect){width - 12, 0, 12, height, 0xff201b18, GPU_RECT_FIXED};
-    editor->rects[count++] = (GpuRect){width - 9, top, 6, size, 0xffaaa098, GPU_RECT_FIXED};
-    return count;
-}
-
-static int run_editor(const AppOptions* opt) {
-    StartupStamp launch = startup_stamp();
-    Editor       editor = {.path = opt->file, .preferred_x = NAN};
-    const char*  welcome =
-        "# rwmd\n\nA small Markdown editor rendered with Slug.\n\n"
-        "Type to edit. **Bold**, *italic*, `code`, and [links](https://example.org).\n\n"
-        "- Mouse: place the caret or drag to select\n- Wheel or scrollbar: scroll independently of the caret\n"
-        "- Ctrl+Z / Ctrl+Shift+Z: undo / redo\n- Ctrl+C / Ctrl+X / Ctrl+V: clipboard\n"
-        "- Ctrl+S: save the file opened on the command line\n\n"
-        "Open a file with: `./rwmd path/to/document.md`\n";
-    bool loaded;
-    if (opt->file) {
-        loaded = document_load(&editor.document, opt->file);
-        if (!loaded && errno == ENOENT) {
-            document_destroy(&editor.document);
-            loaded = document_init(&editor.document, NULL, 0);
-        }
-    } else
-        loaded = document_init(&editor.document, (const u8*)welcome, (u32)strlen(welcome));
-    if (!loaded) {
-        fprintf(stderr, "rwmd: %s: %s\n", opt->file ? opt->file : "document", document_error(&editor.document));
-        document_destroy(&editor.document);
-        return 1;
-    }
-    editor.saved_state          = document_state_id(&editor.document);
-    StartupStamp document_ready = startup_stamp();
-    Arena        arena          = arena_create();
-    RenderTarget target         = window_create(&arena, opt->width, opt->height);
-    editor.window               = target.window;
-    editor_title(&editor, NULL);
-    if (opt->fullscreen)
-        window_set_fullscreen(target.window);
-    GraphicsContext gc             = graphics_context_create(&arena, &target);
-    RenderContext   rc             = render_context_create(&arena, &gc, &target);
-    RenderState     rs             = create_render_state(&arena, &rc);
-    StartupStamp    graphics_ready = startup_stamp();
-    FontState       font           = font_load(&arena,
-                                               "assets/fonts/JetBrainsMonoNerdFontMono-Regular.ttf",
-                                               opt->font_pt > 0 ? opt->font_pt : opt->font_size,
-                                               opt->font_pt > 0);
-    editor.font                    = &font;
-    TextRenderState trs;
-    text_render_init(&arena, &rc, &font, &trs);
-    layout_init(&editor.layout);
-    editor.layout.parser.profile_callbacks = opt->profile_parser;
-    StartupStamp          text_ready       = startup_stamp();
-    VkQueryPoolCreateInfo qi               = {.sType      = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
-                                              .queryType  = VK_QUERY_TYPE_TIMESTAMP,
-                                              .queryCount = 2 * rc.frames_in_flight};
-    if (gc.timestamp_bits)
-        check_vkresult(vkCreateQueryPool(gc.device, &qi, NULL, &trs.timestamp_pool),
-                       SCOPE_GFX_COMMAND_BUFFER,
-                       "Create editor timestamps");
-    u64  mask = gc.timestamp_bits == 64 ? UINT64_MAX : gc.timestamp_bits ? ((UINT64_C(1) << gc.timestamp_bits) - 1) : 0;
-    bool pending[16] = {0};
-    assert(SCOPE_GFX_INIT, rc.frames_in_flight <= 16);
-    Metric cpu = {0}, gpu = {0}, wall = {0}, publication = {0};
-    u64    uploaded = 0, presented = 0;
-    bool   redraw = true, previous_blink = true, previous_focus = target.window->focused;
-    editor.last_input = monotonic_ms();
-    while (!opt->frames || presented < opt->frames) {
-        f64 frame_start = monotonic_ms();
-        window_poll_events(target.window);
-        f64 work_start = monotonic_ms();
-        f32 width = (f32)target.window->width, height = (f32)target.window->height;
-        redraw |= editor_process_events(&editor, width, height);
-        if (target.window->request_close) {
-            if (editor_dirty(&editor) && !editor.close_armed) {
-                target.window->request_close = false;
-                editor.close_armed           = true;
-                editor_error(&editor, "Unsaved changes: Ctrl+S saves; close again to discard");
-            } else
-                break;
-        }
-        if (!target.window->width || !target.window->height) {
-            window_wait_events(target.window, 100);
-            continue;
-        }
-        if (target.window->width != target.extent.width || target.window->height != target.extent.height) {
-            rc.render_target_resized = true;
-            redraw                   = true;
-        }
-        redraw |= editor_update_layout(&editor, width, height);
-        f64  elapsed = monotonic_ms() - editor.last_input;
-        bool blink   = ((u64)(max(elapsed, 0.0) / 500.0) & 1u) == 0;
-        if (blink != previous_blink || previous_focus != target.window->focused)
-            redraw = true;
-        previous_blink = blink;
-        previous_focus = target.window->focused;
-        if (!redraw && !opt->frames) {
-            u32 wait_ms = (u32)max(1.0, 500.0 - fmod(max(elapsed, 0.0), 500.0));
-            window_wait_events(target.window, wait_ms);
-            continue;
-        }
-        f64 acquire_start = monotonic_ms();
-        if (!start_frame(&arena, &rs)) {
-            redraw = true;
-            continue;
-        }
-        f64 acquire_elapsed = monotonic_ms() - acquire_start;
-        // The compositor may have constrained the requested dimensions.
-        width               = (f32)target.extent.width;
-        height              = (f32)target.extent.height;
-        editor_update_layout(&editor, width, height);
-        u32 slot = (u32)(rs.frame_count % rc.frames_in_flight);
-        if (pending[slot]) {
-            f64 value;
-            u32 count = 0;
-            collect_gpu(&gc, trs.timestamp_pool, slot, mask, gc.properties.limits.timestampPeriod, &value, &count);
-            metric_add(&gpu, value);
-            pending[slot] = false;
-        }
-        u32               rect_count = editor_rectangles(&editor, width, height);
-        CaretVisual       caret      = layout_caret(&editor.layout, document_cursor(&editor.document));
-        TextPushConstants pc    = {.scroll_offset = {0, editor.layout.scroll_y}, .cursor_position = {caret.x, caret.y}};
-        TextFrameStyle    style = {.viewport_scale = {2.0f / width, 2.0f / height},
-                                   .text_color     = {1, 1, 1, 1},
-                                   .cursor_size    = {max(caret.width, 1.0f), caret.height},
-                                   .cursor_color   = 0xffffffff,
-                                   .cursor_visible = caret.visible && blink && target.window->focused &&
-                                                     editor.selection_anchor == document_cursor(&editor.document)};
-        trs.timestamp_base      = slot * 2;
-        f64 publication_start   = monotonic_ms();
-        text_render_frame(&rs,
-                          &trs,
-                          editor.layout.window.glyphs,
-                          editor.layout.window.glyph_count,
-                          editor.rects,
-                          rect_count,
-                          style,
-                          pc,
-                          editor.layout.window.revision);
-        f64 work_end = monotonic_ms();
-        metric_add(&publication, work_end - publication_start);
-        pending[slot] = trs.timestamp_pool != VK_NULL_HANDLE;
-        end_frame(&arena, &rs);
-        metric_add(&cpu, work_end - work_start - acquire_elapsed);
-        metric_add(&wall, monotonic_ms() - frame_start);
-        uploaded += trs.last_upload_bytes;
-        if (!presented) {
-            printf("Editor: %s | %u bytes | GPU: %s\n",
-                   opt->file ? opt->file : "Untitled",
-                   document_length(&editor.document),
-                   gc.properties.deviceName);
-            startup_phase("load document", launch, document_ready);
-            startup_phase("window/device", document_ready, graphics_ready);
-            startup_phase("font/Slug", graphics_ready, text_ready);
-            startup_phase("init -> first present", launch, startup_stamp());
-            printf("Surface: %ux%u | input driven; caret=%u | Ctrl+S saves, Ctrl+Z undoes\n",
-                   target.extent.width,
-                   target.extent.height,
-                   document_cursor(&editor.document));
-            fflush(stdout);
-        }
-        presented++;
-        redraw = false;
-    }
-    vkDeviceWaitIdle(gc.device);
-    for (u32 slot = 0; slot < rc.frames_in_flight; slot++)
-        if (pending[slot]) {
-            f64 value;
-            u32 count = 0;
-            collect_gpu(&gc, trs.timestamp_pool, slot, mask, gc.properties.limits.timestampPeriod, &value, &count);
-            metric_add(&gpu, value);
-        }
-    metric_report("Document mutation", &editor.edits);
-    metric_report("Source mirror", &editor.mirror);
-    metric_report("Edit invalidation/anchors", &editor.invalidation);
-    metric_report("Syntax update total", &editor.parsing);
-    metric_report("  Parser total (inclusive)", &editor.parser_total);
-    metric_report("    Block scan/references", &editor.block_scan);
-    metric_report("    Inline/events (inclusive)", &editor.inline_events);
-    if (opt->profile_parser)
-        metric_report("    Callbacks (nested)", &editor.callbacks);
-    else
-        printf("    Callback timing disabled; --profile-parser enables per-event clocks.\n");
-    metric_report("  Index finalization", &editor.index_finalization);
-    metric_report("  Grapheme checkpoints", &editor.graphemes);
-    metric_report("  Cache selection/publication", &editor.cache_publication);
-    metric_report("Window layout", &editor.layout_time);
-    metric_report("GPU upload/record CPU", &publication);
-    const MdParserProfile* parser = &editor.parser_counters;
-    printf("Parser work: %lu full | %lu local | %lu bytes | max %lu bytes/syntax update | %lu events\n",
-           editor.full_parses,
-           editor.local_parses,
-           parser->input_bytes,
-           editor.largest_parse_update,
-           parser->event_count);
-    printf("Parser arena: %lu allocation requests | %lu reallocations | %.3f KiB copied | %lu chunk growths\n",
-           parser->allocations,
-           parser->reallocations,
-           (f64)parser->realloc_copied_bytes / 1024.0,
-           parser->arena_growths);
-    printf("Parser scratch: peak %.3f KiB | retained %.3f KiB; reset after each parse.\n",
-           (f64)parser->arena_peak_bytes / 1024.0,
-           (f64)parser->arena_capacity_bytes / 1024.0);
-    printf("Syntax timing samples are updates, including any local attempt plus full fallback; nested times are not "
-           "additive.\n");
-    metric_report("Editor CPU work", &cpu);
-    metric_report("GPU render", &gpu);
-    metric_report("Wall frame", &wall);
-    printf("Editor frames: %lu | uploaded %.3f KiB | document %u bytes\n",
-           presented,
-           (f64)uploaded / 1024.0,
-           document_length(&editor.document));
-    report_memory(&trs, &arena);
-    if (trs.timestamp_pool)
-        vkDestroyQueryPool(gc.device, trs.timestamp_pool, NULL);
-    text_render_cleanup(&gc, &trs);
-    cleanup_render_state(&rs);
-    cleanup_render_context(&rc);
-    cleanup_render_target(&gc, &target);
-    cleanup_graphics_ctx(&gc);
-    close_window(target.window);
-    layout_destroy(&editor.layout);
-    document_destroy(&editor.document);
-    free(editor.rects);
-    font_destroy(&font);
-    arena_destroy(&arena);
-    return 0;
-}
+#undef RWMD_MARKDOWN_IMPLEMENTATION
 
 int main(int argc, char** argv) {
-    AppOptions opt      = {.width = 1920, .height = 1080, .columns = 100, .rows = 100, .font_size = 32, .warmup = 200};
-    bool       size_set = false;
+    Arena        general_arena = arena_create();
+    ScratchArena scratch_arena = scratch_create();
+
+    InputContext input_ctx = input_ctx_create(&general_arena);
+
+    RenderTarget render_target = window_create(&general_arena, 1920, 1080);
+
+    GraphicsContext gfx_ctx = graphics_context_create(&general_arena, &render_target);
+
+    RenderContext render_ctx = render_context_create(&general_arena, &gfx_ctx, &render_target);
+
+    InputState  input_state  = input_create_state(&input_ctx);
+    RenderState render_state = create_render_state(&general_arena, &render_ctx);
+
     for (int i = 1; i < argc; i++) {
         const char* arg = argv[i];
-        if (!strcmp(arg, "--help")) {
-            printf(
-                "Usage: %s [file.md] [--file PATH] [--font-pt N | --font-size N]\n"
-                "  [--width N] [--height N] [--fullscreen] [--frames N] [--profile-parser]\n"
-                "  [--benchmark [--scene text|grid] [--warmup N] [--columns N] [--rows N]\n"
-                "               [--animate] [--update-every-frame]]\n"
-                "Without --benchmark, opens an input-driven Markdown editor (default 14pt).\n"
-                "Ctrl+S saves; Ctrl+Z/Ctrl+Shift+Z undo/redo; Ctrl+C/X/V clipboard; mouse selection and scrolling.\n"
-                "An unsaved document requires closing twice to discard. --frames limits editor rendering for smoke "
-                "checks.\n"
-                "--profile-parser adds nested callback timing; coarse phases and arena counters are always reported.\n"
-                "Benchmark defaults: 2000 measured +200 warmup frames, 32px height, 1920x1080.\n",
-                argv[0]);
+        if (strcmp(arg, "--help") == 0) {
+            printf("Usage: %s [file.md]", argv[0]);
             return 0;
         }
-        if (!strcmp(arg, "--benchmark")) {
-            opt.benchmark = true;
-            continue;
-        }
-        if (!strcmp(arg, "--profile-parser")) {
-            opt.profile_parser = true;
-            continue;
-        }
-        if (!strcmp(arg, "--fullscreen")) {
-            opt.fullscreen = true;
-            continue;
-        }
-        if (!strcmp(arg, "--animate")) {
-            opt.animate = true;
-            continue;
-        }
-        if (!strcmp(arg, "--update-every-frame")) {
-            opt.update_every_frame = true;
-            continue;
-        }
-        if (!strcmp(arg, "--")) {
-            if (opt.file || i + 2 != argc) {
-                fprintf(stderr, "Expected one file after --\n");
-                return 2;
+    }
+    // TODO these should return a checkpoint I can pass back in at rollback/pop stage
+    arena_ckpt(&general_arena);
+
+    // TODO check fps before descriptor set commit & after, feels like MASSIVE regression
+
+    u64 frame_start_arena_len = general_arena.len;
+    f32 dt;
+    f32 start = (f32)clock() / (f32)CLOCKS_PER_SEC - 0.01f; // give us a bit of dt right at the start
+
+    time_checkpoint(SCOPE_DEBUG, "render loop start", app_profiling_time);
+
+    f32 last_frame_start = start;
+    // window_set_fullscreen(render_target.window);
+    while (true) {
+        f32 now          = (f32)clock() / (f32)CLOCKS_PER_SEC;
+        dt               = now - last_frame_start;
+        last_frame_start = now;
+
+        // TODO this should be in render_target? not calling window stuff directly
+        window_poll_events(render_target.window);
+
+        // TODO this is temp, find a better way. A passthrough bitflag struct to the window struct?
+        if (unlikely(render_target.window->width != render_target.extent.width ||
+                     render_target.window->height != render_target.extent.height)) {
+            render_ctx.render_target_resized = true;
+
+            struct timespec ts;
+            ts.tv_sec  = 10 / 1000;
+            ts.tv_nsec = (10 % 1000) * 1000000;
+            while (render_target.window->width == 0 || render_target.window->height == 0) {
+                window_poll_events(render_target.window);
+
+                nanosleep(&ts, &ts);
+
+                // createSwapChain();
+                // createImageViews();
+                // createFramebuffers();
             }
-            opt.file = argv[++i];
+
+            // TODO only update this after the swapchain was updated?
+            camera_update_lens(&camera, render_target.window->width, render_target.window->height);
+        }
+
+        time_checkpoint(SCOPE_DEBUG, "window events", app_profiling_time);
+
+        input_update(&input_state);
+
+        time_checkpoint(SCOPE_DEBUG, "input events", app_profiling_time);
+
+        if (input_state.lock_mouse) {         // && render_target.window->locked_pointer == NULL) {
+            window_lock_pointer(render_target.window);
+        } else if (!input_state.lock_mouse) { // && render_target.window->locked_pointer != NULL) {
+            window_unlock_pointer(render_target.window);
+        }
+
+        time_checkpoint(SCOPE_DEBUG, "pointer lock", app_profiling_time);
+
+        // anim_walk_forwards(&scratch_arena, &anim_ctx, &anim_state);
+        // anim_update(&scratch_arena, &anim_state, dt);
+        // scratch_reset(&scratch_arena);
+
+        // FIX TEMP
+        // Rotor3 stripped   = camera.current.direction;
+        // stripped.bivec.yz = 0.0f;
+        // stripped.bivec.xy = 0.0f;
+        // rotor3_normalize_ip(&stripped);
+        // player.physics_entity->rotation = stripped;
+
+        // player_move(&player, &input_state);
+        // player_update(&player, dt);
+        //
+        // // DEBUG_LOG("<FRAME");
+        // // // dump_vec3(player.physics_entity->position);
+        // // dump_rotor3(player.physics_entity->rotation);
+        // // DEBUG_LOG("FRAME>");
+        //
+        // Transform player_transform = player.physics_entity->transform;
+        // // player_transform.rotation  = rotor3_from_vec3_to_vec3(
+        // //     vec3_unit_z(), vec3_normalize(vec3_sub(player.physics_entity->position, camera.target.position)));
+        // // camera_set_target(&camera, player_transform);
+        // camera_set_target_pos(&camera, player_transform.pos);
+        //
+        // if (input_state.lock_cam) {
+        //     // ideally slow the glerping here
+        //     // also maybe we need something other than a glerp?
+        //     // the expensive slerp?
+        //     camera_set_target_dir(&camera, player_transform.rotation);
+        //     // dump_rotor3(camera.current.direction);
+        //
+        //     // if (input_ctx.key_delete) {
+        //     //     DEBUG_LOG("Current: ");
+        //     //     dump_rotor3(camera.current.direction);
+        //     //     DEBUG_LOG("Target: ");
+        //     //     dump_rotor3(camera.target.direction);
+        //     //     DEBUG_LOG(" - ");
+        //     // }
+        // } else {
+        //     camera_rotate_yaw_pitch(
+        //         &camera, (f32)input_state.cam_right * 1.0f * dt, (f32)input_state.cam_forward * 1.0f * dt);
+        // }
+
+        if (input_state.lock_mouse) {
+            camera_rotate_yaw_pitch(
+                &camera, (f32)input_state.cam_right * 1.0f * dt, (f32)input_state.cam_forward * 1.0f * dt);
+            camera_zoom(&camera, input_state.up * dt);
+            camera_rotate_yaw_pitch(&camera, (f32)input_state.right * 1.0f * dt, (f32)input_state.forward * 1.0f * dt);
+        } else {
+            camera_rotate_yaw_pitch(
+                &camera, (f32)input_state.cam_right * 1.0f * dt, (f32)input_state.cam_forward * 1.0f * dt);
+            // BUG this is moving the camera, NOT the target?
+            camera_translate_target(&camera,
+                                    (Vec3){
+                                        .x = 100.0f * input_state.right * dt,
+                                        .y = 10.0f * input_state.up * dt,
+                                        .z = 100.0f * input_state.forward * dt,
+                                    });
+        }
+
+        // TODO this seems to have about 1200ns of latency. From printing + gettime??
+        time_checkpoint(SCOPE_DEBUG, "camera input", app_profiling_time);
+
+        camera_update(&camera, dt);
+        time_checkpoint(SCOPE_DEBUG, "camera update", app_profiling_time);
+        camera_matrices = camera_get_matrices(&camera);
+        time_checkpoint(SCOPE_DEBUG, "camera get mats", app_profiling_time);
+
+        camera_ubo.world_to_clip = mat4_mul(camera_matrices.view_to_clip, camera_matrices.world_to_view);
+        // TODO this should come from camera_matrices, rename to cam_state
+        camera_ubo.cam_offset    = camera_matrices.cam_location;
+
+        scene_data_update(&render_state, camera_ubo);
+        // dump_mat4(camera_ubo.world_to_clip);
+
+        time_checkpoint(SCOPE_DEBUG, "scene_data_update", app_profiling_time);
+
+        // physics_update(&scratch_arena, &physics_state, dt);
+        //
+        // time_checkpoint(SCOPE_DEBUG, "physics_update", app_profiling_time);
+
+        // TODO check if render_target is 0 size and just loop on
+        // poll input/events, this applies to minimized window
+        u32 start_frame_result = start_frame(&general_arena, &render_state);
+        if (!start_frame_result) {
+            continue;
+        }
+
+        time_checkpoint(SCOPE_DEBUG, "start_frame", app_profiling_time);
+
+        // TODO use this!
+        // instance_update(dragon_inst, model_ubo);
+
+        draw_frame(&render_state);
+
+        time_checkpoint(SCOPE_DEBUG, "draw_frame", app_profiling_time);
+
+        end_frame(&general_arena, &render_state);
+
+        time_checkpoint(SCOPE_DEBUG, "end_frame", app_profiling_time);
+
+        if (render_target.window->request_close == true) {
             break;
         }
-        if (arg[0] != '-') {
-            if (opt.file) {
-                fprintf(stderr, "Only one document may be opened\n");
-                return 2;
-            }
-            opt.file = arg;
-            continue;
-        }
-        if (++i == argc) {
-            fprintf(stderr, "Missing value for %s\n", arg);
-            return 2;
-        }
-        if (!strcmp(arg, "--file")) {
-            if (opt.file) {
-                fprintf(stderr, "Only one document may be opened\n");
-                return 2;
-            }
-            opt.file = argv[i];
-            continue;
-        }
-        if (!strcmp(arg, "--scene")) {
-            if (!strcmp(argv[i], "grid"))
-                opt.grid = true;
-            else if (!strcmp(argv[i], "text"))
-                opt.grid = false;
-            else {
-                fprintf(stderr, "Scene must be text or grid\n");
-                return 2;
-            }
-            continue;
-        }
-        char* end;
-        if (!strcmp(arg, "--font-pt")) {
-            f32 value = strtof(argv[i], &end);
-            if (!*argv[i] || *end || !isfinite(value) || value < 1 || value > 128) {
-                fprintf(stderr, "Font points must be a number in 1..128\n");
-                return 2;
-            }
-            opt.font_pt = value;
-            size_set    = true;
-            continue;
-        }
-        unsigned long value = strtoul(argv[i], &end, 10);
-        if (!*argv[i] || *end || value > 1000000 || (!value && strcmp(arg, "--warmup"))) {
-            fprintf(stderr, "Invalid numeric value for %s: %s\n", arg, argv[i]);
-            return 2;
-        }
-        if (!strcmp(arg, "--frames"))
-            opt.frames = (u32)value;
-        else if (!strcmp(arg, "--warmup"))
-            opt.warmup = (u32)value;
-        else if (!strcmp(arg, "--width"))
-            opt.width = (u32)value;
-        else if (!strcmp(arg, "--height"))
-            opt.height = (u32)value;
-        else if (!strcmp(arg, "--columns"))
-            opt.columns = (u32)value;
-        else if (!strcmp(arg, "--rows"))
-            opt.rows = (u32)value;
-        else if (!strcmp(arg, "--font-size")) {
-            opt.font_size = (f32)value;
-            opt.font_pt   = 0;
-            size_set      = true;
-        } else {
-            fprintf(stderr, "Unknown option: %s\n", arg);
-            return 2;
-        }
+
+        arena_rollback(&general_arena);
+        assert(SCOPE_MEM_ARENA, frame_start_arena_len == general_arena.len);
+
+        time_checkpoint(SCOPE_DEBUG, "arena_rollback", app_profiling_time);
+
+        scratch_reset(&scratch_arena);
+
+        time_checkpoint(SCOPE_DEBUG, "scratch_reset", app_profiling_time);
+
+        // if (render_state.frame_count > 5) {
+        // break;
+        // }
     }
-    if ((u64)opt.columns * opt.rows > 65536 || opt.width < 64 || opt.height < 64 || opt.width > 16384 ||
-        opt.height > 16384 || (opt.font_pt == 0 && (opt.font_size < 4 || opt.font_size > 512))) {
-        fprintf(stderr, "Limits: grid <=65536 cells, extent64..16384, pixel font size4..512\n");
-        return 2;
-    }
-    if (!size_set)
-        opt.font_pt = 14;
-    return run_editor(&opt);
+
+    f32 end       = (f32)clock() / (f32)CLOCKS_PER_SEC;
+    f32 full_time = end - start;
+    DEBUG_LOG(SCOPE_DEBUG,
+              "%u frames in %fs for %f fps",
+              render_state.frame_count,
+              full_time,
+              (f32)render_state.frame_count / full_time);
+
+    // /sys/devices/system/cpu/cpu31/cache/index3/size
+    // P & E cores
+    // /sys/devices/cpu_core/cpus: Lists all P-cores.
+    // /sys/devices/cpu_atom/cpus: Lists all E-cores.
+
+    INFO_LOG(SCOPE_SHUTDOWN, "CLOSING Application!");
+
+    cleanup_render_state(&render_state);
+
+    cleanup_render_context(&render_ctx);
+    cleanup_render_target(&gfx_ctx, &render_target);
+    cleanup_graphics_ctx(&gfx_ctx);
+    close_window(render_target.window);
+
+    input_cleanup(&input_ctx);
+
+    // TODO probably don't need to do this manually.
+    // Maybe error check that arena.len = 0 so we can reason about allocs?
+    arena_destroy(&general_arena);
+    scratch_destroy(&scratch_arena);
+
+    print_log_summary();
+
+    INFO_LOG(SCOPE_SHUTDOWN, "Application CLOSED!");
+
+    return 0;
 }

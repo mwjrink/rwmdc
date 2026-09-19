@@ -1,102 +1,110 @@
 #pragma once
 
+#include <lib/grim/assert.h>
 #include <lib/grim/bp.h>
+#include <lib/grim/math.h>
 #include <lib/grim/mem/arena.h>
-#include <stdbool.h>
+#include <lib/grim/mem/buff.h>
+
+// TODO find a way to do this & share the vertex type
+// Maybe a separate gfx_types.h file that does not include
+// this then we include that and rune types here?
+#include <lib/grim/gfx/types.h>
+#include <lib/grim/rune/types.h>
+
+// ====================================================================================================================
+// =                                                    Types                                                         =
+// ====================================================================================================================
+
+// TODO I need a static assert that this is byte identical to Cluster becuase right now I treat them as such
+// BETTER: Get rid of this or the other one. No need to have 2 copies
+typedef struct GpuCluster {
+    alignas(8) u32 idx_offset;
+    u32 vtx_offset;
+
+    struct {
+        u8 vtx_count;
+        u8 tri_count;
+
+        u8 _padding[2];
+    };
+
+    ClusterBounds bounds;
+} GpuCluster;
+STATIC_ASSERT(sizeof(GpuCluster) == 32);
+
 #include <vulkan/vulkan.h>
 
-typedef struct GrimWindow GrimWindow;
+// ====================================================================================================================
+// =                                                  Functions                                                       =
+// ====================================================================================================================
 
-typedef struct GraphicsContext {
-    VkInstance instance;
-    VkPhysicalDevice physical_device;
-    VkDevice device;
-    VkPhysicalDeviceProperties properties;
-    VkPhysicalDeviceMemoryProperties memory_properties;
-    u32 graphics_family;
-    u32 present_family;
-    u32 timestamp_bits;
-    VkQueue graphics_queue;
-    VkQueue present_queue;
-#ifdef __DEBUG
-    VkDebugUtilsMessengerEXT debug_messenger;
-#endif
-} GraphicsContext;
+// ================  Render Target  ================
 
-typedef struct Buffer {
-    VkBuffer handle;
-    VkDeviceMemory memory;
-    u64 size;
-    VkDeviceAddress address;
-    void *mapped;
-    u64 allocation_size;
-    VkMemoryPropertyFlags properties;
-} Buffer;
+RenderTarget window_create(rop(rw Arena) arena, ro u32 width, ro u32 height);
 
-typedef struct Image {
-    VkImage handle;
-    VkImageView view;
-} Image;
+// ================  Context  ================
 
-typedef struct Pipeline {
-    VkPipeline handle;
-    VkPipelineLayout layout;
-} Pipeline;
+GraphicsContext graphics_context_create(rop(rw Arena) arena, rop(rw RenderTarget) render_target);
 
+void cleanup_graphics_ctx(rop(rw GraphicsContext) ctx);
+void cleanup_render_target(rop(ro GraphicsContext) ctx, rop(rw RenderTarget) render_target);
+void render_target_update_extent(rop(rw RenderTarget) render_target);
 
-typedef struct Swapchain {
-    VkSwapchainKHR handle;
-    Image *images;
-    VkSemaphore *render_finished;
-    u32 image_count;
-    VkPresentModeKHR present_mode;
-} Swapchain;
+// ================  Command Pool & Buffer ================
 
-typedef struct RenderTarget {
-    GrimWindow *window;
-    VkSurfaceKHR surface;
-    Swapchain swapchain;
-    VkExtent2D extent;
-    VkFormat format;
-    VkColorSpaceKHR color_space;
-} RenderTarget;
+CommandPool    create_command_pool(rop(ro GraphicsContext) ctx, ro u32 queue_idx);
+CommandPool    create_command_pool(rop(ro GraphicsContext) ctx, ro u32 queue_idx);
+CommandBuffer* create_command_buffers(rop(rw Arena) arena,
+                                      rop(ro GraphicsContext) ctx,
+                                      rop(rw CommandPool) pool,
+                                      ro u32 buffer_count);
 
-typedef struct FrameSlot {
-    VkCommandPool pool;
-    VkCommandBuffer command_buffer;
-    VkFence fence;
-    VkSemaphore image_available;
-} FrameSlot;
+void cleanup_command_pool(rop(ro GraphicsContext) ctx, rop(rw CommandPool) command_pool);
+// void cleanup_command_buffer(rop(ro GraphicsContext) ctx, CommandPool* command_pool);
 
-typedef struct RenderContext {
-    const GraphicsContext *ctx;
-    RenderTarget *target;
-    u32 frames_in_flight;
-    bool render_target_resized;
-    FrameSlot slots[2];
-} RenderContext;
+// ================  Commands  ================
 
-typedef struct RenderState {
-    RenderContext *r_ctx;
-    u64 frame_count;
-    u32 image_idx;
-} RenderState;
+RecordingState begin_recording(rop(ro GraphicsContext) ctx,
+                               rop(ro CommandBuffer) command_buffer,
+                               rop(ro Pipeline) pipeline,
+                               rop(ro RenderTarget) render_target,
+                               ro u32 frame_idx);
+void           end_recording(rop(ro GraphicsContext) ctx, rop(rw RecordingState) state);
 
-RenderTarget window_create(Arena *arena, u32 width, u32 height);
-GraphicsContext graphics_context_create(Arena *arena, RenderTarget *target);
-RenderContext render_context_create(Arena *arena, const GraphicsContext *ctx, RenderTarget *target);
-RenderState create_render_state(Arena *arena, RenderContext *rc);
-bool start_frame(Arena *arena, RenderState *rs);
-VkCommandBuffer render_command_buffer(const RenderState *rs);
-void enqueue_submit_graphics(RenderState *rs);
-void end_frame(Arena *arena, RenderState *rs);
-void cleanup_render_state(RenderState *rs);
-void cleanup_render_context(RenderContext *rc);
-void cleanup_render_target(const GraphicsContext *ctx, RenderTarget *target);
-void cleanup_graphics_ctx(GraphicsContext *ctx);
-Buffer buffer_create(const GraphicsContext *ctx, u64 size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties);
-void buffer_host_copy(const GraphicsContext *ctx, Buffer *buffer, const void *data, u64 bytes, u64 offset);
-void cleanup_buffer(const GraphicsContext *ctx, Buffer *buffer);
-VkImageView create_image_view(const GraphicsContext *ctx, VkImage image, VkFormat format);
-VkShaderModule read_shader(Arena *arena, const GraphicsContext *ctx, const char *path);
-void cleanup_pipeline(const GraphicsContext *ctx, Pipeline *pipeline);
+// ================  Buffer  ================
+
+// TODO not sure if this should be internal
+Buffer buffer_create(rop(ro GraphicsContext) ctx, u64 size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties);
+void   cleanup_buffer(rop(ro GraphicsContext) ctx, rop(rw Buffer) buffer);
+
+// ================  Image  ================
+
+Image create_image(rop(ro GraphicsContext) ctx,
+                   u32                      width,
+                   u32                      height,
+                   VkFormat                 format,
+                   VkImageTiling            tiling,
+                   VkImageUsageFlagBits     usage,
+                   VkMemoryPropertyFlagBits mem_properties);
+
+// ================  Rendering  ================
+
+RenderContext render_context_create(rop(rw Arena) arena,
+                                    rop(ro GraphicsContext) ctx,
+                                    rop(rw RenderTarget) render_target);
+RenderState   create_render_state(rop(rw Arena) arena, rop(rw RenderContext) r_ctx);
+AssetHandle   load_model(rop(rw RenderState) render_state, rop(ro Model) model);
+
+u8   start_frame(rop(rw Arena) arena, rop(rw RenderState) render_state);
+u8   update_cam_ubo_frame(rop(rw Arena) arena, rop(rw RenderState) render_state, rop(ro CameraUbo) ubo);
+u8   update_model_ubos_frame(rop(rw Arena) arena, rop(rw RenderState) render_state, AllocDynList ubo);
+void draw_frame(rop(rw RenderState) render_state);
+void end_frame(rop(rw Arena) arena, rop(rw RenderState) render_state);
+
+void cleanup_render_state(rop(rw RenderState) render_state);
+void cleanup_render_context(rop(rw RenderContext) r_ctx);
+
+// ====================================================================================================================
+// =                                                  Imports =
+// ====================================================================================================================
