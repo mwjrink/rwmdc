@@ -251,8 +251,6 @@ internal FontAtlas slug_build_atlas(rop(rw Arena) arena, rop(rw ScratchArena) sc
     memory_copy(font_data + curves_off, packed, curves_bytes);
     memory_copy(font_data + band_off, words, band_bytes);
 
-    scratch_reset(scratch);
-
     FontAtlas atlas = {
         .data            = font_data,
         .total_bytes     = total,

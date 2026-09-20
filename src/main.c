@@ -7,6 +7,8 @@
 #include <lib/grim/text/font.h>
 #include <lib/grim/text/slug.h>
 
+#include <config.h>
+
 // FIXME TEMP
 #include <lib/grim/gfx/internal_graphics.h>
 
@@ -36,6 +38,17 @@ int main(int argc, char** argv) {
 
     RenderContext render_ctx = render_context_create(&general_arena, &gfx_ctx, &render_target);
 
+    Theme       theme;
+    AppSettings settings;
+    Str         font_path;
+    {
+        ConfigParseResult parsed_config = config_load(&scratch_arena);
+
+        theme     = parsed_config.theme;
+        settings  = parsed_config.settings;
+        font_path = parsed_config.font_path;
+    }
+
     // TODO list:
     // - load/parse the config
     //   - use config to load font
@@ -45,9 +58,16 @@ int main(int argc, char** argv) {
     // - set up saving thread
 
     arena_ckpt(&general_arena);
-    // TODO use a loading arena here which is separate.
-    TTFont    font  = font_load(&general_arena, &scratch_arena, "");
-    FontAtlas atlas = slug_build_atlas(&general_arena, &scratch_arena, &font, 1.0f);
+    // TODO use a loading arena here which is separate. ENSURE scratch is NOT reset internally
+    TTFont    font  = font_load(&general_arena, &scratch_arena, font_path.data);
+    FontAtlas atlas = slug_build_atlas(&general_arena, &scratch_arena, &font, settings.font.size);
+
+    Editor   editor   = editor_create();
+    Document document = document_create();
+
+    // this invalidates font_path
+    scratch_reset(&scratch_arena);
+    font_path = (Str){0}; // just to be clear.
 
     InputState  input_state  = input_create_state(&input_ctx);
     RenderState render_state = create_render_state(&general_arena, &render_ctx, &atlas);

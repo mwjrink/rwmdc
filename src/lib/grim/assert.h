@@ -4,6 +4,7 @@
 #undef assert
 
 #define STATIC_ASSERT(condition) typedef char p__LINE__[(condition) ? 1 : -1]
+#define STATIC_ASSERT_EXPR(cond) ((void)sizeof(struct { int failure : (cond) ? 1 : -1; }))
 
 #if !defined(ENABLE_ASSERT)
 #define ENABLE_ASSERT 1
