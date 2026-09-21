@@ -112,6 +112,7 @@ typedef enum Severity {
                                                                                                                        \
     X(FONT_LOAD, LEVEL_WARNING)                                                                                        \
     X(CONFIG, LEVEL_WARNING)                                                                                           \
+    X(DOCUMENT, LEVEL_WARNING)                                                                                         \
                                                                                                                        \
     X(INPUT_LINUX, LEVEL_WARNING)                                                                                      \
     X(PERF_LINUX, LEVEL_WARNING)                                                                                       \
@@ -436,9 +437,9 @@ u64 _clock_nano() {
 
 #define time_checkpoint(scope, ckpt, start)                                                                            \
     do {                                                                                                               \
-        u64 now = _clock_nano();                                                                                       \
-        u64 _dt = now - start;                                                                                         \
-        start   = now;                                                                                                 \
+        u64 _now = _clock_nano();                                                                                      \
+        u64 _dt  = _now - start;                                                                                       \
+        start    = _now;                                                                                               \
                                                                                                                        \
         DEBUG_LOG(scope, ckpt " took: %lu ns", _dt);                                                                   \
     } while (0)

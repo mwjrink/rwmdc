@@ -33,6 +33,7 @@ typedef struct {
     u32 selection_bg;
     u32 cursor;
 } Theme;
+STATIC_ASSERT(sizeof(Theme) == 40);
 
 typedef struct {
     struct {
@@ -59,18 +60,21 @@ typedef struct {
         u32 ligatures : 1;
     } font;
 } AppSettings;
+STATIC_ASSERT(sizeof(AppSettings) == 32);
 
 typedef struct {
     Theme       theme;
     AppSettings settings;
     Str         font_path;
 } ConfigParseResult;
+STATIC_ASSERT(sizeof(ConfigParseResult) == 88);
 
 typedef struct {
     char* data;
     u32   pos;
     u32   len;
 } ReadCursor;
+STATIC_ASSERT(sizeof(ReadCursor) == 16);
 
 internal AppSettings config_settings_default() {
     return (AppSettings){

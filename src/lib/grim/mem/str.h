@@ -31,8 +31,9 @@ STATIC_ASSERT(sizeof(Str) == 16);
 Str str_from_cstring(char* string) {
     u32 len = (u32)strlen(string);
     return (Str){
-        .data = string,
-        .len  = len,
+        .data            = string,
+        .len             = len,
+        .null_terminated = true,
     };
 }
 

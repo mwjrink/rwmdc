@@ -8,6 +8,8 @@
 #include <lib/grim/text/slug.h>
 
 #include <config.h>
+#include <document.h>
+#include <editor.h>
 
 // FIXME TEMP
 #include <lib/grim/gfx/internal_graphics.h>
@@ -19,13 +21,18 @@
 int main(int argc, char** argv) {
     u64 app_profiling_time = time_start();
 
+    Str document_path = {0};
     for (int i = 1; i < argc; i++) {
-        const char* arg = argv[i];
-        if (strcmp(arg, "--help") == 0) {
+        Str arg = str_from_cstring(argv[i]);
+        if (str_equals(arg, str_create("--help")) || str_equals(arg, str_create("-h"))) {
             printf("Usage: %s [file.md]", argv[0]);
             return 0;
+        } else {
+            document_path = arg;
         }
     }
+
+    assert(SCOPE_LOAD, document_path.len != 0);
 
     Arena        general_arena = arena_create();
     ScratchArena scratch_arena = scratch_create();
@@ -62,8 +69,7 @@ int main(int argc, char** argv) {
     TTFont    font  = font_load(&general_arena, &scratch_arena, font_path.data);
     FontAtlas atlas = slug_build_atlas(&general_arena, &scratch_arena, &font, settings.font.size);
 
-    Editor   editor   = editor_create();
-    Document document = document_create();
+    Editor editor = editor_create(&general_arena, settings, document_path);
 
     // this invalidates font_path
     scratch_reset(&scratch_arena);
@@ -106,23 +112,16 @@ int main(int argc, char** argv) {
             struct timespec ts;
             ts.tv_sec  = 10 / 1000;
             ts.tv_nsec = (10 % 1000) * 1000000;
-            while (render_target.window->width == 0 || render_target.window->height == 0) {
-                window_poll_events(render_target.window);
-
+            if (render_target.window->width == 0 || render_target.window->height == 0) {
                 nanosleep(&ts, &ts);
-
-                // createSwapChain();
-                // createImageViews();
-                // createFramebuffers();
+                continue;
             }
-
-            // TODO only update this after the swapchain was updated?
-            camera_update_lens(&camera, render_target.window->width, render_target.window->height);
         }
 
         time_checkpoint(SCOPE_DEBUG, "window events", app_profiling_time);
 
-        input_update(&input_state);
+        input_update(&input_state); // should do a sleep for ~500us or intrinsic to wait on input interrupt. we only
+                                    // need to render on input.
 
         time_checkpoint(SCOPE_DEBUG, "input events", app_profiling_time);
 
@@ -132,89 +131,9 @@ int main(int argc, char** argv) {
             window_unlock_pointer(render_target.window);
         }
 
-        time_checkpoint(SCOPE_DEBUG, "pointer lock", app_profiling_time);
+        editor_data_update(&render_state, camera_ubo);
 
-        // anim_walk_forwards(&scratch_arena, &anim_ctx, &anim_state);
-        // anim_update(&scratch_arena, &anim_state, dt);
-        // scratch_reset(&scratch_arena);
-
-        // FIX TEMP
-        // Rotor3 stripped   = camera.current.direction;
-        // stripped.bivec.yz = 0.0f;
-        // stripped.bivec.xy = 0.0f;
-        // rotor3_normalize_ip(&stripped);
-        // player.physics_entity->rotation = stripped;
-
-        // player_move(&player, &input_state);
-        // player_update(&player, dt);
-        //
-        // // DEBUG_LOG("<FRAME");
-        // // // dump_vec3(player.physics_entity->position);
-        // // dump_rotor3(player.physics_entity->rotation);
-        // // DEBUG_LOG("FRAME>");
-        //
-        // Transform player_transform = player.physics_entity->transform;
-        // // player_transform.rotation  = rotor3_from_vec3_to_vec3(
-        // //     vec3_unit_z(), vec3_normalize(vec3_sub(player.physics_entity->position, camera.target.position)));
-        // // camera_set_target(&camera, player_transform);
-        // camera_set_target_pos(&camera, player_transform.pos);
-        //
-        // if (input_state.lock_cam) {
-        //     // ideally slow the glerping here
-        //     // also maybe we need something other than a glerp?
-        //     // the expensive slerp?
-        //     camera_set_target_dir(&camera, player_transform.rotation);
-        //     // dump_rotor3(camera.current.direction);
-        //
-        //     // if (input_ctx.key_delete) {
-        //     //     DEBUG_LOG("Current: ");
-        //     //     dump_rotor3(camera.current.direction);
-        //     //     DEBUG_LOG("Target: ");
-        //     //     dump_rotor3(camera.target.direction);
-        //     //     DEBUG_LOG(" - ");
-        //     // }
-        // } else {
-        //     camera_rotate_yaw_pitch(
-        //         &camera, (f32)input_state.cam_right * 1.0f * dt, (f32)input_state.cam_forward * 1.0f * dt);
-        // }
-
-        if (input_state.lock_mouse) {
-            camera_rotate_yaw_pitch(
-                &camera, (f32)input_state.cam_right * 1.0f * dt, (f32)input_state.cam_forward * 1.0f * dt);
-            camera_zoom(&camera, input_state.up * dt);
-            camera_rotate_yaw_pitch(&camera, (f32)input_state.right * 1.0f * dt, (f32)input_state.forward * 1.0f * dt);
-        } else {
-            camera_rotate_yaw_pitch(
-                &camera, (f32)input_state.cam_right * 1.0f * dt, (f32)input_state.cam_forward * 1.0f * dt);
-            // BUG this is moving the camera, NOT the target?
-            camera_translate_target(&camera,
-                                    (Vec3){
-                                        .x = 100.0f * input_state.right * dt,
-                                        .y = 10.0f * input_state.up * dt,
-                                        .z = 100.0f * input_state.forward * dt,
-                                    });
-        }
-
-        // TODO this seems to have about 1200ns of latency. From printing + gettime??
-        time_checkpoint(SCOPE_DEBUG, "camera input", app_profiling_time);
-
-        camera_update(&camera, dt);
-        time_checkpoint(SCOPE_DEBUG, "camera update", app_profiling_time);
-        camera_matrices = camera_get_matrices(&camera);
-        time_checkpoint(SCOPE_DEBUG, "camera get mats", app_profiling_time);
-
-        camera_ubo.world_to_clip = mat4_mul(camera_matrices.view_to_clip, camera_matrices.world_to_view);
-        // TODO this should come from camera_matrices, rename to cam_state
-        camera_ubo.cam_offset    = camera_matrices.cam_location;
-
-        scene_data_update(&render_state, camera_ubo);
-        // dump_mat4(camera_ubo.world_to_clip);
-
-        time_checkpoint(SCOPE_DEBUG, "scene_data_update", app_profiling_time);
-
-        // physics_update(&scratch_arena, &physics_state, dt);
-        //
-        // time_checkpoint(SCOPE_DEBUG, "physics_update", app_profiling_time);
+        time_checkpoint(SCOPE_DEBUG, "editor_data_update", app_profiling_time);
 
         // TODO check if render_target is 0 size and just loop on
         // poll input/events, this applies to minimized window
@@ -224,9 +143,6 @@ int main(int argc, char** argv) {
         }
 
         time_checkpoint(SCOPE_DEBUG, "start_frame", app_profiling_time);
-
-        // TODO use this!
-        // instance_update(dragon_inst, model_ubo);
 
         draw_frame(&render_state);
 
@@ -244,14 +160,6 @@ int main(int argc, char** argv) {
         assert(SCOPE_MEM_ARENA, frame_start_arena_len == general_arena.len);
 
         time_checkpoint(SCOPE_DEBUG, "arena_rollback", app_profiling_time);
-
-        scratch_reset(&scratch_arena);
-
-        time_checkpoint(SCOPE_DEBUG, "scratch_reset", app_profiling_time);
-
-        // if (render_state.frame_count > 5) {
-        // break;
-        // }
     }
 
     f32 end       = (f32)clock() / (f32)CLOCKS_PER_SEC;
@@ -259,8 +167,8 @@ int main(int argc, char** argv) {
     DEBUG_LOG(SCOPE_DEBUG,
               "%u frames in %fs for %f fps",
               render_state.frame_count,
-              full_time,
-              (f32)render_state.frame_count / full_time);
+              (f64)full_time,
+              (f64)render_state.frame_count / (f64)full_time);
 
     // /sys/devices/system/cpu/cpu31/cache/index3/size
     // P & E cores
