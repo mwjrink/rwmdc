@@ -1,0 +1,282 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 2K of event 'cycles:u'
+# Event count (approx.): 11080936034
+#
+# Overhead  Command          Shared Object         Symbol                      
+# ........  ...............  ....................  ............................
+#
+    18.08%  .parser_neo_ben  .parser_neo_bench     [.] md_visit_footnotes
+            |          
+             --17.65%--md_visit_footnotes
+                       |          
+                       |--16.15%--md_visit_footnotes
+                       |          md_resolve_footnotes
+                       |          md_apply
+                       |          |          
+                       |           --15.94%--clock_ns (inlined)
+                       |                     main
+                       |                     0x7f7c3ae27c8e
+                       |                     0x7ffe761abf51
+                       |                     0x65625f6f656e5f72
+                       |          
+                        --1.50%--md_resolve_footnotes
+                                  md_apply
+                                  clock_ns (inlined)
+                                  main
+                                  0x7f7c3ae27c8e
+                                  0x7ffe761abf51
+                                  0x65625f6f656e5f72
+
+    11.44%  .parser_neo_ben  .parser_neo_bench     [.] md_finish_content
+            |          
+            |--9.85%--md_finish_content
+            |          |          
+            |          |--7.06%--md_finish_content
+            |          |          md_apply
+            |          |          |          
+            |          |           --7.02%--clock_ns (inlined)
+            |          |                     main
+            |          |                     0x7f7c3ae27c8e
+            |          |                     0x7ffe761abf51
+            |          |                     0x65625f6f656e5f72
+            |          |          
+            |           --2.79%--md_apply
+            |                     |          
+            |                      --2.75%--clock_ns (inlined)
+            |                                main
+            |                                0x7f7c3ae27c8e
+            |                                0x7ffe761abf51
+            |                                0x65625f6f656e5f72
+            |          
+             --1.59%--md_block_at (inlined)
+                       md_finish_content
+                       |          
+                        --1.08%--md_apply
+                                  |          
+                                   --1.03%--clock_ns (inlined)
+                                             main
+                                             0x7f7c3ae27c8e
+                                             0x7ffe761abf51
+                                             0x65625f6f656e5f72
+
+     8.89%  .parser_neo_ben  .parser_neo_bench     [.] md_reparse_root
+            |          
+            |--4.51%--md_reparse_root
+            |          md_apply
+            |          clock_ns (inlined)
+            |          main
+            |          0x7f7c3ae27c8e
+            |          0x7ffe761abf51
+            |          0x65625f6f656e5f72
+            |          
+            |--2.49%--md_work_push (inlined)
+            |          md_rebuild_lines (inlined)
+            |          md_reparse_root
+            |          md_apply
+            |          |          
+            |           --2.45%--clock_ns (inlined)
+            |                     main
+            |                     0x7f7c3ae27c8e
+            |                     0x7ffe761abf51
+            |                     0x65625f6f656e5f72
+            |          
+             --1.46%--md_rebuild_lines (inlined)
+                       md_reparse_root
+                       md_apply
+                       clock_ns (inlined)
+                       main
+                       0x7f7c3ae27c8e
+                       0x7ffe761abf51
+                       0x65625f6f656e5f72
+
+     8.37%  .parser_neo_ben  .parser_neo_bench     [.] md_prepare_commit
+            |          
+             --7.43%--md_prepare_commit
+                       md_apply
+                       |          
+                        --7.38%--clock_ns (inlined)
+                                  main
+                                  0x7f7c3ae27c8e
+                                  0x7ffe761abf51
+                                  0x65625f6f656e5f72
+
+     5.20%  .parser_neo_ben  .parser_neo_bench     [.] md_commit
+            |          
+             --5.15%--md_retire (inlined)
+                       md_commit
+                       md_apply
+                       clock_ns (inlined)
+                       main
+                       0x7f7c3ae27c8e
+                       0x7ffe761abf51
+                       0x65625f6f656e5f72
+
+     5.08%  .parser_neo_ben  .parser_neo_bench     [.] md_finish_leaves
+            |
+            ---md_finish_leaves
+               md_apply
+               clock_ns (inlined)
+               main
+               0x7f7c3ae27c8e
+               0x7ffe761abf51
+               0x65625f6f656e5f72
+
+     5.07%  .parser_neo_ben  libc.so.6             [.] 0x00000000001b81fd
+            |
+            ---0x7f7c3afb81fd
+               |          
+               |--2.71%--md_apply
+               |          clock_ns (inlined)
+               |          main
+               |          0x7f7c3ae27c8e
+               |          0x7ffe761abf51
+               |          0x65625f6f656e5f72
+               |          
+                --2.07%--clock_ns (inlined)
+                          main
+                          0x7f7c3ae27c8e
+                          0x7ffe761abf51
+                          0x65625f6f656e5f72
+
+     4.21%  .parser_neo_ben  .parser_neo_bench     [.] md_add_child
+            |          
+            |--1.72%--md_add_child
+            |          |          
+            |           --1.63%--md_reparse_root
+            |                     md_apply
+            |                     clock_ns (inlined)
+            |                     main
+            |                     0x7f7c3ae27c8e
+            |                     0x7ffe761abf51
+            |                     0x65625f6f656e5f72
+            |          
+            |--1.46%--md_work_push (inlined)
+            |          md_add_child
+            |          md_reparse_root
+            |          md_apply
+            |          clock_ns (inlined)
+            |          main
+            |          0x7f7c3ae27c8e
+            |          0x7ffe761abf51
+            |          0x65625f6f656e5f72
+            |          
+             --1.03%--md_block_at (inlined)
+                       md_add_child
+
+     3.70%  .parser_neo_ben  libc.so.6             [.] 0x00000000001b81f6
+            |
+            ---0x7f7c3afb81f6
+               |          
+               |--1.93%--md_apply
+               |          clock_ns (inlined)
+               |          main
+               |          0x7f7c3ae27c8e
+               |          0x7ffe761abf51
+               |          0x65625f6f656e5f72
+               |          
+                --1.63%--clock_ns (inlined)
+                          main
+                          0x7f7c3ae27c8e
+                          0x7ffe761abf51
+                          0x65625f6f656e5f72
+
+     2.96%  .parser_neo_ben  .parser_neo_bench     [.] md_reconcile_definitions
+            |
+            ---md_reconcile_definitions
+               md_apply
+               clock_ns (inlined)
+               main
+               0x7f7c3ae27c8e
+               0x7ffe761abf51
+               0x65625f6f656e5f72
+
+     2.88%  .parser_neo_ben  libc.so.6             [.] 0x00000000001b81db
+            |
+            ---0x7f7c3afb81db
+               |          
+                --1.68%--md_apply
+                          clock_ns (inlined)
+                          main
+                          0x7f7c3ae27c8e
+                          0x7ffe761abf51
+                          0x65625f6f656e5f72
+
+     2.36%  .parser_neo_ben  libc.so.6             [.] 0x00000000001b88dc
+            |
+            ---0x7f7c3afb88dc
+               |          
+                --1.63%--clock_ns (inlined)
+                          main
+                          0x7f7c3ae27c8e
+                          0x7ffe761abf51
+                          0x65625f6f656e5f72
+
+     2.30%  .parser_neo_ben  libc.so.6             [.] 0x00000000001b88ce
+            |
+            ---0x7f7c3afb88ce
+               |          
+                --1.72%--clock_ns (inlined)
+                          main
+                          0x7f7c3ae27c8e
+                          0x7ffe761abf51
+                          0x65625f6f656e5f72
+
+     2.06%  .parser_neo_ben  libc.so.6             [.] 0x00000000001b81e8
+            |
+            ---0x7f7c3afb81e8
+               |          
+                --1.07%--md_apply
+                          clock_ns (inlined)
+                          main
+                          0x7f7c3ae27c8e
+                          0x7ffe761abf51
+                          0x65625f6f656e5f72
+
+     2.02%  .parser_neo_ben  libc.so.6             [.] 0x00000000001b88c7
+            |
+            ---0x7f7c3afb88c7
+               |          
+                --1.29%--clock_ns (inlined)
+                          main
+                          0x7f7c3ae27c8e
+                          0x7ffe761abf51
+                          0x65625f6f656e5f72
+
+     1.99%  .parser_neo_ben  .parser_neo_bench     [.] md_sort_nodes
+            |          
+             --1.95%--md_sort_nodes
+                       |          
+                        --1.45%--md_get
+                                  main
+                                  0x7f7c3ae27c8e
+                                  0x7ffe761abf51
+                                  0x65625f6f656e5f72
+
+     1.94%  .parser_neo_ben  libc.so.6             [.] 0x00000000001b88d5
+            |
+            ---0x7f7c3afb88d5
+               |          
+                --1.29%--clock_ns (inlined)
+                          main
+                          0x7f7c3ae27c8e
+                          0x7ffe761abf51
+                          0x65625f6f656e5f72
+
+     1.79%  .parser_neo_ben  .parser_neo_bench     [.] md_parse_inlines
+     1.63%  .parser_neo_ben  libc.so.6             [.] 0x00000000001b81ef
+            |
+            ---0x7f7c3afb81ef
+
+     1.30%  .parser_neo_ben  libc.so.6             [.] 0x00000000001b805b
+            |
+            ---0x7f7c3afb805b
+
+
+
+#
+# (Tip: To change sampling frequency to 100 Hz: perf record -F 100)
+#

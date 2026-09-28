@@ -326,6 +326,9 @@ void* scratch_alloc_align(rop(rw ScratchArena) scratch, usize align, usize size)
     assert(SCOPE_MEM_ARENA, size < PAGE_SIZE);
     assert(SCOPE_MEM_ARENA, is_pow2_or_zero(align));
 
+    // x86 aligned reads
+    align = max(alignof(u32), align);
+
     usize partial = align - scratch->len & (align - 1);
     if (partial != 0) {
         DEBUG_LOG(SCOPE_MEM_ARENA, "scratch partial %lu", partial);

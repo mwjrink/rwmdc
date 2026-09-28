@@ -15,8 +15,8 @@ layout(buffer_reference, scalar, buffer_reference_align = 4) restrict readonly b
 
 layout(push_constant, scalar) uniform RectPushConstants
 {
-    layout(offset = 0)  GpuRect_ptr rects;
-    layout(offset = 8)  vec2 pixel_to_ndc;
+    layout(offset = 0) GpuRect_ptr rects;
+    layout(offset = 8) vec2 pixel_to_ndc;
     layout(offset = 16) vec2 scroll_offset;
     layout(offset = 24) uint rect_count;
 } pc_rect;
@@ -33,10 +33,7 @@ void main()
     vec2 pixel = vec2(rect.x, rect.y) + corner * vec2(rect.width, rect.height);
 
     // Fixed rects (UI: scrollbar, etc.) ignore scroll; everything else scrolls.
-    if ((rect.flags & 1u) == 0u)
-    {
-        pixel += pc_rect.scroll_offset;
-    }
+    pixel += pc_rect.scroll_offset * float(1u - (rect.flags & 1u));
 
     out_color = unpackUnorm4x8(rect.color);
 

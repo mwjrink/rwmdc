@@ -20,20 +20,62 @@ typedef enum ConfigFindBinding {
     ConfigFindBinding_Slash,
 } ConfigFindBinding;
 
-// Markdown colors, packed R | G<<8 | B<<16 | A<<24.
+// Markdown colors, packed R | G<<8 | B<<16 | A<<24. One entry per distinct
+// visual treatment produced by the text layer.
 typedef struct {
-    u32 bg;
-    u32 font_fg;
-    u32 comment_fg;
-    u32 code_block_bg;
-    u32 code_span_bg;
-    u32 link_fg;
-    u32 quote_fg;
-    u32 hr_fg;
+    // Structural
+    u32 window_bg;
     u32 selection_bg;
     u32 cursor;
+
+    // Text / blocks
+    u32 font_fg; // default paragraph text
+    u32 h1_fg;
+    u32 h2_fg;
+    u32 h3_fg;
+    u32 h4_fg;
+    u32 h5_fg;
+    u32 h6_fg;
+    u32 quote_fg;     // quote text
+    u32 quote_bar_fg; // quote gutter
+    u32 list_marker_fg;
+    u32 code_block_fg;
+    u32 code_block_bg;
+    u32 html_fg;
+    u32 thematic_break_fg;
+    u32 comment_fg;
+
+    // Inline spans
+    u32 emphasis_fg;
+    u32 strong_fg;
+    u32 link_fg;
+    u32 image_fg;
+    u32 code_fg; // inline code text
+    u32 code_span_bg;
+    u32 strikethrough_fg;
+    u32 insert_fg;
+    u32 underline_fg;
+    u32 spoiler_fg;
+    u32 superscript_fg;
+    u32 subscript_fg;
+    u32 highlight_fg;
+    u32 highlight_bg;
+    u32 math_fg;
+    u32 footnote_fg;
+
+    // Tables
+    u32 table_border_fg;
+    u32 table_header_fg;
+    u32 table_header_bg;
+
+    // Admonitions
+    u32 admonition_note_fg;
+    u32 admonition_tip_fg;
+    u32 admonition_important_fg;
+    u32 admonition_warning_fg;
+    u32 admonition_caution_fg;
 } Theme;
-STATIC_ASSERT(sizeof(Theme) == 40);
+STATIC_ASSERT(sizeof(Theme) == 168);
 
 typedef struct {
     struct {
@@ -67,7 +109,7 @@ typedef struct {
     AppSettings settings;
     Str         font_path;
 } ConfigParseResult;
-STATIC_ASSERT(sizeof(ConfigParseResult) == 88);
+STATIC_ASSERT(sizeof(ConfigParseResult) == 216);
 
 typedef struct {
     char* data;
@@ -107,21 +149,58 @@ internal AppSettings config_settings_default() {
 
 internal Theme config_theme_default() {
     return (Theme){
-        .bg            = 0xff140000u,
-        .font_fg       = 0xffffffffu,
-        .comment_fg    = 0xff888888u,
-        .code_block_bg = 0xff26221fu,
-        .code_span_bg  = 0xff302b27u,
-        .link_fg       = 0xffffc080u,
-        .quote_fg      = 0xff777777u,
-        .hr_fg         = 0xff888888u,
-        .selection_bg  = 0x805a87c8u,
-        .cursor        = 0xffffffffu,
+        .window_bg    = 0xff140000u,
+        .selection_bg = 0x805a87c8u,
+        .cursor       = 0xffffffffu,
+
+        .font_fg           = 0xffffffffu,
+        .h1_fg             = 0xffffffffu,
+        .h2_fg             = 0xffffffffu,
+        .h3_fg             = 0xffffffffu,
+        .h4_fg             = 0xffffffffu,
+        .h5_fg             = 0xffffffffu,
+        .h6_fg             = 0xffffffffu,
+        .quote_fg          = 0xff777777u,
+        .quote_bar_fg      = 0xff777777u,
+        .list_marker_fg    = 0xffffffffu,
+        .code_block_fg     = 0xffffffffu,
+        .code_block_bg     = 0xff26221fu,
+        .html_fg           = 0xff888888u,
+        .thematic_break_fg = 0xff888888u,
+        .comment_fg        = 0xff888888u,
+
+        .emphasis_fg      = 0xffffffffu,
+        .strong_fg        = 0xffffffffu,
+        .link_fg          = 0xffffc080u,
+        .image_fg         = 0xffffc080u,
+        .code_fg          = 0xffffffffu,
+        .code_span_bg     = 0xff302b27u,
+        .strikethrough_fg = 0xff888888u,
+        .insert_fg        = 0xff88ff88u,
+        .underline_fg     = 0xffffffffu,
+        .spoiler_fg       = 0xff888888u,
+        .superscript_fg   = 0xffffffffu,
+        .subscript_fg     = 0xffffffffu,
+        .highlight_fg     = 0xff000000u,
+        .highlight_bg     = 0xffffff00u,
+        .math_fg          = 0xffffffffu,
+        .footnote_fg      = 0xffffc080u,
+
+        .table_border_fg = 0xff888888u,
+        .table_header_fg = 0xffffffffu,
+        .table_header_bg = 0xff26221fu,
+
+        .admonition_note_fg      = 0xff88c0ffu,
+        .admonition_tip_fg       = 0xff88ff88u,
+        .admonition_important_fg = 0xffff88ffu,
+        .admonition_warning_fg   = 0xffffc080u,
+        .admonition_caution_fg   = 0xffff8888u,
     };
 }
 
 #define chget(cursor) cursor->data[cursor->pos]
 
+// TODO use grim strutils instead of these
 internal force_inline(u32) config_is_whitespace(char ch) {
     return ch == ' ' || ch == '\t';
 }
@@ -525,37 +604,103 @@ internal ConfigParseResult config_parse(rop(rw ScratchArena) scratch, Str conten
                 goto unknown_key;
             case 't':
                 if (str_equals(category, str_create("theme"))) {
-                    if (str_equals(key, str_create("bg"))) {
-                        config.theme.bg = config_parse_color(&line);
-                        break;
-                    } else if (str_equals(key, str_create("font_fg"))) {
-                        config.theme.font_fg = config_parse_color(&line);
-                        break;
-                    } else if (str_equals(key, str_create("comment_fg"))) {
-                        config.theme.comment_fg = config_parse_color(&line);
-                        break;
-                    } else if (str_equals(key, str_create("code_block_bg"))) {
-                        config.theme.code_block_bg = config_parse_color(&line);
-                        break;
-                    } else if (str_equals(key, str_create("code_span_bg"))) {
-                        config.theme.code_span_bg = config_parse_color(&line);
-                        break;
-                    } else if (str_equals(key, str_create("link_fg"))) {
-                        config.theme.link_fg = config_parse_color(&line);
-                        break;
-                    } else if (str_equals(key, str_create("quote_fg"))) {
-                        config.theme.quote_fg = config_parse_color(&line);
-                        break;
-                    } else if (str_equals(key, str_create("hr_fg"))) {
-                        config.theme.hr_fg = config_parse_color(&line);
-                        break;
+                    // Structural
+                    if (str_equals(key, str_create("window_bg"))) {
+                        config.theme.window_bg = config_parse_color(&line);
                     } else if (str_equals(key, str_create("selection_bg"))) {
                         config.theme.selection_bg = config_parse_color(&line);
-                        break;
                     } else if (str_equals(key, str_create("cursor"))) {
                         config.theme.cursor = config_parse_color(&line);
-                        break;
                     }
+                    // Text / blocks
+                    else if (str_equals(key, str_create("font_fg"))) {
+                        config.theme.font_fg = config_parse_color(&line);
+                    } else if (str_equals(key, str_create("h1_fg"))) {
+                        config.theme.h1_fg = config_parse_color(&line);
+                    } else if (str_equals(key, str_create("h2_fg"))) {
+                        config.theme.h2_fg = config_parse_color(&line);
+                    } else if (str_equals(key, str_create("h3_fg"))) {
+                        config.theme.h3_fg = config_parse_color(&line);
+                    } else if (str_equals(key, str_create("h4_fg"))) {
+                        config.theme.h4_fg = config_parse_color(&line);
+                    } else if (str_equals(key, str_create("h5_fg"))) {
+                        config.theme.h5_fg = config_parse_color(&line);
+                    } else if (str_equals(key, str_create("h6_fg"))) {
+                        config.theme.h6_fg = config_parse_color(&line);
+                    } else if (str_equals(key, str_create("quote_fg"))) {
+                        config.theme.quote_fg = config_parse_color(&line);
+                    } else if (str_equals(key, str_create("quote_bar_fg"))) {
+                        config.theme.quote_bar_fg = config_parse_color(&line);
+                    } else if (str_equals(key, str_create("list_marker_fg"))) {
+                        config.theme.list_marker_fg = config_parse_color(&line);
+                    } else if (str_equals(key, str_create("code_block_fg"))) {
+                        config.theme.code_block_fg = config_parse_color(&line);
+                    } else if (str_equals(key, str_create("code_block_bg"))) {
+                        config.theme.code_block_bg = config_parse_color(&line);
+                    } else if (str_equals(key, str_create("html_fg"))) {
+                        config.theme.html_fg = config_parse_color(&line);
+                    } else if (str_equals(key, str_create("thematic_break_fg"))) {
+                        config.theme.thematic_break_fg = config_parse_color(&line);
+                    } else if (str_equals(key, str_create("comment_fg"))) {
+                        config.theme.comment_fg = config_parse_color(&line);
+                    }
+                    // Inline spans
+                    else if (str_equals(key, str_create("emphasis_fg"))) {
+                        config.theme.emphasis_fg = config_parse_color(&line);
+                    } else if (str_equals(key, str_create("strong_fg"))) {
+                        config.theme.strong_fg = config_parse_color(&line);
+                    } else if (str_equals(key, str_create("link_fg"))) {
+                        config.theme.link_fg = config_parse_color(&line);
+                    } else if (str_equals(key, str_create("image_fg"))) {
+                        config.theme.image_fg = config_parse_color(&line);
+                    } else if (str_equals(key, str_create("code_fg"))) {
+                        config.theme.code_fg = config_parse_color(&line);
+                    } else if (str_equals(key, str_create("code_span_bg"))) {
+                        config.theme.code_span_bg = config_parse_color(&line);
+                    } else if (str_equals(key, str_create("strikethrough_fg"))) {
+                        config.theme.strikethrough_fg = config_parse_color(&line);
+                    } else if (str_equals(key, str_create("insert_fg"))) {
+                        config.theme.insert_fg = config_parse_color(&line);
+                    } else if (str_equals(key, str_create("underline_fg"))) {
+                        config.theme.underline_fg = config_parse_color(&line);
+                    } else if (str_equals(key, str_create("spoiler_fg"))) {
+                        config.theme.spoiler_fg = config_parse_color(&line);
+                    } else if (str_equals(key, str_create("superscript_fg"))) {
+                        config.theme.superscript_fg = config_parse_color(&line);
+                    } else if (str_equals(key, str_create("subscript_fg"))) {
+                        config.theme.subscript_fg = config_parse_color(&line);
+                    } else if (str_equals(key, str_create("highlight_fg"))) {
+                        config.theme.highlight_fg = config_parse_color(&line);
+                    } else if (str_equals(key, str_create("highlight_bg"))) {
+                        config.theme.highlight_bg = config_parse_color(&line);
+                    } else if (str_equals(key, str_create("math_fg"))) {
+                        config.theme.math_fg = config_parse_color(&line);
+                    } else if (str_equals(key, str_create("footnote_fg"))) {
+                        config.theme.footnote_fg = config_parse_color(&line);
+                    }
+                    // Tables
+                    else if (str_equals(key, str_create("table_border_fg"))) {
+                        config.theme.table_border_fg = config_parse_color(&line);
+                    } else if (str_equals(key, str_create("table_header_fg"))) {
+                        config.theme.table_header_fg = config_parse_color(&line);
+                    } else if (str_equals(key, str_create("table_header_bg"))) {
+                        config.theme.table_header_bg = config_parse_color(&line);
+                    }
+                    // Admonitions
+                    else if (str_equals(key, str_create("admonition_note_fg"))) {
+                        config.theme.admonition_note_fg = config_parse_color(&line);
+                    } else if (str_equals(key, str_create("admonition_tip_fg"))) {
+                        config.theme.admonition_tip_fg = config_parse_color(&line);
+                    } else if (str_equals(key, str_create("admonition_important_fg"))) {
+                        config.theme.admonition_important_fg = config_parse_color(&line);
+                    } else if (str_equals(key, str_create("admonition_warning_fg"))) {
+                        config.theme.admonition_warning_fg = config_parse_color(&line);
+                    } else if (str_equals(key, str_create("admonition_caution_fg"))) {
+                        config.theme.admonition_caution_fg = config_parse_color(&line);
+                    } else {
+                        goto unknown_key;
+                    }
+                    break;
                 }
                 goto unknown_key;
             unknown_key:

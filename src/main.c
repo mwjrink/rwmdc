@@ -18,6 +18,17 @@
 #include <lib/grim/markdown/layout.h>
 #undef RWMD_MARKDOWN_IMPLEMENTATION
 
+// Fontshaper: compile the native shaping font once at startup. One TU owns
+// the implementation; the compiled blob lives as long as the editor.
+#define FONTSHAPER_STATIC
+#define FONTSHAPER_IMPLEMENTATION
+#define FONTSHAPER_ASSERT(condition) assert(SCOPE_STARTUP, (condition))
+#pragma push_macro("Unsorted")
+#undef Unsorted
+#include <lib/fontshaper/fontshaper.h>
+#pragma pop_macro("Unsorted")
+#undef FONTSHAPER_IMPLEMENTATION
+
 int main(int argc, char** argv) {
     u64 app_profiling_time = time_start();
 
@@ -69,13 +80,14 @@ int main(int argc, char** argv) {
     TTFont    font  = font_load(&general_arena, &scratch_arena, font_path.data);
     FontAtlas atlas = slug_build_atlas(&general_arena, &scratch_arena, &font, settings.font.size);
 
-    Editor editor = editor_create(&general_arena, settings, document_path);
+    Editor editor = editor_create(&general_arena, &font, settings, document_path);
 
     // this invalidates font_path
     scratch_reset(&scratch_arena);
     font_path = (Str){0}; // just to be clear.
 
     InputState  input_state  = input_create_state(&input_ctx);
+    // TODO should this be scratch instead?
     RenderState render_state = create_render_state(&general_arena, &render_ctx, &atlas);
 
     // TODO technically this is unsafe because arena was used in create_render_state but in this case,
@@ -131,25 +143,44 @@ int main(int argc, char** argv) {
             window_unlock_pointer(render_target.window);
         }
 
-        editor_data_update(&render_state, camera_ubo);
+        Vec2 pixel_to_ndc = (Vec2){
+            .x = 2.0f / (f32)render_target.extent.width,
+            .y = 2.0f / (f32)render_target.extent.height,
+        };
+        update_state(&render_state, editor.scroll, pixel_to_ndc);
+
+        DrawLayer   text_draw_layer   = editor_get_text_layer(&editor,
+                                                              &general_arena,
+                                                              &scratch_arena,
+                                                              &settings,
+                                                              &theme,
+                                                              &font,
+                                                              render_target.extent.width,
+                                                              render_target.extent.height);
+        RenderLayer text_render_layer = upload_layer(&render_state, &text_draw_layer);
+        // DrawLayer ui_layer = editor_get_ui_layer(&editor);
 
         time_checkpoint(SCOPE_DEBUG, "editor_data_update", app_profiling_time);
 
-        // TODO check if render_target is 0 size and just loop on
-        // poll input/events, this applies to minimized window
         u32 start_frame_result = start_frame(&general_arena, &render_state);
         if (!start_frame_result) {
-            continue;
+            goto render_loop_cleanup;
         }
 
         time_checkpoint(SCOPE_DEBUG, "start_frame", app_profiling_time);
 
-        draw_frame(&render_state);
+        RecordingState recording_state = render_init(&render_state);
+
+        draw_layer(&render_state, recording_state, &text_render_layer);
+        // draw_layer(&render_state, recording_state, &ui_render_layer);
+
+        render_finish(&render_state, recording_state);
 
         time_checkpoint(SCOPE_DEBUG, "draw_frame", app_profiling_time);
 
         end_frame(&general_arena, &render_state);
 
+    render_loop_cleanup:
         time_checkpoint(SCOPE_DEBUG, "end_frame", app_profiling_time);
 
         if (render_target.window->request_close == true) {

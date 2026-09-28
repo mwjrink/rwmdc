@@ -307,6 +307,24 @@ typedef struct GpuRect {
 } GpuRect;
 STATIC_ASSERT(sizeof(GpuRect) == 24);
 
+typedef struct {
+    GlyphDrawCmd* glyphs;
+    GpuRect*      rects;
+
+    u32 glyph_count;
+    u32 rect_count;
+} DrawLayer;
+STATIC_ASSERT(sizeof(DrawLayer) == 24);
+
+typedef struct {
+    u32 glyph_offset;
+    u32 glyph_count;
+
+    u32 rect_offset;
+    u32 rect_count;
+} RenderLayer;
+STATIC_ASSERT(sizeof(RenderLayer) == 16);
+
 typedef struct GlyphBounds {
     f32 min_x;
     f32 min_y;
@@ -340,6 +358,7 @@ typedef struct RenderState {
     u32 frame_count;
 
     Buffer slug_buff;
+    Buffer draw_buff;
 
     PushConstant_TextVert pc_vert;
     PushConstant_TextFrag pc_frag;
@@ -347,7 +366,7 @@ typedef struct RenderState {
 
     RingBuff swapchain_garbage;
 } RenderState;
-STATIC_ASSERT(sizeof(RenderState) == 184);
+STATIC_ASSERT(sizeof(RenderState) == 232);
 
 typedef struct FontAtlas {
     u8* data; // contiguous block holding all four regions

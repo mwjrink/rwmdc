@@ -96,7 +96,7 @@ RenderContext render_context_create(rop(rw Arena) arena,
 RenderState   create_render_state(rop(rw Arena) arena, rop(rw RenderContext) r_ctx, rop(ro FontAtlas) font_atlas);
 
 u8   start_frame(rop(rw Arena) arena, rop(rw RenderState) render_state);
-void draw_frame(rop(rw RenderState) render_state);
+void draw_frame(rop(rw RenderState) render_state, rop(ro DrawLayer) text_layer, rop(ro DrawLayer) ui_layer);
 void end_frame(rop(rw Arena) arena, rop(rw RenderState) render_state);
 
 void cleanup_render_state(rop(rw RenderState) render_state);

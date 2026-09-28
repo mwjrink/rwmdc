@@ -1,0 +1,287 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 2K of event 'cycles:u'
+# Event count (approx.): 10351038844
+#
+# Overhead  Command          Shared Object         Symbol                              
+# ........  ...............  ....................  ....................................
+#
+    30.82%  .parser_neo_ben  .parser_neo_bench     [.] benchmark_event
+            |
+            ---benchmark_event
+               |          
+               |--22.15%--md_emit (inlined)
+               |          |          
+               |          |--12.81%--md_emit_text (inlined)
+               |          |          md_process_inlines (inlined)
+               |          |          md_process_normal_block_contents
+               |          |          md_process_leaf_block (inlined)
+               |          |          md_process_all_blocks
+               |          |          md_process_doc (inlined)
+               |          |          md_parser_parse
+               |          |          fork_bench_parse
+               |          |          main
+               |          |          0x7f98f9227c8e
+               |          |          0x7ffdc8f67f51
+               |          |          0x65625f6f656e5f72
+               |          |          
+               |           --9.34%--md_emit_block (inlined)
+               |                     md_process_leaf_block (inlined)
+               |                     md_process_all_blocks
+               |                     md_process_doc (inlined)
+               |                     md_parser_parse
+               |                     fork_bench_parse
+               |                     main
+               |                     0x7f98f9227c8e
+               |                     0x7ffdc8f67f51
+               |                     0x65625f6f656e5f72
+               |          
+                --7.79%--md_emit_span
+                          md_process_inlines (inlined)
+                          md_process_normal_block_contents
+                          md_process_leaf_block (inlined)
+                          md_process_all_blocks
+                          md_process_doc (inlined)
+                          md_parser_parse
+                          fork_bench_parse
+                          main
+                          0x7f98f9227c8e
+                          0x7ffdc8f67f51
+                          0x65625f6f656e5f72
+
+    14.30%  .parser_neo_ben  .parser_neo_bench     [.] md_collect_marks
+            |          
+             --11.88%--md_collect_marks
+                       md_analyze_inlines
+                       md_process_normal_block_contents
+                       md_process_leaf_block (inlined)
+                       md_process_all_blocks
+                       md_process_doc (inlined)
+                       md_parser_parse
+                       fork_bench_parse
+                       main
+                       0x7f98f9227c8e
+                       0x7ffdc8f67f51
+                       0x65625f6f656e5f72
+
+     9.63%  .parser_neo_ben  .parser_neo_bench     [.] md_process_normal_block_contents
+            |          
+            |--4.05%--md_emit_text (inlined)
+            |          md_process_inlines (inlined)
+            |          md_process_normal_block_contents
+            |          md_process_leaf_block (inlined)
+            |          md_process_all_blocks
+            |          md_process_doc (inlined)
+            |          md_parser_parse
+            |          fork_bench_parse
+            |          main
+            |          0x7f98f9227c8e
+            |          0x7ffdc8f67f51
+            |          0x65625f6f656e5f72
+            |          
+            |--3.86%--md_process_inlines (inlined)
+            |          md_process_normal_block_contents
+            |          md_process_leaf_block (inlined)
+            |          md_process_all_blocks
+            |          md_process_doc (inlined)
+            |          md_parser_parse
+            |          fork_bench_parse
+            |          main
+            |          0x7f98f9227c8e
+            |          0x7ffdc8f67f51
+            |          0x65625f6f656e5f72
+            |          
+             --1.30%--md_emit (inlined)
+                       md_emit_text (inlined)
+                       md_process_inlines (inlined)
+                       md_process_normal_block_contents
+                       md_process_leaf_block (inlined)
+                       md_process_all_blocks
+                       md_process_doc (inlined)
+                       md_parser_parse
+                       fork_bench_parse
+                       main
+                       0x7f98f9227c8e
+                       0x7ffdc8f67f51
+                       0x65625f6f656e5f72
+
+     8.56%  .parser_neo_ben  .parser_neo_bench     [.] md_parser_parse
+            |          
+            |--6.50%--md_analyze_line (inlined)
+            |          md_process_doc (inlined)
+            |          md_parser_parse
+            |          fork_bench_parse
+            |          main
+            |          0x7f98f9227c8e
+            |          0x7ffdc8f67f51
+            |          0x65625f6f656e5f72
+            |          
+             --1.16%--md_process_doc (inlined)
+                       md_parser_parse
+                       fork_bench_parse
+                       main
+                       0x7f98f9227c8e
+                       0x7ffdc8f67f51
+                       0x65625f6f656e5f72
+
+     7.87%  .parser_neo_ben  .parser_neo_bench     [.] md_analyze_marks
+            |          
+            |--4.55%--md_analyze_marks
+            |          |          
+            |          |--3.17%--md_analyze_link_contents
+            |          |          |          
+            |          |           --2.98%--md_analyze_inlines
+            |          |                     md_process_normal_block_contents
+            |          |                     md_process_leaf_block (inlined)
+            |          |                     md_process_all_blocks
+            |          |                     md_process_doc (inlined)
+            |          |                     md_parser_parse
+            |          |                     fork_bench_parse
+            |          |                     main
+            |          |                     0x7f98f9227c8e
+            |          |                     0x7ffdc8f67f51
+            |          |                     0x65625f6f656e5f72
+            |          |          
+            |           --1.25%--md_resolve_brackets (inlined)
+            |                     md_analyze_inlines
+            |                     md_process_normal_block_contents
+            |                     md_process_leaf_block (inlined)
+            |                     md_process_all_blocks
+            |                     md_process_doc (inlined)
+            |                     md_parser_parse
+            |                     fork_bench_parse
+            |                     main
+            |                     0x7f98f9227c8e
+            |                     0x7ffdc8f67f51
+            |                     0x65625f6f656e5f72
+            |          
+             --1.21%--md_pop_openers (inlined)
+                       md_analyze_emph (inlined)
+                       md_analyze_marks
+                       md_analyze_link_contents
+                       md_analyze_inlines
+                       md_process_normal_block_contents
+                       md_process_leaf_block (inlined)
+                       md_process_all_blocks
+                       md_process_doc (inlined)
+                       md_parser_parse
+                       fork_bench_parse
+                       main
+                       0x7f98f9227c8e
+                       0x7ffdc8f67f51
+                       0x65625f6f656e5f72
+
+     5.04%  .parser_neo_ben  libc.so.6             [.] 0x00000000001b13e2
+            |
+            ---0x7f98f93b13e2
+               |          
+                --4.95%--md_analyze_link_contents
+                          |          
+                          |--2.89%--md_resolve_bracket_link (inlined)
+                          |          md_resolve_brackets (inlined)
+                          |          md_analyze_inlines
+                          |          md_process_normal_block_contents
+                          |          md_process_leaf_block (inlined)
+                          |          md_process_all_blocks
+                          |          md_process_doc (inlined)
+                          |          md_parser_parse
+                          |          fork_bench_parse
+                          |          main
+                          |          0x7f98f9227c8e
+                          |          0x7ffdc8f67f51
+                          |          0x65625f6f656e5f72
+                          |          
+                           --2.05%--md_analyze_inlines
+                                     md_process_normal_block_contents
+                                     md_process_leaf_block (inlined)
+                                     md_process_all_blocks
+                                     md_process_doc (inlined)
+                                     md_parser_parse
+                                     fork_bench_parse
+                                     main
+                                     0x7f98f9227c8e
+                                     0x7ffdc8f67f51
+                                     0x65625f6f656e5f72
+
+     4.03%  .parser_neo_ben  .parser_neo_bench     [.] md_add_line_into_current_block
+            |          
+             --3.69%--md_add_line_into_current_block
+                       |          
+                        --2.80%--md_process_doc (inlined)
+                                  md_parser_parse
+                                  fork_bench_parse
+                                  main
+                                  0x7f98f9227c8e
+                                  0x7ffdc8f67f51
+                                  0x65625f6f656e5f72
+
+     2.80%  .parser_neo_ben  .parser_neo_bench     [.] md_is_link_destination
+            |          
+             --2.56%--md_is_link_destination_B (inlined)
+                       md_is_link_destination
+                       md_is_inline_link_spec (inlined)
+                       md_resolve_bracket_link (inlined)
+                       md_resolve_brackets (inlined)
+                       md_analyze_inlines
+                       md_process_normal_block_contents
+                       md_process_leaf_block (inlined)
+                       md_process_all_blocks
+                       md_process_doc (inlined)
+                       md_parser_parse
+                       fork_bench_parse
+                       main
+                       0x7f98f9227c8e
+                       0x7ffdc8f67f51
+                       0x65625f6f656e5f72
+
+     1.92%  .parser_neo_ben  libc.so.6             [.] 0x00000000001b1403
+            |
+            ---0x7f98f93b1403
+               |          
+                --1.22%--md_resolve_brackets (inlined)
+                          md_analyze_inlines
+                          md_process_normal_block_contents
+                          md_process_leaf_block (inlined)
+                          md_process_all_blocks
+                          md_process_doc (inlined)
+                          md_parser_parse
+                          fork_bench_parse
+                          main
+                          0x7f98f9227c8e
+                          0x7ffdc8f67f51
+                          0x65625f6f656e5f72
+
+     1.91%  .parser_neo_ben  libc.so.6             [.] 0x00000000001b13fa
+            |
+            ---0x7f98f93b13fa
+               |          
+                --1.49%--md_analyze_link_contents
+
+     1.62%  .parser_neo_ben  libc.so.6             [.] 0x00000000001b13f4
+            |
+            ---0x7f98f93b13f4
+               |          
+                --1.25%--md_analyze_link_contents
+
+     1.40%  .parser_neo_ben  .parser_neo_bench     [.] md_start_new_block
+            |
+            ---md_start_new_block
+               md_process_line (inlined)
+               md_process_doc (inlined)
+               md_parser_parse
+               fork_bench_parse
+               main
+               0x7f98f9227c8e
+               0x7ffdc8f67f51
+               0x65625f6f656e5f72
+
+     1.26%  .parser_neo_ben  .parser_neo_bench     [.] md_process_all_blocks
+     1.20%  .parser_neo_ben  .parser_neo_bench     [.] md_analyze_inlines
+
+
+#
+# (Tip: For memory address profiling, try: perf mem record / perf mem report)
+#

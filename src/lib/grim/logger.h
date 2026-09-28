@@ -107,12 +107,17 @@ typedef enum Severity {
     X(WAYLAND, LEVEL_WARNING)                                                                                          \
                                                                                                                        \
     X(MATH, LEVEL_WARNING)                                                                                             \
+                                                                                                                       \
+    X(SIMD, LEVEL_WARNING)                                                                                             \
+                                                                                                                       \
     X(CAMERA, LEVEL_WARNING)                                                                                           \
     X(LOAD, LEVEL_WARNING)                                                                                             \
                                                                                                                        \
     X(FONT_LOAD, LEVEL_WARNING)                                                                                        \
     X(CONFIG, LEVEL_WARNING)                                                                                           \
     X(DOCUMENT, LEVEL_WARNING)                                                                                         \
+    X(EDITOR, LEVEL_WARNING)                                                                                           \
+    X(MARKDOWN, LEVEL_WARNING)                                                                                         \
                                                                                                                        \
     X(INPUT_LINUX, LEVEL_WARNING)                                                                                      \
     X(PERF_LINUX, LEVEL_WARNING)                                                                                       \

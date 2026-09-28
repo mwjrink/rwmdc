@@ -1,0 +1,67 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 3K of event 'cycles:u'
+# Event count (approx.): 18681308710
+#
+# Overhead  Command          Shared Object         Symbol                    
+# ........  ...............  ....................  ..........................
+#
+    94.79%  .parser_neo_ben  .parser_neo_bench     [.] md_parse_inlines
+            |          
+            |--88.50%--md_inside_link (inlined)
+            |          md_inline_autolinks (inlined)
+            |          md_parse_inlines
+            |          md_finish_leaves
+            |          md_apply
+            |          |          
+            |          |--70.84%--clock_ns (inlined)
+            |          |          main
+            |          |          0x7fa4cea27c8e
+            |          |          0x7fffe3abef50
+            |          |          0x65625f6f656e5f72
+            |          |          
+            |          |--13.23%--md_create (inlined)
+            |          |          main
+            |          |          0x7fa4cea27c8e
+            |          |          0x7fffe3abef50
+            |          |          0x65625f6f656e5f72
+            |          |          
+            |           --4.43%--main
+            |                     0x7fa4cea27c8e
+            |                     0x7fffe3abef50
+            |                     0x65625f6f656e5f72
+            |          
+             --4.78%--md_inline_nests (inlined)
+                       md_inline_delimiters (inlined)
+                       md_parse_inlines
+                       md_finish_leaves
+                       md_apply
+                       |          
+                        --3.78%--clock_ns (inlined)
+                                  main
+                                  0x7fa4cea27c8e
+                                  0x7fffe3abef50
+                                  0x65625f6f656e5f72
+
+     2.12%  .parser_neo_ben  .parser_neo_bench     [.] md_inline_link_node
+            |
+            ---md_inline_link_node
+               md_inline_brackets (inlined)
+               md_parse_inlines
+               md_finish_leaves
+               md_apply
+               |          
+                --1.70%--clock_ns (inlined)
+                          main
+                          0x7fa4cea27c8e
+                          0x7fffe3abef50
+                          0x65625f6f656e5f72
+
+
+
+#
+# (Tip: Add -I to perf record to sample register values, which will be visible in perf report sample context.)
+#

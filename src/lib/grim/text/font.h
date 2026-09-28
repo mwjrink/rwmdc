@@ -1,6 +1,7 @@
 #pragma once
 
 #include <fcntl.h>
+#include <lib/fontshaper/fontshaper.h>
 #include <lib/grim/assert.h>
 #include <lib/grim/bp.h>
 #include <lib/grim/gfx/types.h>
@@ -102,6 +103,17 @@ typedef struct {
     f32 descent;
     f32 line_gap;
     f32 line_height;
+
+    fontshaper_font shaper; // compiled shaping font, owned for the font's lifetime
+
+    // Shape workspace: one compiled per-script config + reusable glyph storage
+    // and scratchpad, so spans shape without recompiling/reallocating.
+    fontshaper_shape_config*     shape_config;
+    fontshaper_script            shape_config_script;
+    fontshaper_glyph_storage     glyph_storage;
+    fontshaper_shape_scratchpad* shape_scratchpad;
+    void*                        storage_memory;
+    void*                        scratchpad_memory;
 } TTFont;
 
 internal u32 tt_read_u32(rop(rw TTCursor) file) {
@@ -351,7 +363,7 @@ internal void tt_release_data(rop(rw TTFontLoader) loader) {
 // (recursively) before its contours are merged here.
 internal void tt_resolve_compound(
     rop(rw Arena) arena, rop(ro TTFontLoader) loader, rop(rw TTGlyph) glyphs, rop(rw u32) processed, u32 gi) {
-    if (bitarray_test(processed, gi)) {
+    if (bitarray32_test(processed, gi)) {
         return;
     }
 
@@ -368,7 +380,7 @@ internal void tt_resolve_compound(
         u32 child       = tt_read_u16(&file);
 
         // Resolve the child first so its contours are ready to borrow.
-        if (!bitarray_test(processed, child)) {
+        if (!bitarray32_test(processed, child)) {
             tt_resolve_compound(arena, loader, glyphs, processed, child);
         }
 
@@ -461,14 +473,14 @@ internal void tt_resolve_compound(
         file.pos += tt_read_u16(&file);
     }
     glyphs[gi] = glyph;
-    bitarray_set(processed, gi);
+    bitarray32_set(processed, gi);
 }
 
 TTFont font_load(rop(rw Arena) arena, rop(rw ScratchArena) scratch, const char* path) {
     TTFontLoader loader = tt_open(path);
 
     TTGlyph* glyphs           = arena_alloc_aligned(arena, TTGlyph, loader.glyph_count);
-    u32*     processed        = scratch_alloc_aligned(scratch, u32, bitarray_calc_size(loader.glyph_count));
+    u32*     processed        = scratch_alloc_aligned(scratch, u32, bitarray32_calc_size(loader.glyph_count));
     u32*     compound_indices = scratch_alloc_aligned(scratch, u32, loader.glyph_count);
     u32      compound_count   = 0;
 
@@ -493,7 +505,7 @@ TTFont font_load(rop(rw Arena) arena, rop(rw ScratchArena) scratch, const char* 
         current_offset = end;
 
         if (off == end) {
-            bitarray_set(processed, glyph_idx);
+            bitarray32_set(processed, glyph_idx);
             continue;
         }
 
@@ -503,14 +515,14 @@ TTFont font_load(rop(rw Arena) arena, rop(rw ScratchArena) scratch, const char* 
 
         if (contours_count > 0) {
             glyphs[glyph_idx] = tt_load_simple_glyph(arena, scratch, &loader, file, (u32)contours_count);
-            bitarray_set(processed, glyph_idx);
+            bitarray32_set(processed, glyph_idx);
         } else if (contours_count == -1) {
             glyphs[glyph_idx].file_off       = off;
             compound_indices[compound_count] = glyph_idx;
             compound_count += 1;
         } else {
             // contours_count == 0: no contours, no components (empty outline).
-            bitarray_set(processed, glyph_idx);
+            bitarray32_set(processed, glyph_idx);
         }
     }
 
@@ -541,6 +553,86 @@ TTFont font_load(rop(rw Arena) arena, rop(rw ScratchArena) scratch, const char* 
         .line_gap    = loader.line_gap,
         .line_height = loader.line_height,
     };
+
+    // Compile the native shaping font from the still-mapped sfnt bytes.
+    // Persistent blob + compiled font live in `arena`; temporary buffers in
+    // `scratch` are reset. The raw bytes are released below with the loader.
+    {
+        // TODO checkpoints instead
+        u64 scratch_len_before = scratch->len;
+        {
+            fontshaper_load_font_state state         = {0};
+            i32                        scratch_bytes = 0, blob_bytes = 0;
+
+            fontshaper_load_font_error err = fontshaper_LoadFont(
+                &font.shaper, &state, (void*)loader.data, (int)loader.data_len, 0, &scratch_bytes, &blob_bytes);
+            assert(SCOPE_FONT_LOAD,
+                   err == FONTSHAPER_LOAD_FONT_ERROR_NEED_TO_CREATE_BLOB && scratch_bytes > 0 && blob_bytes > 0);
+
+            void* blob         = arena_alloc_aligned(arena, u8, blob_bytes);
+            void* load_scratch = scratch_alloc_aligned(scratch, u8, scratch_bytes);
+
+            err = fontshaper_PlaceBlob(&font.shaper, &state, load_scratch, blob);
+            assert(SCOPE_FONT_LOAD, err == FONTSHAPER_LOAD_FONT_ERROR_NONE);
+
+            // TODO checkpoints instead
+            memset(scratch->data + scratch_len_before, 0, scratch->len - scratch_len_before);
+            scratch->len = scratch_len_before;
+        }
+
+        {
+            u64 compiled_bytes        = fontshaper_SizeOfCompiledFont(&font.shaper);
+            u64 compile_scratch_bytes = fontshaper_SizeOfFontCompileScratch(&font.shaper);
+
+            void* compiled        = arena_alloc_aligned(arena, u8, compiled_bytes);
+            void* compile_scratch = scratch_alloc_aligned(scratch, u8, compile_scratch_bytes);
+
+            fontshaper_load_font_error err = fontshaper_CompileFont(&font.shaper, compiled, compile_scratch, NULL);
+            assert(SCOPE_FONT_LOAD, err == FONTSHAPER_LOAD_FONT_ERROR_NONE && fontshaper_FontIsValid(&font.shaper));
+
+            // TODO checkpoints instead
+            memset(scratch->data + scratch_len_before, 0, scratch->len - scratch_len_before);
+            scratch->len = scratch_len_before;
+        }
+
+        // Build the reusable shape workspace: a default (Latin) shape config,
+        // a bounded glyph storage, and its scratchpad.
+        {
+            u32 glyph_cap = 256; // TODO: tune; bounds simultaneous glyphs
+
+            i32 shape_cfg_bytes =
+                fontshaper_SizeOfShapeConfig(&font.shaper, FONTSHAPER_SCRIPT_LATIN, FONTSHAPER_LANGUAGE_DONT_KNOW);
+            i64 shape_cfg_scratch_bytes = fontshaper_SizeOfShapeConfigScratch(
+                &font.shaper, FONTSHAPER_SCRIPT_LATIN, FONTSHAPER_LANGUAGE_DONT_KNOW);
+            assert(SCOPE_FONT_LOAD, shape_cfg_bytes > 0);
+
+            font.shape_config        = arena_alloc_aligned(arena, u32, shape_cfg_bytes);
+            void* cfg_scratch        = scratch_alloc(scratch, (usize)shape_cfg_scratch_bytes);
+            font.shape_config        = fontshaper_PlaceShapeConfig(&font.shaper,
+                                                                   FONTSHAPER_SCRIPT_LATIN,
+                                                                   FONTSHAPER_LANGUAGE_DONT_KNOW,
+                                                                   font.shape_config,
+                                                                   cfg_scratch,
+                                                                   NULL);
+            font.shape_config_script = FONTSHAPER_SCRIPT_LATIN;
+            assert(SCOPE_FONT_LOAD, font.shape_config != NULL);
+
+            fontshaper_un storage_bytes = fontshaper_SizeOfGlyphStorage(glyph_cap);
+            font.storage_memory         = arena_alloc_aligned(arena, u8, storage_bytes);
+            assert(SCOPE_FONT_LOAD,
+                   fontshaper_InitializeGlyphStorage(&font.glyph_storage, font.storage_memory, glyph_cap));
+
+            fontshaper_un scratchpad_bytes = fontshaper_SizeOfShapeScratchpad(font.shape_config, glyph_cap);
+            font.scratchpad_memory         = arena_alloc_aligned(arena, u8, scratchpad_bytes);
+            font.shape_scratchpad =
+                fontshaper_PlaceShapeScratchpad(font.shape_config, font.scratchpad_memory, glyph_cap);
+            assert(SCOPE_FONT_LOAD, font.shape_scratchpad != NULL);
+
+            // TODO checkpoints instead
+            memset(scratch->data + scratch_len_before, 0, scratch->len - scratch_len_before);
+            scratch->len = scratch_len_before;
+        }
+    }
 
     tt_release_data(&loader);
 

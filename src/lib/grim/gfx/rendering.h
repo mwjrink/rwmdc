@@ -65,21 +65,29 @@ RenderState create_render_state(rop(rw Arena) arena, rop(rw RenderContext) r_ctx
     u64 band_words_bytes    = (u64)font_atlas->band_word_count * sizeof(u32);
 
     u64 glyph_bounds_off  = 0;
-    u64 glyph_bands_off   = (glyph_bounds_off + glyph_bounds_bytes + 15) & ~(u64)15;
-    u64 packed_curves_off = (glyph_bands_off + glyph_bands_bytes + 15) & ~(u64)15;
-    u64 band_words_off    = (packed_curves_off + packed_curves_bytes + 15) & ~(u64)15;
+    u64 glyph_bands_off   = align_up_pow2(glyph_bounds_off + glyph_bounds_bytes, 16);
+    u64 packed_curves_off = align_up_pow2(glyph_bands_off + glyph_bands_bytes, 16);
+    u64 band_words_off    = align_up_pow2(packed_curves_off + packed_curves_bytes, 16);
 
     // One device-local buffer holds the whole atlas; one contiguous upload.
     Buffer slug_buff = buffer_create(ctx,
                                      font_atlas->total_bytes,
-                                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                                         VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
                                          VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     buffer_copy_with_staging(arena, ctx, slug_buff, font_atlas->data, font_atlas->total_bytes);
 
+    u64    rect_draw_size  = sizeof(GpuRect) * 1024;
+    u64    glyph_draw_size = sizeof(GlyphDrawCmd) * 128 * 256;
+    Buffer draw_buff = buffer_create(ctx,
+                                     rect_draw_size + glyph_draw_size,
+                                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                                         VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
     PushConstant_TextVert pc_vert = {
-        .draw_glyphs        = slug_buff.address,
+        .draw_glyphs        = draw_buff.address,
         .font_glyphs_bounds = slug_buff.address + glyph_bounds_off,
         .pixel_to_ndc       = (Vec2){0},
         .scroll_offset      = (Vec2){0},
@@ -91,7 +99,7 @@ RenderState create_render_state(rop(rw Arena) arena, rop(rw RenderContext) r_ctx
         .font_bands       = slug_buff.address + band_words_off,
     };
     PushConstant_Rect pc_rect = {
-        .rects         = 0,
+        .rects         = draw_buff.address + glyph_draw_size,
         .pixel_to_ndc  = (Vec2){0},
         .scroll_offset = (Vec2){0},
         .rect_count    = 0,
@@ -104,6 +112,7 @@ RenderState create_render_state(rop(rw Arena) arena, rop(rw RenderContext) r_ctx
         .frame_count = 0,
 
         .slug_buff = slug_buff,
+        .draw_buff = draw_buff,
 
         .pc_vert = pc_vert,
         .pc_frag = pc_frag,
@@ -156,10 +165,13 @@ u8 start_frame(rop(rw Arena) arena, rop(rw RenderState) render_state) {
     vkResetFences(ctx->device, 1, &(sync_objects->open_on_render_finish));
     vkResetCommandBuffer(command_buffers[frame_idx].handle, 0);
 
+    render_state->pc_vert.draw_glyph_count = 0;
+    render_state->pc_rect.rect_count       = 0;
+
     return true;
 }
 
-void draw_frame(rop(rw RenderState) render_state) {
+RecordingState render_init(rop(rw RenderState) render_state) {
     u32 frames_in_flight = render_state->r_ctx->frames_in_flight;
 
     rop(rw RenderContext) r_ctx        = render_state->r_ctx;
@@ -227,38 +239,103 @@ void draw_frame(rop(rw RenderState) render_state) {
     rendering_info.pColorAttachments    = &color_attachment_info;
     vkCmdBeginRendering(recording_state.cmd_buffer->handle, &rendering_info);
 
+    return recording_state;
+}
+
+void update_state(rop(rw RenderState) render_state, Vec2 scroll_offset, Vec2 pixel_to_ndc) {
+    render_state->pc_vert.scroll_offset = scroll_offset;
+    render_state->pc_vert.pixel_to_ndc  = pixel_to_ndc;
+
+    render_state->pc_rect.scroll_offset = scroll_offset;
+    render_state->pc_rect.pixel_to_ndc  = pixel_to_ndc;
+}
+
+RenderLayer upload_layer(rop(rw RenderState) render_state, rop(ro DrawLayer) layer) {
+    rop(rw RenderContext) r_ctx = render_state->r_ctx;
+    rop(ro GraphicsContext) ctx = r_ctx->ctx;
+
+    // TODO per frame draw buffer with memory barriers per for syncing writes/reads
+    RenderLayer render_layer = {0};
+    buffer_host_copy(ctx,
+                     &render_state->draw_buff,
+                     layer->glyphs,
+                     layer->glyph_count * sizeof(GlyphDrawCmd),
+                     render_state->pc_vert.draw_glyphs - render_state->draw_buff.address +
+                         render_state->pc_vert.draw_glyph_count * sizeof(GlyphDrawCmd));
+
+    render_layer.glyph_offset = render_state->pc_vert.draw_glyph_count;
+    render_state->pc_vert.draw_glyph_count += layer->glyph_count;
+    render_layer.glyph_count = layer->glyph_count;
+
+    buffer_host_copy(ctx,
+                     &render_state->draw_buff,
+                     layer->rects,
+                     layer->rect_count * sizeof(GpuRect),
+                     render_state->pc_rect.rects - render_state->draw_buff.address +
+                         render_state->pc_rect.rect_count * sizeof(GpuRect));
+
+    render_layer.rect_offset = render_state->pc_rect.rect_count;
+    render_state->pc_rect.rect_count += layer->rect_count;
+    render_layer.rect_count = layer->rect_count;
+
+    return render_layer;
+}
+
+void draw_layer(rop(rw RenderState) render_state, ro RecordingState recording_state, rop(ro RenderLayer) layer) {
+    rop(rw RenderContext) r_ctx = render_state->r_ctx;
+
+    PushConstant_TextVert pc_vert = render_state->pc_vert;
+    pc_vert.draw_glyphs           = pc_vert.draw_glyphs + sizeof(GlyphDrawCmd) * layer->glyph_offset;
+    pc_vert.draw_glyph_count      = layer->glyph_count;
+
+    PushConstant_Rect pc_rect = render_state->pc_rect;
+    pc_rect.rects             = pc_rect.rects + sizeof(GpuRect) * layer->rect_offset;
+    pc_rect.rect_count        = layer->rect_count;
+
     // Pass 1: highlight rects (depth 0, behind glyphs).
-    if (render_state->pc_rect.rect_count) {
-        cmd_bind_pipeline(ctx, &recording_state, r_ctx->rect_pipeline);
+    if (pc_rect.rect_count > 0) {
+        vkCmdBindPipeline(
+            recording_state.cmd_buffer->handle, VK_PIPELINE_BIND_POINT_GRAPHICS, r_ctx->rect_pipeline->handle);
         vkCmdPushConstants(recording_state.cmd_buffer->handle,
                            r_ctx->rect_pipeline->layout,
                            VK_SHADER_STAGE_VERTEX_BIT,
                            0,
                            sizeof(PushConstant_Rect),
-                           &render_state->pc_rect);
-        cmd_draw(&recording_state, render_state->pc_rect.rect_count);
+                           &pc_rect);
+        vkCmdDraw(recording_state.cmd_buffer->handle, 4, pc_rect.rect_count, 0, 0);
     }
 
     // Pass 2: glyphs (depth 1).
-    if (render_state->pc_vert.draw_glyph_count) {
-        cmd_bind_pipeline(ctx, &recording_state, r_ctx->glyph_pipeline);
+    if (pc_vert.draw_glyph_count > 0) {
+        vkCmdBindPipeline(
+            recording_state.cmd_buffer->handle, VK_PIPELINE_BIND_POINT_GRAPHICS, r_ctx->glyph_pipeline->handle);
         vkCmdPushConstants(recording_state.cmd_buffer->handle,
                            r_ctx->glyph_pipeline->layout,
                            VK_SHADER_STAGE_VERTEX_BIT,
                            0,
                            sizeof(PushConstant_TextVert),
-                           &render_state->pc_vert);
+                           &pc_vert);
         vkCmdPushConstants(recording_state.cmd_buffer->handle,
                            r_ctx->glyph_pipeline->layout,
                            VK_SHADER_STAGE_FRAGMENT_BIT,
                            sizeof(PushConstant_TextVert),
                            sizeof(PushConstant_TextFrag),
                            &render_state->pc_frag);
-        cmd_draw(&recording_state, render_state->pc_vert.draw_glyph_count);
+        vkCmdDraw(recording_state.cmd_buffer->handle, 4, pc_vert.draw_glyph_count, 0, 0);
     }
+}
 
-    // Pass 3: UI rects (depth 2). Reuses the rect pipeline/pattern.
-    // TODO bind a distinct rect range for UI once the UI layer exists.
+void render_finish(rop(rw RenderState) render_state, rw RecordingState recording_state) {
+    u32 frames_in_flight = render_state->r_ctx->frames_in_flight;
+
+    rop(rw RenderContext) r_ctx        = render_state->r_ctx;
+    rop(ro GraphicsContext) ctx        = r_ctx->ctx;
+    rop(rw RenderTarget) render_target = r_ctx->target;
+
+    u32 frame_idx = render_state->frame_count % frames_in_flight;
+
+    rop(ro CommandBuffer) command_buffers =
+        ctx->queue_families.families[ctx->queue_families.graphics_idx].command_pool.command_buffers;
 
     vkCmdEndRendering(recording_state.cmd_buffer->handle);
 
