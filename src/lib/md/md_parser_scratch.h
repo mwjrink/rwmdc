@@ -3,6 +3,7 @@
 #include <lib/grim/bp.h>
 #include <lib/grim/intrinsics.h>
 #include <lib/grim/mem/arena.h>
+#include <lib/grim/text/strutils.h>
 
 typedef struct MdPiece {
     u8* bytes;
@@ -186,10 +187,22 @@ typedef struct MdResult {
 } MdResult;
 
 // Delimiter-specific payload layouts are specified separately.
-typedef struct MdL0Metadata MdL0Metadata;
+typedef struct MdL0Metadata {
+    u32 indent;
+    u32 body_indent;
+    u32 marker_offset;
+    u32 marker_length;
+    u32 trailing_whitespace : 1;
+} MdL0Metadata;
 typedef struct MdL1Metadata MdL1Metadata;
 
-typedef struct MdMap MdMap;
+typedef struct MdMap {
+    u32        offset;
+    u32        length;
+    MdNodeKind kind;
+    u8         text[6];
+    u32        text_length;
+} MdMap;
 
 typedef struct MdState {
     // Parallel arrays: index i identifies one delimiter occurrence within
@@ -201,6 +214,7 @@ typedef struct MdState {
     // Nested constructs share the same ordered stream; no tree pointers.
     rwp(rw u8) l0_tags;
     rwp(rw u32) l0_offsets;
+    rwp(rw u32) l0_lengths;
     rwp(rw MdL0Metadata) l0_metadata;
     u32 l0_count;
 
@@ -208,6 +222,7 @@ typedef struct MdState {
     // Tags can be searched without loading offsets or metadata.
     rwp(rw u8) l1_tags;
     rwp(rw u32) l1_offsets;
+    rwp(rw u32) l1_lengths;
     rwp(rw MdL1Metadata) l1_metadata;
     u32 l1_count;
 
@@ -266,20 +281,35 @@ MdState md_create(rop(ro MdView) source, rop(rw Arena) arena, rop(rw ScratchAren
         .source = source,
     };
 
-    static const u8  candidates[] = {'\n', 0, '`', '*', '_', '~', '|', '[', ']', '!', '<', '\\', '&'};
-    SimdByteScanMany table        = simd_byte_scan_many_init(candidates, sizeof(candidates));
+    static const u8 candidates[] = {
+        '\n', 0, '#', '>', '-', '+', '=', '`', '*', '_', '~', '|', '[', ']', '!', '<', '\\', '&'};
+    SimdByteScanMany table = simd_byte_scan_many_init(candidates, sizeof(candidates));
     u8               buffer[64];
     u32              buffer_file_offset = 0;
 
-    enum {
-        MD_STATE_LINE_START = 1 << 0,
-        MD_STATE_CODE_BLOCK = 1 << 1,
-    };
-    u32 state = MD_STATE_LINE_START;
+    u32           l0_capacity = source->total_length;
+    u8*           l0_tags     = scratch_alloc_aligned(scratch, u8, l0_capacity);
+    u32*          l0_offsets  = scratch_alloc_aligned(scratch, u32, l0_capacity);
+    u32*          l0_lengths  = scratch_alloc_aligned(scratch, u32, l0_capacity);
+    MdL0Metadata* l0_metadata = scratch_alloc_aligned(scratch, MdL0Metadata, l0_capacity);
+    u32           l0_count    = 0;
+
+    u32  l1_capacity = source->total_length;
+    u8*  l1_tags     = scratch_alloc_aligned(scratch, u8, l1_capacity);
+    u32* l1_offsets  = scratch_alloc_aligned(scratch, u32, l1_capacity);
+    u32* l1_lengths  = scratch_alloc_aligned(scratch, u32, l1_capacity);
+    u32  l1_count    = 0;
+
+    MdMap* mappings       = scratch_alloc_aligned(scratch, MdMap, source->total_length);
+    u32    mappings_count = 0;
 
     u32 line_begin = 0;
+    u32 line_idx   = 0;
     u32 indent     = 0;
     u8  previous   = 0;
+
+    u8           line_tag      = 0;
+    MdL0Metadata line_metadata = {0};
 
     while (buffer_file_offset < source->total_length) {
         memset(buffer, 0, 64);
@@ -291,24 +321,160 @@ MdState md_create(rop(ro MdView) source, rop(rw Arena) arena, rop(rw ScratchAren
 
         hits &= UINT64_MAX >> ((64 - buffer_bytes_read) & 63);
 
+        u32 whitespace_index = 0;
+        if (buffer_file_offset == 0)
+            goto line_indent;
+
         while (hits) {
             u32 index = (u32)__builtin_ctzll(hits);
             hits &= hits - 1;
             u8  byte   = buffer[index];
             u32 offset = buffer_file_offset + index;
 
-            switch (byte) {
-                case '\n': {
-                    u32 content_end = offset;
-                    content_end -= (index ? buffer[index - 1] : previous) == '\r';
-                    // TODO: finish L0 line [line_begin, content_end).
-                    (void)content_end;
-                    line_begin = offset + 1;
-                    state |= MD_STATE_LINE_START;
-                    break;
+            // TODO handle code blocks in block comments, list items
+            if (line_metadata.marker_length > 0 &&
+                line_idx == line_metadata.marker_offset + line_metadata.marker_length &&
+                (offset != line_idx || byte != line_tag)) {
+                if ((line_tag == '`' || line_tag == '~') && line_metadata.marker_length < 3) {
+                    l1_tags[l1_count]    = line_tag;
+                    l1_offsets[l1_count] = line_metadata.marker_offset;
+                    l1_lengths[l1_count] = line_metadata.marker_length;
+                    l1_count += 1;
+                    line_tag      = 0;
+                    line_metadata = (MdL0Metadata){0};
                 }
+            }
+
+            // Can apply anywhere
+            if (byte == '\n') {
+                u32 content_end = offset;
+                content_end -= (index ? buffer[index - 1] : previous) == '\r';
+                l0_tags[l0_count]     = line_tag;
+                l0_offsets[l0_count]  = line_begin;
+                l0_lengths[l0_count]  = content_end - line_begin;
+                line_metadata.indent  = indent;
+                l0_metadata[l0_count] = line_metadata;
+                l0_count += 1;
+
+                line_begin       = offset + 1;
+                whitespace_index = index + 1;
+
+            line_indent:
+                line_idx      = line_begin;
+                indent        = 0;
+                line_tag      = 0; // line_tag == 0 is paragraph
+                line_metadata = (MdL0Metadata){0};
+                while (line_idx < source->total_length) {
+                    while (whitespace_index < buffer_bytes_read) {
+                        u8 indent_byte = buffer[whitespace_index];
+                        if (indent_byte == ' ')
+                            indent += 1;
+                        else if (indent_byte == '\t')
+                            indent += 4 - (indent & 3);
+                        else
+                            goto newline_end;
+
+                        whitespace_index += 1;
+                        line_idx += 1;
+                    }
+                    if (line_idx == source->total_length)
+                        goto newline_end;
+
+                    previous = buffer[buffer_bytes_read - 1];
+                    buffer_file_offset += buffer_bytes_read;
+                    memset(buffer, 0, 64);
+                    buffer_bytes_read = md_fill(&cursor, buffer);
+                    simd_byte_scan_many(buffer, 64, &table, &hits);
+                    hits &= UINT64_MAX >> ((64 - buffer_bytes_read) & 63);
+                    whitespace_index = 0;
+                }
+
+            newline_end:
+                line_metadata.marker_offset = line_idx;
+                continue;
+            }
+
+            if (line_idx == offset && line_idx == line_metadata.marker_offset + line_metadata.marker_length &&
+                (line_metadata.marker_length == 0 || byte == line_tag)) {
+                // Start of line, we only care about these at the start of a line
+                switch (byte) {
+                    case '-':
+                    case '+':
+                    case '*': {
+                        if (line_metadata.marker_length > 0)
+                            goto record_l0_marker;
+
+                        line_tag                          = byte;
+                        line_metadata.marker_offset       = offset;
+                        line_metadata.marker_length       = 1;
+                        line_metadata.trailing_whitespace = true;
+                        line_metadata.body_indent         = indent + 1;
+                        whitespace_index                  = index + 1;
+                        u32 padding_offset                = offset + 1;
+
+                        while (padding_offset < source->total_length) {
+                            while (whitespace_index < buffer_bytes_read) {
+                                u8 padding_byte = buffer[whitespace_index];
+                                if (padding_byte == ' ')
+                                    line_metadata.body_indent += 1;
+                                else if (padding_byte == '\t')
+                                    line_metadata.body_indent += 4 - (line_metadata.body_indent & 3);
+                                else
+                                    goto body_indent_end;
+                                whitespace_index += 1;
+                                padding_offset += 1;
+                            }
+                            if (padding_offset == source->total_length)
+                                goto body_indent_end;
+
+                            previous = buffer[buffer_bytes_read - 1];
+                            buffer_file_offset += buffer_bytes_read;
+                            memset(buffer, 0, 64);
+                            buffer_bytes_read = md_fill(&cursor, buffer);
+                            simd_byte_scan_many(buffer, 64, &table, &hits);
+                            hits &= UINT64_MAX >> ((64 - buffer_bytes_read) & 63);
+                            whitespace_index = 0;
+                        }
+
+                    body_indent_end:
+                        if (line_metadata.body_indent - (indent + 1) < 1 ||
+                            line_metadata.body_indent - (indent + 1) > 4)
+                            line_metadata.body_indent = indent + 2;
+                        // TODO validate list-marker padding and distinguish thematic breaks.
+                        goto hit_end;
+                    }
+                    case '#':
+                    case '>':
+                    case '=':
+                    case '_':
+                    case '~':
+                    case '`': {
+                    record_l0_marker:
+                        if (!line_metadata.marker_length) {
+                            line_tag                    = byte;
+                            line_metadata.marker_offset = offset;
+                            line_metadata.marker_length = 1;
+                        } else if (line_tag == byte) {
+                            line_metadata.marker_length += 1;
+                        }
+                        line_metadata.trailing_whitespace = true;
+                        // TODO clear trailing_whitespace for non-whitespace content after the marker.
+                        goto hit_end;
+                    }
+                }
+            }
+
+            // l1 we always care about these
+            switch (byte) {
                 case 0:
-                    // TODO: record NUL replacement mapping.
+                    mappings[mappings_count] = (MdMap){
+                        .offset      = offset,
+                        .length      = 1,
+                        .kind        = MD_NODE_REPLACEMENT,
+                        .text        = {0xef, 0xbf, 0xbd},
+                        .text_length = 3,
+                    };
+                    mappings_count += 1;
                     break;
                 case '`':
                 case '*':
@@ -320,20 +486,88 @@ MdState md_create(rop(ro MdView) source, rop(rw Arena) arena, rop(rw ScratchAren
                 case '!':
                 case '<':
                 case '\\':
-                case '&':
-                    // TODO: handle L0 markers or record L1 candidate.
+                case '&': {
+                    if (l1_count > 0 && l1_tags[l1_count - 1] == byte &&
+                        l1_offsets[l1_count - 1] + l1_lengths[l1_count - 1] == offset) {
+                        l1_lengths[l1_count - 1] += 1;
+                    } else {
+                        l1_tags[l1_count]    = byte;
+                        l1_offsets[l1_count] = offset;
+                        l1_lengths[l1_count] = 1;
+                        l1_count += 1;
+                    }
                     break;
+                }
             }
+        hit_end:
+            line_idx = offset + 1;
         }
 
-        if (buffer_bytes_read)
+        if (buffer_bytes_read > 0)
             previous = buffer[buffer_bytes_read - 1];
         buffer_file_offset += buffer_bytes_read;
     }
 
-    // TODO: finish final unterminated line and close L0 blocks.
-    // TODO: resolve L1 candidates and publish durable state.
-    return (MdState){0};
+    if (line_begin < source->total_length) {
+        if ((line_tag == '`' || line_tag == '~') && line_metadata.marker_length < 3) {
+            l1_tags[l1_count]    = line_tag;
+            l1_offsets[l1_count] = line_metadata.marker_offset;
+            l1_lengths[l1_count] = line_metadata.marker_length;
+            l1_count += 1;
+            line_tag      = 0;
+            line_metadata = (MdL0Metadata){0};
+        }
+        l0_tags[l0_count]     = line_tag;
+        l0_offsets[l0_count]  = line_begin;
+        l0_lengths[l0_count]  = source->total_length - line_begin;
+        line_metadata.indent  = indent;
+        l0_metadata[l0_count] = line_metadata;
+        l0_count += 1;
+    }
+
+    MdState result = {
+        .l0_count       = l0_count,
+        .l1_count       = l1_count,
+        .mappings_count = mappings_count,
+    };
+
+    // TODO classify remaining L0 markers and resolve L1 candidates.
+    if (result.l0_count) {
+        u32 count = result.l0_count;
+
+        result.l0_tags = arena_alloc_aligned(arena, u8, count);
+        memcpy(result.l0_tags, l0_tags, count * sizeof(u8));
+
+        result.l0_offsets = arena_alloc_aligned(arena, u32, count);
+        memcpy(result.l0_offsets, l0_offsets, count * sizeof(u32));
+
+        result.l0_lengths = arena_alloc_aligned(arena, u32, count);
+        memcpy(result.l0_lengths, l0_lengths, count * sizeof(u32));
+
+        result.l0_metadata = arena_alloc_aligned(arena, MdL0Metadata, count);
+        memcpy(result.l0_metadata, l0_metadata, count * sizeof(MdL0Metadata));
+    }
+
+    if (result.l1_count) {
+        u32 count = result.l1_count;
+
+        result.l1_tags = arena_alloc_aligned(arena, u8, count);
+        memcpy(result.l1_tags, l1_tags, count * sizeof(u8));
+
+        result.l1_offsets = arena_alloc_aligned(arena, u32, count);
+        memcpy(result.l1_offsets, l1_offsets, count * sizeof(u32));
+
+        result.l1_lengths = arena_alloc_aligned(arena, u32, count);
+        memcpy(result.l1_lengths, l1_lengths, count * sizeof(u32));
+    }
+
+    if (result.mappings_count) {
+        u32 count       = result.mappings_count;
+        result.mappings = arena_alloc_aligned(arena, MdMap, count);
+        memcpy(result.mappings, mappings, count * sizeof(MdMap));
+    }
+
+    return result;
 }
 
 void md_update(rop(rw MdState) state,
@@ -343,6 +577,155 @@ void md_update(rop(rw MdState) state,
                u32 offset,
                u32 removed_length);
 
-MdResult md_get(rop(rw MdState) state, rop(rw Arena) arena, rop(rw ScratchArena) scratch, u32 begin, u32 end);
+MdResult md_get(rop(rw MdState) state, rop(rw Arena) arena, rop(rw ScratchArena) scratch, u32 begin, u32 end) {
+    assert(SCOPE_MARKDOWN, end > begin);
+
+    static const u8  context_tags[] = {'`', '~', '>', '-', '+', '*'};
+    SimdByteScanMany context_table  = simd_byte_scan_many_init(context_tags, sizeof(context_tags));
+
+    static const u8  query_tags[] = {0, '#', '>', '-', '+', '=', '`', '*', '_', '~'};
+    SimdByteScanMany query_table  = simd_byte_scan_many_init(query_tags, sizeof(query_tags));
+
+    static const u8  backtick_tag[] = {'`'};
+    SimdByteScanMany backtick_table = simd_byte_scan_many_init(backtick_tag, sizeof(backtick_tag));
+
+    static const u8  tilde_tag[] = {'~'};
+    SimdByteScanMany tilde_table = simd_byte_scan_many_init(tilde_tag, sizeof(tilde_tag));
+
+    static const u8  inline_tags[] = {'`', '*', '_', '~', '|', '[', ']', '!', '<', '\\', '&'};
+    SimdByteScanMany inline_table  = simd_byte_scan_many_init(inline_tags, sizeof(inline_tags));
+
+    usize   capacity    = (usize)state->l0_count + state->l1_count + state->mappings_count;
+    MdNode* nodes       = scratch_alloc_aligned(scratch, MdNode, capacity);
+    u32     nodes_count = 0;
+
+    u32* l0_stack       = scratch_alloc_aligned(scratch, u32, state->l0_count);
+    u32  l0_stack_count = 0;
+    u32  fence_open     = false;
+    u32  fence_idx      = 0;
+
+    u32 l1_idx = 0;
+
+    rwp(ro SimdByteScanMany) current_mask = &context_table;
+
+    u8  buffer[64];
+    u32 buffer_l0_idx = 0;
+
+    while (buffer_l0_idx < state->l0_count) {
+        u32 buffer_bytes_read = min(64, state->l0_count - buffer_l0_idx);
+        u32 last              = buffer_l0_idx + buffer_bytes_read - 1;
+        if (!fence_open && state->l0_offsets[last] + state->l0_lengths[last] >= begin)
+            current_mask = &query_table;
+
+        memset(buffer, 0, sizeof(buffer));
+        memcpy(buffer, state->l0_tags + buffer_l0_idx, buffer_bytes_read);
+        u64 hits = 0;
+        simd_byte_scan_many(buffer, 64, current_mask, &hits);
+        hits &= UINT64_MAX >> ((64 - buffer_bytes_read) & 63);
+
+        while (hits) {
+            u32 index = (u32)__builtin_ctzll(hits);
+            hits &= hits - 1;
+
+            u32 l0_idx    = buffer_l0_idx + index;
+            u32 l0_offset = state->l0_offsets[l0_idx];
+            if (l0_offset >= end) // TODO need to set a flag then only stop on next l0 because of setext header
+                goto get_end;
+
+            u8           l0_tag      = buffer[index];
+            u32          l0_length   = state->l0_lengths[l0_idx];
+            MdL0Metadata l0_metadata = state->l0_metadata[l0_idx];
+            u32          l0_end      = l0_offset + l0_length;
+
+            u32 base_indent = 0;
+            if (l0_stack_count > 0) {
+                u32 container_idx = l0_stack[l0_stack_count - 1];
+                base_indent       = state->l0_metadata[container_idx].body_indent;
+            }
+
+            switch (l0_tag) {
+                case '`':
+                    if (!fence_open) {
+                        // TODO validate indentation and info-string restrictions.
+                        fence_idx    = l0_idx;
+                        fence_open   = true;
+                        current_mask = &backtick_table;
+                        simd_byte_scan_many(buffer, 64, current_mask, &hits);
+                        hits &= (UINT64_MAX << index) & ~(1ULL << index);
+                        hits &= UINT64_MAX >> ((64 - buffer_bytes_read) & 63);
+                    } else {
+                        MdL0Metadata opening = state->l0_metadata[fence_idx];
+                        if (l0_metadata.marker_length < opening.marker_length)
+                            continue;
+                        // TODO validate closing indentation and trailing whitespace, then close the fence.
+                    }
+                    continue;
+                case '~':
+                    if (!fence_open) {
+                        // TODO validate indentation and info-string restrictions.
+                        fence_idx    = l0_idx;
+                        fence_open   = true;
+                        current_mask = &tilde_table;
+                        simd_byte_scan_many(buffer, 64, current_mask, &hits);
+                        hits &= (UINT64_MAX << index) & ~(1ULL << index);
+                        hits &= UINT64_MAX >> ((64 - buffer_bytes_read) & 63);
+                    } else {
+                        MdL0Metadata opening = state->l0_metadata[fence_idx];
+                        if (l0_metadata.marker_length < opening.marker_length)
+                            continue;
+                        // TODO validate closing indentation and trailing whitespace, then close the fence.
+                    }
+                    continue;
+                case '>':
+                    // TODO update quote containers in the L0 stack.
+                    break;
+                case '-':
+                case '+':
+                case '*':
+                    // TODO populate body_indent from marker width and padding, then update the L0 stack.
+                    break;
+                case 0:
+                case '#':
+                case '=':
+                case '_':
+                    // TODO match active container continuations.
+                    break;
+            }
+            // TODO examine skipped lines where container continuation requires it.
+            if (l0_end <= begin)
+                continue;
+
+            MdNode node = {
+                .start_idx      = l0_offset,
+                .end_idx        = l0_end,
+                .content_length = l0_length,
+            };
+            // TODO interpret and store intersecting L0 nodes.
+
+            // TODO binary search or better, checkpoint list
+            while (l1_idx < state->l1_count && state->l1_offsets[l1_idx] < l0_offset)
+                l1_idx += 1;
+            while (l1_idx < state->l1_count && state->l1_offsets[l1_idx] < l0_end) {
+                u32 l1_offset = state->l1_offsets[l1_idx];
+                u8  l1_tag    = state->l1_tags[l1_idx];
+                u32 l1_length = state->l1_lengths[l1_idx];
+                // TODO filter L1 tags with the active inline mask and resolve runs.
+                l1_idx += 1;
+            }
+            // TODO process this line's mappings.
+        }
+        buffer_l0_idx += buffer_bytes_read;
+    }
+
+get_end:
+    {
+        rop(rw MdNode) final_nodes = arena_alloc_aligned(arena, MdNode, nodes_count);
+        memcpy(final_nodes, nodes, sizeof(MdNode) * nodes_count);
+        return (MdResult){
+            .nodes = final_nodes,
+            .count = nodes_count,
+        };
+    }
+}
 
 void md_destroy(rop(rw MdState) state);
