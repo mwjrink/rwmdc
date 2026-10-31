@@ -25,9 +25,9 @@ layout(buffer_reference, scalar, buffer_reference_align = 4) restrict readonly b
 
 layout(push_constant, scalar) uniform TextFragPushConstants
 {
-    layout(offset = 0) GlyphBands_ptr font_glyph_bands;
-    layout(offset = 8) PackedCurve_ptr font_curves;
-    layout(offset = 16) Band_ptr font_bands;
+    layout(offset = 48) GlyphBands_ptr font_glyph_bands;
+    layout(offset = 56) PackedCurve_ptr font_curves;
+    layout(offset = 64) Band_ptr font_bands;
 } pc_frag;
 
 layout(location = 0) in vec4 in_color;
@@ -39,7 +39,7 @@ layout(location = 0) out vec4 out_color;
 uvec2 load_band(uint glyph_origin, uint band)
 {
     uint header = glyph_origin + band * 2u;
-    uvec2 result = uvec2(pc_frag.font_bands.data[header], pc_frag.font_bands.data[header + 1u]);
+    uvec2 result = uvec2(pc_frag.font_bands[header].data, pc_frag.font_bands[header + 1u].data);
 
     result.y += glyph_origin;
     return result;
@@ -47,9 +47,9 @@ uvec2 load_band(uint glyph_origin, uint band)
 
 bool load_curve(uint index_word, vec2 sample_uv, out vec4 p12, out vec2 p3)
 {
-    uint index = pc_frag.font_bands.data[index_word];
+    uint idx = pc_frag.font_bands[index_word].data;
 
-    PackedCurve curve = pc_frag.font_curves.data[index];
+    PackedCurve curve = pc_frag.font_curves[idx].data;
 
     p12 = vec4(unpackHalf2x16(curve.p0), unpackHalf2x16(curve.p1)) - vec4(sample_uv, sample_uv);
     p3 = unpackHalf2x16(curve.p2) - sample_uv;
@@ -217,7 +217,7 @@ void main()
 
     uint glyph_index = in_glyph.x;
 
-    GlyphBands glyph = pc_frag.font_glyph_bands.data[glyph_index];
+    GlyphBands glyph = pc_frag.font_glyph_bands[glyph_index].data;
 
     vec2 units_per_pixel = max(fwidth(in_uv), vec2(1.0e-7));
     vec2 pixels_per_unit = 1.0 / units_per_pixel;

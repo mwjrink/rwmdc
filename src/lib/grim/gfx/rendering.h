@@ -56,7 +56,11 @@ RenderContext render_context_create(rop(rw Arena) arena,
     return render_context;
 }
 
-RenderState create_render_state(rop(rw Arena) arena, rop(rw RenderContext) r_ctx, rop(ro FontAtlas) font_atlas) {
+RenderState create_render_state(rop(rw Arena) arena,
+                                rop(rw RenderContext) r_ctx,
+                                rop(ro FontAtlas) font_atlas,
+                                rop(ro Vec4) colors,
+                                u32 colors_count) {
     rop(ro GraphicsContext) ctx = r_ctx->ctx;
 
     u64 glyph_bounds_bytes  = (u64)font_atlas->glyph_count * sizeof(GlyphBounds);
@@ -77,6 +81,13 @@ RenderState create_render_state(rop(rw Arena) arena, rop(rw RenderContext) r_ctx
                                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     buffer_copy_with_staging(arena, ctx, slug_buff, font_atlas->data, font_atlas->total_bytes);
 
+    Buffer color_buff = buffer_create(ctx,
+                                      colors_count * sizeof(Vec4),
+                                      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                                          VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    buffer_copy_with_staging(arena, ctx, color_buff, colors, colors_count * sizeof(Vec4));
+
     u64    rect_draw_size  = sizeof(GpuRect) * 1024;
     u64    glyph_draw_size = sizeof(GlyphDrawCmd) * 128 * 256;
     Buffer draw_buff = buffer_create(ctx,
@@ -91,6 +102,7 @@ RenderState create_render_state(rop(rw Arena) arena, rop(rw RenderContext) r_ctx
         .font_glyphs_bounds = slug_buff.address + glyph_bounds_off,
         .pixel_to_ndc       = (Vec2){0},
         .scroll_offset      = (Vec2){0},
+        .palette            = color_buff.address,
         .draw_glyph_count   = 0,
     };
     PushConstant_TextFrag pc_frag = {
@@ -102,6 +114,7 @@ RenderState create_render_state(rop(rw Arena) arena, rop(rw RenderContext) r_ctx
         .rects         = draw_buff.address + glyph_draw_size,
         .pixel_to_ndc  = (Vec2){0},
         .scroll_offset = (Vec2){0},
+        .palette       = color_buff.address,
         .rect_count    = 0,
     };
 
@@ -111,8 +124,9 @@ RenderState create_render_state(rop(rw Arena) arena, rop(rw RenderContext) r_ctx
         .image_idx   = 0,
         .frame_count = 0,
 
-        .slug_buff = slug_buff,
-        .draw_buff = draw_buff,
+        .slug_buff  = slug_buff,
+        .color_buff = color_buff,
+        .draw_buff  = draw_buff,
 
         .pc_vert = pc_vert,
         .pc_frag = pc_frag,
@@ -171,7 +185,7 @@ u8 start_frame(rop(rw Arena) arena, rop(rw RenderState) render_state) {
     return true;
 }
 
-RecordingState render_init(rop(rw RenderState) render_state) {
+RecordingState render_init(rop(rw RenderState) render_state, Vec4 bg_color) {
     u32 frames_in_flight = render_state->r_ctx->frames_in_flight;
 
     rop(rw RenderContext) r_ctx        = render_state->r_ctx;
@@ -229,7 +243,7 @@ RecordingState render_init(rop(rw RenderState) render_state) {
     color_attachment_info.imageLayout               = VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL;
     color_attachment_info.loadOp                    = VK_ATTACHMENT_LOAD_OP_CLEAR;
     color_attachment_info.storeOp                   = VK_ATTACHMENT_STORE_OP_STORE;
-    color_attachment_info.clearValue                = (VkClearValue){.color = {{0.0f, 0.0f, 0.0f, 1.0f}}};
+    memcpy(&color_attachment_info.clearValue, bg_color.el, sizeof(bg_color.el));
 
     VkRenderingInfo rendering_info      = {0};
     rendering_info.sType                = VK_STRUCTURE_TYPE_RENDERING_INFO;
@@ -401,6 +415,8 @@ void cleanup_render_state(rop(rw RenderState) render_state) {
     empty_garbage(render_state);
 
     cleanup_buffer(ctx, &render_state->slug_buff);
+    cleanup_buffer(ctx, &render_state->color_buff);
+    cleanup_buffer(ctx, &render_state->draw_buff);
 }
 
 void cleanup_render_context(rop(rw RenderContext) r_ctx) {

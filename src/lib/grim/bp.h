@@ -19,6 +19,8 @@
 #define likely(x)   __builtin_expect(!!(x), 1)
 #define unlikely(x) __builtin_expect(!!(x), 0)
 
+#define unreachable() __builtin_unreachable()
+
 #define min(a, b)       ((a) < (b) ? (a) : (b))
 #define max(a, b)       ((a) > (b) ? (a) : (b))
 #define clamp(a, x, b)  (((x) < (a)) ? (a) : ((b) < (x)) ? (b) : (x))
@@ -64,7 +66,8 @@
 
 // NOTE SHOULD result in cmov or cmovne instructions instead of jumps
 // #define setif(cond, val_if_true, val_if_false) ((val_if_false) + ((cond) * ((val_if_true) - (val_if_false))))
-// #define setif_u32(cond, dest, src) ((dest) ^ (((src) ^ (dest)) & -(u32)(cond)))
+#define setif_u32(cond, dest, src) (dest) = ((dest) ^ (((src) ^ (dest)) & -(u32)(cond)))
+#define setif_u8(cond, dest, src) (dest) = ((dest) ^ (((src) ^ (dest)) & -(u8)(cond)))
 // #define setif(cond, dest, src) ((__builtin_unpredictable(cond)) ? (src) : (dest))
 
 // Helper macros to type-pun float addresses into integer pointers safely

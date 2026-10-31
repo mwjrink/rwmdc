@@ -8,7 +8,8 @@
 #include <lib/grim/math.h>
 #include <lib/grim/mem/str.h>
 #include <lib/grim/text/font.h>
-#include <lib/md/md_interface.h>
+// #include <lib/md/md_interface.h>
+#include <lib/md/md_parser_scratch.h>
 
 typedef enum EditorMode {
     INSERT = 0,
@@ -39,7 +40,7 @@ typedef struct ListMarkerCache {
 typedef struct Editor {
     Document    document;
     DocumentWal wal;
-    MdState*    md; // TODO not a pointer.
+    MdState     md;
 
     ListMarkerCache markers;
 
@@ -89,7 +90,8 @@ internal u32 font_shape_run(rop(rw TTFont) font,
     return count;
 }
 
-internal Editor editor_create(rop(rw Arena) arena, rop(rw TTFont) font, ro AppSettings settings, Str path) {
+internal Editor editor_create(
+    rop(rw Arena) arena, rop(rw ScratchArena) scratch, rop(rw TTFont) font, ro AppSettings settings, Str path) {
     Editor editor = {0};
 
     // Create owned copy of path
@@ -120,6 +122,10 @@ internal Editor editor_create(rop(rw Arena) arena, rop(rw TTFont) font, ro AppSe
         font_shape_run(font, space, 1, space_glyph);
         editor.space_advance = space_glyph[0].advance;
     }
+
+    DocPiece pieces[3];
+    DocView  source = document_get_view(&editor.document, 0, u32_MAX, pieces);
+    editor.md       = md_create(&source, arena, scratch);
 
     return editor;
 }
@@ -168,7 +174,7 @@ enum {
 };
 
 internal force_inline(f32) output_glyphs_reverse(
-    rop(rw DrawLayer) layer, rop(ro ShapedGlyph) glyphs, u32 glyphs_count, f32 scale, f32 x, f32 y, u32 fg_color) {
+    rop(rw DrawLayer) layer, rop(ro ShapedGlyph) glyphs, u32 glyphs_count, f32 scale, f32 x, f32 y, u32 color_idx) {
     for (u32 idx = glyphs_count; idx > 0; idx--) {
         const ShapedGlyph* glyph = &glyphs[idx - 1];
         x -= glyph->advance * scale;
@@ -178,7 +184,7 @@ internal force_inline(f32) output_glyphs_reverse(
             .sx        = scale,
             .sy        = -scale,
             .glyph_idx = glyph->id,
-            .color     = fg_color,
+            .color_idx = color_idx,
         };
         layer->glyph_count += 1;
     }
@@ -186,7 +192,7 @@ internal force_inline(f32) output_glyphs_reverse(
 }
 
 internal force_inline(f32) output_glyphs(
-    rop(rw DrawLayer) layer, rop(ro ShapedGlyph) glyphs, u32 glyphs_count, f32 scale, f32 x, f32 y, u32 fg_color) {
+    rop(rw DrawLayer) layer, rop(ro ShapedGlyph) glyphs, u32 glyphs_count, f32 scale, f32 x, f32 y, u32 color_idx) {
     for (u32 idx = 0; idx < glyphs_count; idx++) {
         const ShapedGlyph* glyph = &glyphs[idx];
         x += glyph->advance * scale;
@@ -196,7 +202,7 @@ internal force_inline(f32) output_glyphs(
             .sx        = scale,
             .sy        = -scale,
             .glyph_idx = glyph->id,
-            .color     = fg_color,
+            .color_idx = color_idx,
         };
         layer->glyph_count += 1;
     }
@@ -215,6 +221,7 @@ DrawLayer editor_get_text_layer(rop(rw Editor) editor,
                                 rop(rw TTFont) font,
                                 u32 width,
                                 u32 height) {
+    u64 editor_layer_profiling_time = time_start();
 
     // 1. Anchor at the byte under scroll.y (linear estimate for now), then
     //    walk md blocks backward and forward until the viewport is covered.
@@ -242,17 +249,21 @@ DrawLayer editor_get_text_layer(rop(rw Editor) editor,
         end   = min(anchor + window_bytes, doc_stats.length);
     }
 
+    time_checkpoint(SCOPE_DEBUG, "editor_get_text_layer pre md", editor_layer_profiling_time);
     // 3. Ask md for nodes overlapping [begin, end).
-    MdResult md_nodes = md_get(editor->md, arena, scratch, begin, end);
+    MdResult md_nodes = md_get(&editor->md, arena, scratch, begin, end);
+    time_checkpoint(SCOPE_DEBUG, "editor_get_text_layer post md", editor_layer_profiling_time);
 
     DrawLayer layer = {0};
-    layer.glyphs    = arena_alloc_aligned(arena, GlyphDrawCmd, doc_stats.length ? doc_stats.length : 1);
-    layer.rects     = arena_alloc_aligned(arena, GpuRect, md_nodes.count ? md_nodes.count : 1);
+    layer.glyphs    = arena_alloc_aligned(arena, GlyphDrawCmd, max(doc_stats.length, 1));
+    layer.rects     = arena_alloc_aligned(arena, GpuRect, max(md_nodes.count, 1));
+
+    time_checkpoint(SCOPE_DEBUG, "editor_get_text_layer setup", editor_layer_profiling_time);
 
     // 4. One span per iteration, driven by an explicit stack.
     {
         struct StackEntry {
-            u32 node_idx;
+            u32 next_node_idx;
             u32 style_mask;
         };
         struct StackEntry* stack     = scratch_alloc_aligned(scratch, struct StackEntry, max(md_nodes.count * 2, 1));
@@ -260,7 +271,7 @@ DrawLayer editor_get_text_layer(rop(rw Editor) editor,
 
         // Pending background/gutter rects, closed when their block is popped.
         struct PendingRect {
-            u32 node_idx;
+            u32 next_node_idx;
             f32 start_y;
             f32 x;
             f32 width;
@@ -270,65 +281,58 @@ DrawLayer editor_get_text_layer(rop(rw Editor) editor,
         u32                 pending_len = 0;
 
         f32 x      = MARGIN;
-        f32 y      = MARGIN;
+        f32 y      = MARGIN; // Line top; glyph output adds the scaled ascent.
         f32 indent = MARGIN;
 
-        u32 i          = 0;
-        u32 span_start = begin;
+        u32 next_node_idx = 0;
+        u32 span_start    = begin;
 
-        u32 last_processed = 0;
-        u32 style          = 0;
+        // u32 last_processed = 0;
+        u32 style = 0;
 
         while (true) {
             u32 cur_idx;
 
             if (stack_len > 0) {
-                cur_idx = stack[stack_len - 1].node_idx;
-            } else if (i < md_nodes.count) {
-                stack[stack_len] = (struct StackEntry){.node_idx = i, .style_mask = style}; // push always
+                cur_idx = stack[stack_len - 1].next_node_idx;
+            } else if (next_node_idx < md_nodes.count) {
+                stack[stack_len] =
+                    (struct StackEntry){.next_node_idx = next_node_idx, .style_mask = style}; // push always
                 stack_len += 1;
-                cur_idx = i;
+                cur_idx = next_node_idx;
+                next_node_idx += 1;
             } else {
                 break;
             }
 
-            last_processed = max(last_processed, cur_idx);
-            MdNode cur     = md_nodes.nodes[cur_idx];
+            // last_processed = max(last_processed, cur_idx);
+            MdNode cur = md_nodes.nodes[cur_idx];
 
-            u32 next     = i + 1;
             u32 span_end = cur.end_idx;
-            if (likely(next < md_nodes.count)) { // TODO is there a way to get rid of the if statement entirely?
-                                                 // make md_nodes one too long? or end loop at count - 1?
-                span_end = min(cur.end_idx, md_nodes.nodes[next].start_idx);
 
-                stack[stack_len] = (struct StackEntry){.node_idx = next, .style_mask = style};
-                stack_len += 1;
-            }
-
-            f32 scale      = base_scale;
-            u32 text_color = theme->font_fg;
+            f32 scale          = base_scale;
+            u32 text_color_idx = theme_idx(font_fg);
 
             switch (cur.kind) {
                 case MD_NODE_HIDDEN:
                     goto span_done;
                 case MD_NODE_HARD_BREAK:
-                    y += font->line_height;
+                    y += font->line_height * scale;
                     x = indent;
                     goto span_done;
                 case MD_NODE_SOFT_BREAK:
                     x += editor->space_advance * scale;
                     goto span_done;
                 case MD_NODE_BLANK:
-                    y += font->line_height * (f32)cur.data.line_count;
+                    y += font->line_height * scale * (f32)(cur.data.line_count - 1);
                     goto span_done;
                 case MD_NODE_THEMATIC_BREAK:
-                    layer.rects[layer.rect_count++] = (GpuRect){.x      = indent,
-                                                                .y      = y,
-                                                                .width  = (f32)width - indent - MARGIN,
-                                                                .height = 1.0f,
-                                                                .color  = theme->thematic_break_fg,
-                                                                .flags  = 0};
-                    y += font->line_height;
+                    layer.rects[layer.rect_count++] = (GpuRect){.x         = indent,
+                                                                .y         = y,
+                                                                .width     = (f32)width - indent - MARGIN,
+                                                                .height    = 1.0f,
+                                                                .color_idx = theme_idx(thematic_break_fg),
+                                                                .flags     = 0};
                     goto span_done;
                 case MD_NODE_QUOTE:
                     indent = MARGIN + (f32)cur.data.quote_depth * 16.0f;
@@ -351,13 +355,25 @@ DrawLayer editor_get_text_layer(rop(rw Editor) editor,
                         }
 
                         f32 marker_x = indent - 6.0f;
-                        output_glyphs_reverse(&layer, glyphs, glyphs_count, scale, marker_x, y, theme->list_marker_fg);
+                        output_glyphs_reverse(&layer,
+                                              glyphs,
+                                              glyphs_count,
+                                              scale,
+                                              marker_x,
+                                              y + font->ascent * scale,
+                                              theme_idx(list_marker_fg));
                     } else if (!cur.data.item.ordered) {
                         u32          glyphs_count = editor->markers.bullet_count;
                         ShapedGlyph* glyphs       = editor->markers.bullet_glyphs;
 
                         f32 marker_x = indent - 6.0f;
-                        output_glyphs_reverse(&layer, glyphs, glyphs_count, scale, marker_x, y, theme->list_marker_fg);
+                        output_glyphs_reverse(&layer,
+                                              glyphs,
+                                              glyphs_count,
+                                              scale,
+                                              marker_x,
+                                              y + font->ascent * scale,
+                                              theme_idx(list_marker_fg));
                     } else {
                         // Ordered "N." number varies; shape fresh.
                         i32 marker_codepoints[16];
@@ -379,43 +395,49 @@ DrawLayer editor_get_text_layer(rop(rw Editor) editor,
                         u32 glyphs_count = font_shape_run(font, marker_codepoints, marker_codepoint_count, glyphs);
 
                         f32 marker_x = indent - 6.0f;
-                        output_glyphs_reverse(&layer, glyphs, glyphs_count, scale, marker_x, y, theme->list_marker_fg);
+                        output_glyphs_reverse(&layer,
+                                              glyphs,
+                                              glyphs_count,
+                                              scale,
+                                              marker_x,
+                                              y + font->ascent * scale,
+                                              theme_idx(list_marker_fg));
                     }
 
                     break;
                 }
                 case MD_NODE_CODE_BLOCK: {
                     pending[pending_len++] = (struct PendingRect){
-                        .node_idx = cur_idx,
-                        .start_y  = y,
-                        .x        = indent - 4.0f,
-                        .width    = (f32)width - indent - 8.0f,
-                        .color    = theme->code_block_bg,
+                        .next_node_idx = cur_idx,
+                        .start_y       = y,
+                        .x             = indent - 4.0f,
+                        .width         = (f32)width - indent - 8.0f,
+                        .color         = theme_idx(code_block_bg),
                     };
                     indent += 4.0f; // indentation inside a code block
-                    text_color = theme->code_block_fg;
+                    text_color_idx = theme_idx(code_block_fg);
                     break;
                 }
                 case MD_NODE_HEADING:
                     scale *= 1.0f + 2.0f / (f32)cur.data.heading_level;
                     switch (cur.data.heading_level) {
                         case 1:
-                            text_color = theme->h1_fg;
+                            text_color_idx = theme_idx(h1_fg);
                             break;
                         case 2:
-                            text_color = theme->h2_fg;
+                            text_color_idx = theme_idx(h2_fg);
                             break;
                         case 3:
-                            text_color = theme->h3_fg;
+                            text_color_idx = theme_idx(h3_fg);
                             break;
                         case 4:
-                            text_color = theme->h4_fg;
+                            text_color_idx = theme_idx(h4_fg);
                             break;
                         case 5:
-                            text_color = theme->h5_fg;
+                            text_color_idx = theme_idx(h5_fg);
                             break;
                         default:
-                            text_color = theme->h6_fg;
+                            text_color_idx = theme_idx(h6_fg);
                             break;
                     }
                     break;
@@ -433,66 +455,75 @@ DrawLayer editor_get_text_layer(rop(rw Editor) editor,
                         font_shape_run(font, replacement_codepoints, (u32)replacement_codepoint_count, glyphs);
 
                     for (u32 repeat_index = 0; repeat_index < cur.data.replacement.repeat; repeat_index++) {
-                        x += output_glyphs(&layer, glyphs, glyphs_count, scale, x, y, text_color);
+                        x += output_glyphs(
+                            &layer, glyphs, glyphs_count, scale, x, y + font->ascent * scale, text_color_idx);
                     }
                     goto span_done;
                 }
                 case MD_NODE_EMPHASIS:
                     style |= STYLE_ITALIC;
-                    text_color = theme->emphasis_fg;
+                    text_color_idx = theme_idx(emphasis_fg);
                     break;
                 case MD_NODE_STRONG:
                     style |= STYLE_BOLD;
-                    text_color = theme->strong_fg;
+                    text_color_idx = theme_idx(strong_fg);
                     break;
                 case MD_NODE_CODE_INLINE:
                     style |= STYLE_CODE;
-                    text_color = theme->code_fg;
+                    text_color_idx = theme_idx(code_fg);
                     break;
                 case MD_NODE_LINK:
                 case MD_NODE_WIKI_LINK:
                     style |= STYLE_LINK;
-                    text_color = theme->link_fg;
+                    text_color_idx = theme_idx(link_fg);
                     break;
                 case MD_NODE_IMAGE:
-                    text_color = theme->image_fg;
+                    text_color_idx = theme_idx(image_fg);
                     break;
                 case MD_NODE_HTML_INLINE:
                 case MD_NODE_HTML_BLOCK:
-                    text_color = theme->html_fg;
+                    text_color_idx = theme_idx(html_fg);
                     break;
                 case MD_NODE_STRIKETHROUGH:
-                    text_color = theme->strikethrough_fg;
+                    text_color_idx = theme_idx(strikethrough_fg);
                     break;
                 case MD_NODE_INSERT:
-                    text_color = theme->insert_fg;
+                    text_color_idx = theme_idx(insert_fg);
                     break;
                 case MD_NODE_UNDERLINE:
-                    text_color = theme->underline_fg;
+                    text_color_idx = theme_idx(underline_fg);
                     break;
                 case MD_NODE_SPOILER:
-                    text_color = theme->spoiler_fg;
+                    text_color_idx = theme_idx(spoiler_fg);
                     break;
                 case MD_NODE_SUPERSCRIPT:
-                    text_color = theme->superscript_fg;
+                    text_color_idx = theme_idx(superscript_fg);
                     break;
                 case MD_NODE_SUBSCRIPT:
-                    text_color = theme->subscript_fg;
+                    text_color_idx = theme_idx(subscript_fg);
                     break;
                 case MD_NODE_HIGHLIGHT:
-                    text_color = theme->highlight_fg;
+                    text_color_idx = theme_idx(highlight_fg);
                     break;
                 case MD_NODE_MATH_INLINE:
                 case MD_NODE_MATH_DISPLAY:
-                    text_color = theme->math_fg;
+                    text_color_idx = theme_idx(math_fg);
                     break;
                 case MD_NODE_FOOTNOTE_REFERENCE:
                 case MD_NODE_FOOTNOTE_DEFINITION:
                 case MD_NODE_FOOTNOTE_SECTION:
-                    text_color = theme->footnote_fg;
+                    text_color_idx = theme_idx(footnote_fg);
                     break;
                 default:
                     break;
+            }
+
+            if (likely(next_node_idx < md_nodes.count) && md_nodes.nodes[next_node_idx].start_idx < cur.end_idx) {
+                span_end = md_nodes.nodes[next_node_idx].start_idx;
+
+                stack[stack_len] = (struct StackEntry){.next_node_idx = next_node_idx, .style_mask = style};
+                stack_len += 1;
+                next_node_idx += 1;
             }
 
             // output one span of CONTENT (strip Markdown syntax):
@@ -511,6 +542,7 @@ DrawLayer editor_get_text_layer(rop(rw Editor) editor,
 
                 //   shape               codepoint[] -> glyphs (fontshaper, one run)
                 {
+
                     fontshaper_ResetGlyphStorage(&font->glyph_storage);
                     for (u32 codepoint_index = 0; codepoint_index < codepoint_count; codepoint_index++) {
                         fontshaper_glyph* glyph = fontshaper_PushGlyph(&font->glyph_storage,
@@ -534,17 +566,17 @@ DrawLayer editor_get_text_layer(rop(rw Editor) editor,
                         // wrap at width on glyph boundaries (ligatures intact)
                         if (x + advance > (f32)width - MARGIN) {
                             x = indent;
-                            y += font->line_height;
+                            y += font->line_height * scale;
                         }
 
                         // append GlyphDrawCmd
                         layer.glyphs[layer.glyph_count] = (GlyphDrawCmd){
                             .x         = x + (f32)glyph->OffsetX * scale,
-                            .y         = y + (f32)glyph->OffsetY * scale,
+                            .y         = y + (font->ascent + (f32)glyph->OffsetY) * scale,
                             .sx        = scale,
                             .sy        = -scale,
                             .glyph_idx = glyph->Id,
-                            .color     = text_color,
+                            .color_idx = text_color_idx,
                         };
 
                         layer.glyph_count += 1;
@@ -570,26 +602,31 @@ DrawLayer editor_get_text_layer(rop(rw Editor) editor,
                 // Close this block's pending background. Rect is pushed on enter,
                 // so its index in `pending` matches the node-stack depth; scan
                 // from the top down and stop at the first match.
-                if (pending_len > 0 && pending[pending_len - 1].node_idx == cur_idx) {
+                if (pending_len > 0 && pending[pending_len - 1].next_node_idx == cur_idx) {
                     struct PendingRect rect = pending[pending_len - 1];
                     pending_len -= 1;
                     layer.rects[layer.rect_count] = (GpuRect){
-                        .x      = rect.x,
-                        .y      = rect.start_y,
-                        .width  = rect.width,
-                        .height = y - rect.start_y,
-                        .color  = rect.color,
-                        .flags  = 0,
+                        .x         = rect.x,
+                        .y         = rect.start_y,
+                        .width     = rect.width,
+                        .height    = y - rect.start_y,
+                        .color_idx = rect.color,
+                        .flags     = 0,
                     };
                     layer.rect_count += 1;
                 }
                 style = stack[stack_len - 1].style_mask;
                 stack_len -= 1;
+
+                y += font->line_height * scale;
+                x = indent;
             }
 
-            i = max(last_processed, i + 1);
+            // next_node_idx = max(last_processed, next_node_idx + 1);
         }
     }
+
+    time_checkpoint(SCOPE_DEBUG, "editor_get_text_layer loop", editor_layer_profiling_time);
 
     // 5. caret + selection are rects too; add them here.
 

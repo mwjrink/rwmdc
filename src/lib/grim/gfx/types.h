@@ -261,8 +261,9 @@ typedef struct PushConstant_TextVert {
     VkDeviceAddress draw_glyphs;
     VkDeviceAddress font_glyphs_bounds;
 
-    Vec2 pixel_to_ndc;
-    Vec2 scroll_offset;
+    Vec2            pixel_to_ndc;
+    Vec2            scroll_offset;
+    VkDeviceAddress palette;
 
     u32 draw_glyph_count;
 } PushConstant_TextVert;
@@ -278,8 +279,9 @@ STATIC_ASSERT(sizeof(PushConstant_TextFrag) <= 128);
 typedef struct PushConstant_Rect {
     VkDeviceAddress rects;
 
-    Vec2 pixel_to_ndc;
-    Vec2 scroll_offset;
+    Vec2            pixel_to_ndc;
+    Vec2            scroll_offset;
+    VkDeviceAddress palette;
 
     u32 rect_count;
 } PushConstant_Rect;
@@ -292,7 +294,7 @@ typedef struct GlyphDrawCmd {
     f32 sy;
 
     u32 glyph_idx;
-    u32 color;
+    u32 color_idx;
 } GlyphDrawCmd;
 STATIC_ASSERT(sizeof(GlyphDrawCmd) == 24);
 
@@ -302,7 +304,7 @@ typedef struct GpuRect {
     f32 width;
     f32 height;
 
-    u32 color;
+    u32 color_idx;
     u32 flags;
 } GpuRect;
 STATIC_ASSERT(sizeof(GpuRect) == 24);
@@ -359,6 +361,7 @@ typedef struct RenderState {
 
     Buffer slug_buff;
     Buffer draw_buff;
+    Buffer color_buff;
 
     PushConstant_TextVert pc_vert;
     PushConstant_TextFrag pc_frag;
@@ -366,7 +369,7 @@ typedef struct RenderState {
 
     RingBuff swapchain_garbage;
 } RenderState;
-STATIC_ASSERT(sizeof(RenderState) == 232);
+STATIC_ASSERT(sizeof(RenderState) == 296);
 
 typedef struct FontAtlas {
     u8* data; // contiguous block holding all four regions

@@ -10,13 +10,10 @@
 #include <config.h>
 #include <document.h>
 #include <editor.h>
+// #include <lib/md/md_parser_scratch.h>
 
 // FIXME TEMP
 #include <lib/grim/gfx/internal_graphics.h>
-
-#define RWMD_MARKDOWN_IMPLEMENTATION
-#include <lib/grim/markdown/layout.h>
-#undef RWMD_MARKDOWN_IMPLEMENTATION
 
 // Fontshaper: compile the native shaping font once at startup. One TU owns
 // the implementation; the compiled blob lives as long as the editor.
@@ -33,11 +30,13 @@ int main(int argc, char** argv) {
     u64 app_profiling_time = time_start();
 
     Str document_path = {0};
-    for (int i = 1; i < argc; i++) {
+    for (i32 i = 1; i < argc; i++) {
         Str arg = str_from_cstring(argv[i]);
         if (str_equals(arg, str_create("--help")) || str_equals(arg, str_create("-h"))) {
             printf("Usage: %s [file.md]", argv[0]);
             return 0;
+        } else if (str_equals(arg, str_create("--config")) || str_equals(arg, str_create("-c"))) {
+            // TODO config file loc
         } else {
             document_path = arg;
         }
@@ -75,24 +74,21 @@ int main(int argc, char** argv) {
     // - create document
     // - set up saving thread
 
-    arena_ckpt(&general_arena);
     // TODO use a loading arena here which is separate. ENSURE scratch is NOT reset internally
     TTFont    font  = font_load(&general_arena, &scratch_arena, font_path.data);
-    FontAtlas atlas = slug_build_atlas(&general_arena, &scratch_arena, &font, settings.font.size);
-
-    Editor editor = editor_create(&general_arena, &font, settings, document_path);
+    // TODO get rid of atlas from memory once it's uploaded
+    FontAtlas atlas = slug_build_atlas(&general_arena, &scratch_arena, &font);
 
     // this invalidates font_path
-    scratch_reset(&scratch_arena);
+    // scratch_reset(&scratch_arena);
     font_path = (Str){0}; // just to be clear.
 
-    InputState  input_state  = input_create_state(&input_ctx);
-    // TODO should this be scratch instead?
-    RenderState render_state = create_render_state(&general_arena, &render_ctx, &atlas);
+    InputState  input_state = input_create_state(&input_ctx);
+    // TODO should this be scratch for buffer copy, general for garbage ring buffer
+    RenderState render_state =
+        create_render_state(&general_arena, &render_ctx, &atlas, (Vec4*)&theme, sizeof(theme) / sizeof(Vec4));
 
-    // TODO technically this is unsafe because arena was used in create_render_state but in this case,
-    // I know it wasn't used in there for anything.
-    arena_pop(&general_arena);
+    Editor editor = editor_create(&general_arena, &scratch_arena, &font, settings, document_path);
 
     // TODO these should return a checkpoint I can pass back in at rollback/pop stage
     arena_ckpt(&general_arena);
@@ -137,7 +133,7 @@ int main(int argc, char** argv) {
 
         time_checkpoint(SCOPE_DEBUG, "input events", app_profiling_time);
 
-        if (input_state.lock_mouse) {         // && render_target.window->locked_pointer == NULL) {
+        if (input_state.lock_mouse) { // && render_target.window->locked_pointer == NULL) {
             window_lock_pointer(render_target.window);
         } else if (!input_state.lock_mouse) { // && render_target.window->locked_pointer != NULL) {
             window_unlock_pointer(render_target.window);
@@ -147,20 +143,23 @@ int main(int argc, char** argv) {
             .x = 2.0f / (f32)render_target.extent.width,
             .y = 2.0f / (f32)render_target.extent.height,
         };
+        // TODO why is scroll passed here? doesn't editor layer handle this?
         update_state(&render_state, editor.scroll, pixel_to_ndc);
 
-        DrawLayer   text_draw_layer   = editor_get_text_layer(&editor,
-                                                              &general_arena,
-                                                              &scratch_arena,
-                                                              &settings,
-                                                              &theme,
-                                                              &font,
-                                                              render_target.extent.width,
-                                                              render_target.extent.height);
+        DrawLayer text_draw_layer = editor_get_text_layer(&editor,
+                                                          &general_arena,
+                                                          &scratch_arena,
+                                                          &settings,
+                                                          &theme,
+                                                          &font,
+                                                          render_target.extent.width,
+                                                          render_target.extent.height);
+        time_checkpoint(SCOPE_DEBUG, "editor_get_text_layer", app_profiling_time);
+
         RenderLayer text_render_layer = upload_layer(&render_state, &text_draw_layer);
         // DrawLayer ui_layer = editor_get_ui_layer(&editor);
 
-        time_checkpoint(SCOPE_DEBUG, "editor_data_update", app_profiling_time);
+        time_checkpoint(SCOPE_DEBUG, "upload_text_layer", app_profiling_time);
 
         u32 start_frame_result = start_frame(&general_arena, &render_state);
         if (!start_frame_result) {
@@ -169,7 +168,7 @@ int main(int argc, char** argv) {
 
         time_checkpoint(SCOPE_DEBUG, "start_frame", app_profiling_time);
 
-        RecordingState recording_state = render_init(&render_state);
+        RecordingState recording_state = render_init(&render_state, theme.window_bg);
 
         draw_layer(&render_state, recording_state, &text_render_layer);
         // draw_layer(&render_state, recording_state, &ui_render_layer);
@@ -187,6 +186,7 @@ int main(int argc, char** argv) {
             break;
         }
 
+        scratch_reset(&scratch_arena);
         arena_rollback(&general_arena);
         assert(SCOPE_MEM_ARENA, frame_start_arena_len == general_arena.len);
 
@@ -195,11 +195,11 @@ int main(int argc, char** argv) {
 
     f32 end       = (f32)clock() / (f32)CLOCKS_PER_SEC;
     f32 full_time = end - start;
-    DEBUG_LOG(SCOPE_DEBUG,
-              "%u frames in %fs for %f fps",
-              render_state.frame_count,
-              (f64)full_time,
-              (f64)render_state.frame_count / (f64)full_time);
+    WARNING_LOG(SCOPE_DEBUG,
+                "%u frames in %fs for %f fps",
+                render_state.frame_count,
+                (f64)full_time,
+                (f64)render_state.frame_count / (f64)full_time);
 
     // /sys/devices/system/cpu/cpu31/cache/index3/size
     // P & E cores

@@ -18,13 +18,19 @@ layout(buffer_reference, scalar, buffer_reference_align = 4) restrict readonly b
     GlyphBounds data;
 };
 
+layout(buffer_reference, scalar, buffer_reference_align = 4) restrict readonly buffer Palette_ptr
+{
+    vec4 data;
+};
+
 layout(push_constant, scalar) uniform TextVertPushConstants
 {
-    layout(offset = 0)  GlyphDrawCmd_ptr draw_glyphs;
-    layout(offset = 8)  GlyphBounds_ptr font_glyphs_bounds;
+    layout(offset = 0) GlyphDrawCmd_ptr draw_glyphs;
+    layout(offset = 8) GlyphBounds_ptr font_glyphs_bounds;
     layout(offset = 16) vec2 pixel_to_ndc;
     layout(offset = 24) vec2 scroll_offset;
-    layout(offset = 32) uint draw_glyph_count;
+    layout(offset = 32) Palette_ptr palette;
+    layout(offset = 40) uint draw_glyph_count;
 } pc_vert;
 
 layout(location = 0) out vec4 out_color;
@@ -36,11 +42,11 @@ void main()
     uint idx = uint(gl_InstanceIndex);
     vec2 corner = vec2(gl_VertexIndex & 1, (gl_VertexIndex >> 1) & 1);
 
-    GlyphDrawCmd instance = pc_vert.draw_glyphs.data[idx];
+    GlyphDrawCmd instance = pc_vert.draw_glyphs[idx].data;
 
     uint glyph_index = instance.glyph_idx & 0x00ffffffu;
 
-    GlyphBounds bounds = pc_vert.font_glyphs_bounds.data[glyph_index];
+    GlyphBounds bounds = pc_vert.font_glyphs_bounds[glyph_index].data;
 
     // A zero-area bbox marks an empty glyph (no ink): cull the whole quad.
     if (bounds.min_x == bounds.max_x && bounds.min_y == bounds.max_y)
@@ -61,7 +67,7 @@ void main()
         return;
     }
 
-    out_color = unpackUnorm4x8(instance.color);
+    out_color = pc_vert.palette[instance.color_idx].data;
 
     uint style = instance.glyph_idx & 0xff000000u;
     out_glyph = uvec4(glyph_index, style, 0u, 0u);

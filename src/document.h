@@ -30,6 +30,17 @@ typedef struct {
     u32           index; // TODO: single cursor vs redo tail
 } DocumentWal;
 
+typedef struct {
+    u8* bytes;
+    u32 length;
+} DocPiece;
+
+typedef struct {
+    DocPiece* pieces;
+    u32       count;
+    u32       total_length;
+} DocView;
+
 #define AFTER_WRITE_PTR(doc) (doc->after + doc->after_cap - doc->after_len)
 #define ACTIVE_SIZE          60
 // Gap buffer: before | active[60] (hot) | after. Cursor lives in active.
@@ -127,6 +138,56 @@ DocumentStats document_get_stats(rop(ro Document) doc) {
         .length = doc->before_len + doc->active_len + doc->after_len,
         .cursor = doc->before_len + (u32)doc->active_cursor,
         .dirty  = doc->dirty,
+    };
+}
+
+DocView document_get_view(rop(ro Document) doc, u32 offset, u32 len, DocPiece pieces[3]) {
+    u32 total = doc->before_len + doc->active_len + doc->after_len;
+    u32 start = min(offset, total);
+    len       = min(len, total - start);
+
+    // before
+    if (start < doc->before_len) {
+        u32 take  = min(len, doc->before_len - start);
+        pieces[0] = (DocPiece){
+            .bytes  = doc->before + start,
+            .length = take,
+        };
+
+        start += take;
+        len -= take;
+    }
+
+    // active
+    if (len > 0 && start < doc->before_len + doc->active_len) {
+        u32 relative_start = start - doc->before_len;
+        u32 take           = min(len, doc->active_len - relative_start);
+
+        pieces[0] = (DocPiece){
+            .bytes  = (u8*)doc->active + relative_start,
+            .length = take,
+        };
+
+        start += take;
+        len -= take;
+    }
+
+    // after (content stored tail-first in the buffer)
+    if (len > 0) {
+        u32 relative_start = start - doc->before_len - doc->active_len;
+        assert(SCOPE_DOCUMENT, relative_start < doc->after_len);
+        u32 take = min(len, doc->after_len - relative_start);
+
+        pieces[0] = (DocPiece){
+            .bytes  = AFTER_WRITE_PTR(doc) + relative_start,
+            .length = take,
+        };
+    }
+
+    return (DocView){
+        .pieces       = pieces,
+        .count        = 3,
+        .total_length = total,
     };
 }
 

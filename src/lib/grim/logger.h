@@ -444,9 +444,10 @@ u64 _clock_nano() {
     do {                                                                                                               \
         u64 _now = _clock_nano();                                                                                      \
         u64 _dt  = _now - start;                                                                                       \
-        start    = _now;                                                                                               \
                                                                                                                        \
         DEBUG_LOG(scope, ckpt " took: %lu ns", _dt);                                                                   \
+                                                                                                                       \
+        start = _clock_nano();                                                                                         \
     } while (0)
 
 #define time_end(scope, start)                                                                                         \

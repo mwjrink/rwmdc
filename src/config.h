@@ -2,6 +2,7 @@
 
 #include <fcntl.h>
 #include <lib/grim/bp.h>
+#include <lib/grim/gfx/vkutils.h>
 #include <lib/grim/logger.h>
 #include <lib/grim/math.h>
 #include <lib/grim/mem/arena.h>
@@ -20,62 +21,63 @@ typedef enum ConfigFindBinding {
     ConfigFindBinding_Slash,
 } ConfigFindBinding;
 
-// Markdown colors, packed R | G<<8 | B<<16 | A<<24. One entry per distinct
+// Markdown colors as normalized RGBA floats. One entry per distinct
 // visual treatment produced by the text layer.
 typedef struct {
     // Structural
-    u32 window_bg;
-    u32 selection_bg;
-    u32 cursor;
+    Vec4 window_bg;
+    Vec4 selection_bg;
+    Vec4 cursor;
 
     // Text / blocks
-    u32 font_fg; // default paragraph text
-    u32 h1_fg;
-    u32 h2_fg;
-    u32 h3_fg;
-    u32 h4_fg;
-    u32 h5_fg;
-    u32 h6_fg;
-    u32 quote_fg;     // quote text
-    u32 quote_bar_fg; // quote gutter
-    u32 list_marker_fg;
-    u32 code_block_fg;
-    u32 code_block_bg;
-    u32 html_fg;
-    u32 thematic_break_fg;
-    u32 comment_fg;
+    Vec4 font_fg; // default paragraph text
+    Vec4 h1_fg;
+    Vec4 h2_fg;
+    Vec4 h3_fg;
+    Vec4 h4_fg;
+    Vec4 h5_fg;
+    Vec4 h6_fg;
+    Vec4 quote_fg;     // quote text
+    Vec4 quote_bar_fg; // quote gutter
+    Vec4 list_marker_fg;
+    Vec4 code_block_fg;
+    Vec4 code_block_bg;
+    Vec4 html_fg;
+    Vec4 thematic_break_fg;
+    Vec4 comment_fg;
 
     // Inline spans
-    u32 emphasis_fg;
-    u32 strong_fg;
-    u32 link_fg;
-    u32 image_fg;
-    u32 code_fg; // inline code text
-    u32 code_span_bg;
-    u32 strikethrough_fg;
-    u32 insert_fg;
-    u32 underline_fg;
-    u32 spoiler_fg;
-    u32 superscript_fg;
-    u32 subscript_fg;
-    u32 highlight_fg;
-    u32 highlight_bg;
-    u32 math_fg;
-    u32 footnote_fg;
+    Vec4 emphasis_fg;
+    Vec4 strong_fg;
+    Vec4 link_fg;
+    Vec4 image_fg;
+    Vec4 code_fg; // inline code text
+    Vec4 code_span_bg;
+    Vec4 strikethrough_fg;
+    Vec4 insert_fg;
+    Vec4 underline_fg;
+    Vec4 spoiler_fg;
+    Vec4 superscript_fg;
+    Vec4 subscript_fg;
+    Vec4 highlight_fg;
+    Vec4 highlight_bg;
+    Vec4 math_fg;
+    Vec4 footnote_fg;
 
     // Tables
-    u32 table_border_fg;
-    u32 table_header_fg;
-    u32 table_header_bg;
+    Vec4 table_border_fg;
+    Vec4 table_header_fg;
+    Vec4 table_header_bg;
 
     // Admonitions
-    u32 admonition_note_fg;
-    u32 admonition_tip_fg;
-    u32 admonition_important_fg;
-    u32 admonition_warning_fg;
-    u32 admonition_caution_fg;
+    Vec4 admonition_note_fg;
+    Vec4 admonition_tip_fg;
+    Vec4 admonition_important_fg;
+    Vec4 admonition_warning_fg;
+    Vec4 admonition_caution_fg;
 } Theme;
-STATIC_ASSERT(sizeof(Theme) == 168);
+STATIC_ASSERT(sizeof(Theme) == 672);
+#define theme_idx(color) (offsetof(Theme, color) / sizeof(Vec4))
 
 typedef struct {
     struct {
@@ -109,7 +111,7 @@ typedef struct {
     AppSettings settings;
     Str         font_path;
 } ConfigParseResult;
-STATIC_ASSERT(sizeof(ConfigParseResult) == 216);
+STATIC_ASSERT(sizeof(ConfigParseResult) == 720);
 
 typedef struct {
     char* data;
@@ -147,54 +149,62 @@ internal AppSettings config_settings_default() {
     };
 }
 
+#define bytes_to_vec4_color(red, green, blue, alpha)                                                                   \
+    {                                                                                                                  \
+        .r = srgb_to_linear(red / 255.0f),                                                                             \
+        .g = srgb_to_linear(green / 255.0f),                                                                           \
+        .b = srgb_to_linear(blue / 255.0f),                                                                            \
+        .a = alpha / 255.0f,                                                                                           \
+    }
+// Catppuccin Mocha with a custom window background.
 internal Theme config_theme_default() {
     return (Theme){
-        .window_bg    = 0xff140000u,
-        .selection_bg = 0x805a87c8u,
-        .cursor       = 0xffffffffu,
+        .window_bg    = bytes_to_vec4_color(24, 24, 37, 255),               // Custom #181825
+        .selection_bg = bytes_to_vec4_color(88, 91, 112, 128),              // Surface 2
+        .cursor       = bytes_to_vec4_color(245, 224, 220, 255),            // Rosewater
 
-        .font_fg           = 0xffffffffu,
-        .h1_fg             = 0xffffffffu,
-        .h2_fg             = 0xffffffffu,
-        .h3_fg             = 0xffffffffu,
-        .h4_fg             = 0xffffffffu,
-        .h5_fg             = 0xffffffffu,
-        .h6_fg             = 0xffffffffu,
-        .quote_fg          = 0xff777777u,
-        .quote_bar_fg      = 0xff777777u,
-        .list_marker_fg    = 0xffffffffu,
-        .code_block_fg     = 0xffffffffu,
-        .code_block_bg     = 0xff26221fu,
-        .html_fg           = 0xff888888u,
-        .thematic_break_fg = 0xff888888u,
-        .comment_fg        = 0xff888888u,
+        .font_fg           = bytes_to_vec4_color(205, 214, 244, 255),       // Text
+        .h1_fg             = bytes_to_vec4_color(203, 166, 247, 255),       // Mauve
+        .h2_fg             = bytes_to_vec4_color(137, 180, 250, 255),       // Blue
+        .h3_fg             = bytes_to_vec4_color(166, 227, 161, 255),       // Green
+        .h4_fg             = bytes_to_vec4_color(249, 226, 175, 255),       // Yellow
+        .h5_fg             = bytes_to_vec4_color(250, 179, 135, 255),       // Peach
+        .h6_fg             = bytes_to_vec4_color(245, 194, 231, 255),       // Pink
+        .quote_fg          = bytes_to_vec4_color(166, 173, 200, 255),       // Subtext 0
+        .quote_bar_fg      = bytes_to_vec4_color(127, 132, 156, 255),       // Overlay 1
+        .list_marker_fg    = bytes_to_vec4_color(148, 226, 213, 255),       // Teal
+        .code_block_fg     = bytes_to_vec4_color(205, 214, 244, 255),       // Text
+        .code_block_bg     = bytes_to_vec4_color(24, 24, 37, 255),          // Mantle
+        .html_fg           = bytes_to_vec4_color(166, 173, 200, 255),       // Subtext 0
+        .thematic_break_fg = bytes_to_vec4_color(88, 91, 112, 255),         // Surface 2
+        .comment_fg        = bytes_to_vec4_color(127, 132, 156, 255),       // Overlay 1
 
-        .emphasis_fg      = 0xffffffffu,
-        .strong_fg        = 0xffffffffu,
-        .link_fg          = 0xffffc080u,
-        .image_fg         = 0xffffc080u,
-        .code_fg          = 0xffffffffu,
-        .code_span_bg     = 0xff302b27u,
-        .strikethrough_fg = 0xff888888u,
-        .insert_fg        = 0xff88ff88u,
-        .underline_fg     = 0xffffffffu,
-        .spoiler_fg       = 0xff888888u,
-        .superscript_fg   = 0xffffffffu,
-        .subscript_fg     = 0xffffffffu,
-        .highlight_fg     = 0xff000000u,
-        .highlight_bg     = 0xffffff00u,
-        .math_fg          = 0xffffffffu,
-        .footnote_fg      = 0xffffc080u,
+        .emphasis_fg      = bytes_to_vec4_color(245, 194, 231, 255),        // Pink
+        .strong_fg        = bytes_to_vec4_color(203, 166, 247, 255),        // Mauve
+        .link_fg          = bytes_to_vec4_color(137, 180, 250, 255),        // Blue
+        .image_fg         = bytes_to_vec4_color(148, 226, 213, 255),        // Teal
+        .code_fg          = bytes_to_vec4_color(250, 179, 135, 255),        // Peach
+        .code_span_bg     = bytes_to_vec4_color(49, 50, 68, 255),           // Surface 0
+        .strikethrough_fg = bytes_to_vec4_color(166, 173, 200, 255),        // Subtext 0
+        .insert_fg        = bytes_to_vec4_color(166, 227, 161, 255),        // Green
+        .underline_fg     = bytes_to_vec4_color(205, 214, 244, 255),        // Text
+        .spoiler_fg       = bytes_to_vec4_color(108, 112, 134, 255),        // Overlay 0
+        .superscript_fg   = bytes_to_vec4_color(180, 190, 254, 255),        // Lavender
+        .subscript_fg     = bytes_to_vec4_color(180, 190, 254, 255),        // Lavender
+        .highlight_fg     = bytes_to_vec4_color(30, 30, 46, 255),           // Base
+        .highlight_bg     = bytes_to_vec4_color(249, 226, 175, 255),        // Yellow
+        .math_fg          = bytes_to_vec4_color(137, 220, 235, 255),        // Sky
+        .footnote_fg      = bytes_to_vec4_color(180, 190, 254, 255),        // Lavender
 
-        .table_border_fg = 0xff888888u,
-        .table_header_fg = 0xffffffffu,
-        .table_header_bg = 0xff26221fu,
+        .table_border_fg = bytes_to_vec4_color(88, 91, 112, 255),           // Surface 2
+        .table_header_fg = bytes_to_vec4_color(205, 214, 244, 255),         // Text
+        .table_header_bg = bytes_to_vec4_color(49, 50, 68, 255),            // Surface 0
 
-        .admonition_note_fg      = 0xff88c0ffu,
-        .admonition_tip_fg       = 0xff88ff88u,
-        .admonition_important_fg = 0xffff88ffu,
-        .admonition_warning_fg   = 0xffffc080u,
-        .admonition_caution_fg   = 0xffff8888u,
+        .admonition_note_fg      = bytes_to_vec4_color(137, 180, 250, 255), // Blue
+        .admonition_tip_fg       = bytes_to_vec4_color(166, 227, 161, 255), // Green
+        .admonition_important_fg = bytes_to_vec4_color(203, 166, 247, 255), // Mauve
+        .admonition_warning_fg   = bytes_to_vec4_color(249, 226, 175, 255), // Yellow
+        .admonition_caution_fg   = bytes_to_vec4_color(243, 139, 168, 255), // Red
     };
 }
 
@@ -410,14 +420,15 @@ internal f32 config_parse_font_size(rop(rw ReadCursor) cursor) {
 
 // #RRGGBB / #RRGGBBAA, or 3-4 decimal components separated by commas or
 // whitespace (decimal in 0..1, integer in 0..255).
-internal u32 config_parse_color(rop(rw ReadCursor) cursor) {
+internal Vec4 config_parse_color(rop(rw ReadCursor) cursor) {
     Str value = config_get_value(cursor);
     assert(SCOPE_CONFIG, value.len > 0);
 
-    u32 color = 0x000000FF;
     if (value.data[0] == '#') {
         value.data += 1;
         value.len -= 1;
+
+        u32 color = 0x000000ff;
 
         assert(SCOPE_CONFIG, value.len == 6 || value.len == 8);
 
@@ -434,7 +445,13 @@ internal u32 config_parse_color(rop(rw ReadCursor) cursor) {
                 color |= (u32)(ch - 'A' + 10) << offset;
             }
         }
-        return color;
+
+        return (Vec4){
+            .r = srgb_to_linear((f32)(color & 0xffu) / 255.0f),
+            .g = srgb_to_linear((f32)((color >> 8) & 0xffu) / 255.0f),
+            .b = srgb_to_linear((f32)((color >> 16) & 0xffu) / 255.0f),
+            .a = (f32)((color >> 24) & 0xffu) / 255.0f,
+        };
     }
 
     // Decimal components: 3 (rgb) or 4 (rgba), separated by ',' or whitespace.
@@ -447,6 +464,7 @@ internal u32 config_parse_color(rop(rw ReadCursor) cursor) {
             break;
         }
     }
+    Vec4 color = {.z = 1.0f};
 
     u32   component_count = 0;
     char* at              = value.data;
@@ -467,16 +485,9 @@ internal u32 config_parse_color(rop(rw ReadCursor) cursor) {
         value.len -= new_len;
 
         f32 parsed_component = config_parse_number(component_str_slice);
-        u32 component;
-        if (normalized) {
-            assert(SCOPE_CONFIG, parsed_component >= 0.0f && parsed_component <= 1.0f);
-            component = (u32)roundf(parsed_component * 255.0f);
-        } else {
-            assert(SCOPE_CONFIG, parsed_component >= 0.0f && parsed_component <= 255.0f);
-            component = (u32)roundf(parsed_component);
-        }
+        assert(SCOPE_CONFIG, parsed_component >= 0.0f && parsed_component <= 1.0f + !normalized * 254.0f);
+        color.el[i] = parsed_component / (255.0f * !normalized);
 
-        color |= component << (24 - 8 * i);
         component_count += 1;
     }
 
@@ -716,7 +727,7 @@ internal ConfigParseResult config_load(rop(rw ScratchArena) scratch) {
     ConfigParseResult defaults = {
         .settings  = config_settings_default(),
         .theme     = config_theme_default(),
-        .font_path = {0},
+        .font_path = str_create("/usr/share/fonts/TTF/NotoSansNerdFontPropo-Regular.ttf"),
     };
 
     // Default config location: $HOME/.config/rwmd.conf

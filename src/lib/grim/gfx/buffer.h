@@ -134,7 +134,7 @@ Buffer buffer_create(rop(ro GraphicsContext) ctx,
 }
 
 void buffer_copy_with_staging(
-    rop(rw Arena) arena, rop(ro GraphicsContext) ctx, Buffer dst_buffer, void* src, u64 size) {
+    rop(rw Arena) arena, rop(ro GraphicsContext) ctx, Buffer dst_buffer, rop(ro void) src, u64 size) {
 
     /* https://docs.vulkan.org/guide/latest/synchronization_examples.html#_transfer_dependencies
      * Unified Memory:
@@ -233,7 +233,7 @@ void buffer_unmap(rop(ro GraphicsContext) ctx, rop(rw Buffer) buffer) {
     buffer->mapped = NULL;
 }
 
-void buffer_host_copy(rop(ro GraphicsContext) ctx, rop(ro Buffer) buffer, void* src, u64 byte_len, u64 offset) {
+void buffer_host_copy(rop(ro GraphicsContext) ctx, rop(ro Buffer) buffer, rop(ro void) src, u64 byte_len, u64 offset) {
     if (buffer->mapped != NULL) {
         memcpy(buffer->mapped, src, byte_len);
     } else {

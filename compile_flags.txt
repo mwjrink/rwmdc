@@ -23,3 +23,6 @@
 -DLOG_LEVEL_ERROR
 -DLOG_LEVEL_CRITICAL
 -xc
+-msse2
+-mssse3
+-mavx2

@@ -171,11 +171,12 @@ void cleanup_sync_objects(rop(ro GraphicsContext) ctx, rop(rw SyncObjects) sync_
 // ================  Buffers  ================
 
 void buffer_copy(rop(rw Arena) arena, rop(ro GraphicsContext) ctx, Buffer dst, Buffer src, u64 size, u64 offset);
-void buffer_copy_with_staging(rop(rw Arena) arena, rop(ro GraphicsContext) ctx, Buffer dst_buffer, void* src, u64 size);
+void buffer_copy_with_staging(
+    rop(rw Arena) arena, rop(ro GraphicsContext) ctx, Buffer dst_buffer, rop(ro void) src, u64 size);
 
 void* buffer_map(rop(ro GraphicsContext) ctx, rop(rw Buffer) buffer);
 void  buffer_unmap(rop(ro GraphicsContext) ctx, rop(rw Buffer) buffer);
-void  buffer_host_copy(rop(ro GraphicsContext) ctx, rop(ro Buffer) buffer, void* src, u64 byte_len, u64 offset);
+void  buffer_host_copy(rop(ro GraphicsContext) ctx, rop(ro Buffer) buffer, rop(ro void) src, u64 byte_len, u64 offset);
 
 Buffer buffer_create(rop(ro GraphicsContext) ctx, u64 size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties);
 void   cleanup_buffer(rop(ro GraphicsContext) ctx, rop(rw Buffer) buffer);
@@ -204,7 +205,12 @@ const char* colorspace_to_str(ro VkColorSpaceKHR colorspace);
 // =                                                  Includes =
 // ====================================================================================================================
 
+#if AFTERMATH
 #include <lib/grim/gfx/aftermath.h>
+#endif
+
+#include <lib/grim/gfx/vkutils.h>
+
 #include <lib/grim/gfx/buffer.h>
 #include <lib/grim/gfx/command_buffer.h>
 #include <lib/grim/gfx/commands.h>
@@ -214,11 +220,9 @@ const char* colorspace_to_str(ro VkColorSpaceKHR colorspace);
 #include <lib/grim/gfx/ext.h>
 #include <lib/grim/gfx/image.h>
 #include <lib/grim/gfx/pipeline.h>
-#include <lib/grim/gfx/render_graph.h>
 #include <lib/grim/gfx/render_target.h>
 #include <lib/grim/gfx/rendering.h>
 #include <lib/grim/gfx/shader.h>
 #include <lib/grim/gfx/swapchain.h>
 #include <lib/grim/gfx/sync_objects.h>
 #include <lib/grim/gfx/types.h>
-#include <lib/grim/gfx/vkutils.h>

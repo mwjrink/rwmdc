@@ -1,0 +1,7 @@
+[double-promotion]
+src:src/lib/wayland/*
+src:src/lib/stb/*
+
+[implicit-int-conversion]
+src:src/lib/wayland/*
+src:src/lib/stb/*

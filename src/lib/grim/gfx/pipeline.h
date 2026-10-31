@@ -336,11 +336,10 @@ Pipeline create_rect_pipeline(rop(rw Arena) arena, rop(ro GraphicsContext) ctx, 
     arena_pop(arena);
 
     return (Pipeline){
-        .handle        = pipeline,
-        .stage_count   = shader_count,
-        .shaders       = shaders,
-        .layout        = layout,
-        .pipeline_type = PipelineType_Graphics,
+        .handle      = pipeline,
+        .stage_count = shader_count,
+        .shaders     = shaders,
+        .layout      = layout,
     };
 }
 

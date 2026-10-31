@@ -2,6 +2,14 @@
 
 #include <lib/grim/gfx/internal_graphics.h>
 
+static f32 srgb_to_linear(f32 value) {
+    if (value <= 0.04045f) {
+        return value / 12.92f;
+    } else {
+        return powf((value + 0.055f) / 1.055f, 2.4f);
+    }
+}
+
 void log_available_layers() {
     uint32_t layerCount;
     // First call to get the count

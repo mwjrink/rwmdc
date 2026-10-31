@@ -29,7 +29,6 @@ typedef struct {
 // into scratch and the glyph's ink bounds (scaled pixel space) into bounds.
 internal u32 slug_flatten_glyph(rop(rw ScratchArena) scratch,
                                 rop(ro TTGlyph) glyph,
-                                f32 scale,
                                 rop(rw SlugCrv) curves,
                                 rop(rw f32) bounds_min,
                                 rop(rw f32) bounds_max) {
@@ -68,12 +67,12 @@ internal u32 slug_flatten_glyph(rop(rw ScratchArena) scratch,
                 continue;
             }
 
-            curve.x0 = (f32)(_Float16)(curve.x0 * scale);
-            curve.y0 = (f32)(_Float16)(curve.y0 * scale);
-            curve.x1 = (f32)(_Float16)(curve.x1 * scale);
-            curve.y1 = (f32)(_Float16)(curve.y1 * scale);
-            curve.x2 = (f32)(_Float16)(curve.x2 * scale);
-            curve.y2 = (f32)(_Float16)(curve.y2 * scale);
+            curve.x0 = (f32)(_Float16)(curve.x0);
+            curve.y0 = (f32)(_Float16)(curve.y0);
+            curve.x1 = (f32)(_Float16)(curve.x1);
+            curve.y1 = (f32)(_Float16)(curve.y1);
+            curve.x2 = (f32)(_Float16)(curve.x2);
+            curve.y2 = (f32)(_Float16)(curve.y2);
 
             if (curve.x0 == curve.x1 && curve.x1 == curve.x2 && curve.y0 == curve.y1 && curve.y1 == curve.y2) {
                 continue;
@@ -90,7 +89,7 @@ internal u32 slug_flatten_glyph(rop(rw ScratchArena) scratch,
     return curve_count;
 }
 
-internal FontAtlas slug_build_atlas(rop(rw Arena) arena, rop(rw ScratchArena) scratch, rop(ro TTFont) font, f32 scale) {
+internal FontAtlas slug_build_atlas(rop(rw Arena) arena, rop(rw ScratchArena) scratch, rop(ro TTFont) font) {
     u32 glyph_count = font->glyph_count;
 
     // Upper bound on curves: each contour point emits at most one quadratic.
@@ -126,7 +125,7 @@ internal FontAtlas slug_build_atlas(rop(rw Arena) arena, rop(rw ScratchArena) sc
         SlugCrv* curves = scratch_alloc_aligned(scratch, SlugCrv, curve_cap);
         f32      bounds_min[2];
         f32      bounds_max[2];
-        u32      curve_count = slug_flatten_glyph(scratch, glyph, scale, curves, bounds_min, bounds_max);
+        u32      curve_count = slug_flatten_glyph(scratch, glyph, curves, bounds_min, bounds_max);
         if (!curve_count)
             continue;
 

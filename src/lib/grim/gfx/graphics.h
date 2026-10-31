@@ -93,7 +93,11 @@ Image create_image(rop(ro GraphicsContext) ctx,
 RenderContext render_context_create(rop(rw Arena) arena,
                                     rop(ro GraphicsContext) ctx,
                                     rop(rw RenderTarget) render_target);
-RenderState   create_render_state(rop(rw Arena) arena, rop(rw RenderContext) r_ctx, rop(ro FontAtlas) font_atlas);
+RenderState   create_render_state(rop(rw Arena) arena,
+                                  rop(rw RenderContext) r_ctx,
+                                  rop(ro FontAtlas) font_atlas,
+                                  rop(ro Vec4) colors,
+                                  u32 colors_count);
 
 u8   start_frame(rop(rw Arena) arena, rop(rw RenderState) render_state);
 void draw_frame(rop(rw RenderState) render_state, rop(ro DrawLayer) text_layer, rop(ro DrawLayer) ui_layer);

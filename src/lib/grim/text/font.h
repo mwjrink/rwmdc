@@ -381,6 +381,7 @@ internal void tt_resolve_compound(
 
         // Resolve the child first so its contours are ready to borrow.
         if (!bitarray32_test(processed, child)) {
+            WARNING_LOG(SCOPE_FONT_LOAD, "%u is looking for: %u", gi, child);
             tt_resolve_compound(arena, loader, glyphs, processed, child);
         }
 
@@ -459,13 +460,21 @@ internal void tt_resolve_compound(
         }
 
         for (u32 ci = 0; ci < sub.contours_count; ci++) {
+            const TTContour* source = &sub.contours[ci];
+            TTPoint*         points = arena_alloc_aligned(arena, TTPoint, source->pts_count);
+
             for (u32 pi = 0; pi < sub.contours[ci].pts_count; pi++) {
-                TTPoint* p = &sub.contours[ci].pts[pi];
-                f32      x = p->x, y = p->y;
-                p->x = xx * x + yx * y + dx;
-                p->y = xy * x + yy * y + dy;
+                rop(ro TTPoint) p = &sub.contours[ci].pts[pi];
+                points[pi]        = (TTPoint){
+                    .x  = xx * p->x + yx * p->y + dx,
+                    .y  = xy * p->x + yy * p->y + dy,
+                    .on = p->on,
+                };
             }
-            glyph.contours[glyph.contours_count++] = sub.contours[ci];
+            glyph.contours[glyph.contours_count++] = (TTContour){
+                .pts       = points,
+                .pts_count = source->pts_count,
+            };
         }
     } while (component_flags & TT_COMP_MORE);
 
@@ -494,11 +503,13 @@ TTFont font_load(rop(rw Arena) arena, rop(rw ScratchArena) scratch, const char* 
 
         // PERF make sure this is unswitched by the compiler
         if (loca_fmt) {
-            memcpy(&end, loader.loca.d + glyph_idx * 4, 4);
+            // idx + 1 to read the start of the next glyph/end of this glyph
+            memcpy(&end, loader.loca.d + (glyph_idx + 1) * 4, 4);
             end = __builtin_bswap32(end);
         } else {
             u16 half;
-            memcpy(&half, loader.loca.d + glyph_idx * 2, 2);
+            // idx + 1 to read the start of the next glyph/end of this glyph
+            memcpy(&half, loader.loca.d + (glyph_idx + 1) * 2, 2);
             end = __builtin_bswap16(half) * 2;
         }
 
@@ -598,7 +609,7 @@ TTFont font_load(rop(rw Arena) arena, rop(rw ScratchArena) scratch, const char* 
         // Build the reusable shape workspace: a default (Latin) shape config,
         // a bounded glyph storage, and its scratchpad.
         {
-            u32 glyph_cap = 256; // TODO: tune; bounds simultaneous glyphs
+            u32 glyph_cap = 256 * 1024; // TODO tune; bounds simultaneous glyphs
 
             i32 shape_cfg_bytes =
                 fontshaper_SizeOfShapeConfig(&font.shaper, FONTSHAPER_SCRIPT_LATIN, FONTSHAPER_LANGUAGE_DONT_KNOW);

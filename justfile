@@ -20,7 +20,8 @@ export LSAN_OPTIONS := "report_objects=1:verbosity=1:suppressions=lsan.supp"
 # TODO -std=c99
 
 # aftermath/lib/x64/libGFSDK_Aftermath_Lib.x64.so \
-complibs := "/lib/libm.so                                    \
+complibs := "/lib/libutf8proc.so                             \
+             /lib/libm.so                                    \
              /lib/libc.so                                    \
              /lib/libvulkan.so                               \
              /lib/libevdev.so"
@@ -76,11 +77,11 @@ compfast := " -fPIC"
 corebuild := " -I src                        \
                -I aftermath                  \
                -x c                          \
-               -msse2"
+               -msse2 -mssse3 -mavx2"
 
 # -fno-signed-zeros             \
 #
-# TODO ldd ritual
+# TODO ldd rwmd
 # TODO check this out:
 # -Rpass-missed # INCREDIBLY interesting flag that tells you when and why some optimizations were missed
 #
@@ -111,7 +112,7 @@ check:
     fi
 
 check-deps:
-    @ldd ritual
+    @ldd rwmd
 
 gen-xdg-shell:
     @wayland-scanner client-header </usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml > lib/wayland/xdg-shell.h
@@ -135,7 +136,7 @@ gen-pointer-constraints:
 [arg("output", long="outputfilename", short="o", help="output filename")]
 [arg("shader_print", long="shader-print", short="p", help="turn on shader printf")]
 [arg("displayserverprotocol", long="displayserverprotocol", help="Choose between x11 and wayland")]
-buildn verbosity="a" shader_print="on" warnings="on" debug="on" sanitize="on" opt="none" output="ritual" source="main.c" displayserverprotocol="wayland":
+buildn verbosity="a" shader_print="on" warnings="on" debug="on" sanitize="on" opt="none" output="rwmd" source="main.c" displayserverprotocol="wayland":
     @clang                                                                                                    \
         {{ if warnings == "on" { compwarn } else { "" } }}                                                    \
         {{ if debug == "on" { compdebug } else { "" } }}                                                      \
@@ -198,13 +199,13 @@ build-dist:
     @just buildn -v=dist -s=off -d=off -p=off -w=off -O=h
 
 run:
-    @./ritual
+    @./rwmd
 
 run-rune:
     @./rune
 
 debug:
-    @gdb ./ritual
+    @gdb ./rwmd
 
 compile-shaders:
     slangc assets/shaders/simple.slang -entry vertexMain -stage vertex -matrix-layout-column-major -o assets/shaders/simple.vert.spv -target spirv
@@ -229,7 +230,7 @@ transpile-shaders:
 
 # --sep meshCullMain \ # rename meshCullMain to the -e option, main
 _compile-shaders-glsl name stage entry="main":
-    @glslang \
+    @env -u LD_LIBRARY_PATH glslang \
         assets/shaders/{{ name }}.{{ stage }}.glsl \
         -o assets/shaders/{{ name }}.{{ stage }}.spv \
         -S {{ stage }} \
@@ -242,10 +243,10 @@ _compile-shaders-glsl name stage entry="main":
         assets/shaders/glslangValidator.conf
 
 compile-shaders-glsl:
-    @just _compile-shaders-glsl simple frag
-    @just _compile-shaders-glsl simple task
-    @just _compile-shaders-glsl simple mesh
-    @just _compile-shaders-glsl meshcull comp
+    @just _compile-shaders-glsl rect frag
+    @just _compile-shaders-glsl rect vert
+    @just _compile-shaders-glsl text frag
+    @just _compile-shaders-glsl text vert
 
 build-run:
     @just check

@@ -6,7 +6,7 @@ struct GlyphDrawCmd
     float sy;
 
     uint glyph_idx;
-    uint color;
+    uint color_idx;
 };
 
 struct GpuRect
@@ -16,7 +16,7 @@ struct GpuRect
     float width;
     float height;
 
-    uint color;
+    uint color_idx;
     uint flags;
 };
 
