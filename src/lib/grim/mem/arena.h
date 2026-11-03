@@ -1,10 +1,8 @@
 #pragma once
 
-// #ifndef _ARENA_IMPL_H
-// #define _ARENA_IMPL_H
-
 #include <lib/grim/assert.h>
 #include <lib/grim/bp.h>
+#include <lib/grim/logger.h>
 #include <stdalign.h>
 #include <string.h>
 #include <sys/mman.h> /* mmap() is defined in this header */
@@ -223,7 +221,9 @@ void scratch_destroy(rop(rw ScratchArena) scratch) {
 //         return;
 //     }
 //
+// #if defined(__DEBUG)
 //     memset(arena->ckpt, 0, arena->data + arena->len - arena->ckpt);
+// #endif
 //     arena->len = arena->ckpt - arena->data;
 //     arena->ckpt = *(void**)arena->ckpt;
 // }
@@ -283,7 +283,9 @@ void* arena_alloc(rop(rw Arena) arena, usize size) {
     void* result = arena->data + arena->len;
     arena->len += size;
 
+#if defined(__DEBUG)
     memset(result, 0, size);
+#endif
 
     return result;
 }
@@ -294,7 +296,9 @@ void* scratch_alloc(rop(rw ScratchArena) scratch, usize size) {
     void* result = scratch->data + scratch->len;
     scratch->len += size;
 
+#if defined(__DEBUG)
     memset(result, 0, size);
+#endif
 
     return result;
 }
@@ -314,7 +318,9 @@ void* arena_alloc_align(rop(rw Arena) arena, usize align, usize size) {
     }
     void* result = arena->data + arena->len + partial;
 
+#if defined(__DEBUG)
     memset(arena->data + arena->len, 0, size + partial);
+#endif
 
     arena->len += size + partial;
 
@@ -335,7 +341,9 @@ void* scratch_alloc_align(rop(rw ScratchArena) scratch, usize align, usize size)
     }
     void* result = scratch->data + scratch->len + partial;
 
+#if defined(__DEBUG)
     memset(scratch->data + scratch->len, 0, size + partial);
+#endif
 
     scratch->len += size + partial;
 
@@ -368,104 +376,3 @@ char* scratch_copy_str(ScratchArena* scratch, char* str) {
     scratch->len  = new_loc - scratch->data;
     return dst;
 }
-
-#ifdef TEST
-
-#include <stdio.h>
-#include <unistd.h> // Required for sleep()
-void arena_test() {
-    printf("Starting Arena Alloc Tests!\n");
-    Arena arena = arena_create();
-
-    printf("first page: %p\n", arena.data);
-
-    printf("Allocating 200 x 4096 * 1024\n");
-    u8* final;
-    for (int i = 0; i < 200; i++) {
-        final  = (u8*)arena_alloc(&arena, 4096 * 1024);
-        *final = 0xFF;
-    }
-
-    printf("Creating Checkpoint\n");
-    arena_ckpt(&arena);
-
-    printf("Allocating 55 x 4096\n");
-    for (int i = 0; i < 55; i++) {
-        final  = (u8*)arena_alloc(&arena, 4096 * 1024);
-        *final = 0xFF;
-    }
-
-    printf("Rolling Back\n");
-    arena_rollback(&arena);
-
-    printf("Allocating 55 x 4096\n");
-    for (int i = 0; i < 55; i++) {
-        final  = (u8*)arena_alloc(&arena, 4096 * 1024);
-        *final = 0xFF;
-    }
-
-    printf("Creating Checkpoint\n");
-    arena_ckpt(&arena);
-
-    printf("Writing to final ptr\n");
-    for (int i = 0; i < 4096; i++) {
-        final[i] = 0xFF;
-    }
-
-    printf("Allocating 1 x 4096 * 20\n");
-    u8* new_page = arena_alloc(&arena, 4096 * 1024 * 20);
-
-    for (int i = 0; i < 10000; i++) {
-        final  = (u8*)arena_alloc(&arena, 4096 * 1024 * 25);
-        *final = 0xFF;
-    }
-    sleep(5); // Pause execution for 5 seconds
-
-    printf("second page: %p\n", arena.data);
-
-    printf("Writing to new_page ptr\n");
-    for (int i = 0; i < 40960; i++) {
-        new_page[i] = 0xFF;
-    }
-
-    printf("Creating Checkpoint\n");
-    arena_ckpt(&arena);
-
-    printf("Allocating 3 x 40960\n");
-    new_page  = arena_alloc(&arena, 4096 * 1024 * 10);
-    *new_page = 0xFF;
-    new_page  = arena_alloc(&arena, 4096 * 1024 * 10);
-    *new_page = 0xFF;
-    new_page  = arena_alloc(&arena, 4096 * 1024 * 10);
-    *new_page = 0xFF;
-
-    printf("Rolling Back\n");
-    arena_rollback(&arena);
-
-    printf("Rolling Back to Previous Page\n");
-    arena_rollback(&arena);
-
-    printf("Rolling Back 5 times\n");
-    printf("on page: %p\n", arena.data);
-    printf("1\n");
-    arena_rollback(&arena);
-    printf("on page: %p\n", arena.data);
-    printf("2\n");
-    arena_rollback(&arena);
-    printf("on page: %p\n", arena.data);
-    printf("3\n");
-    arena_rollback(&arena);
-    printf("on page: %p\n", arena.data);
-    printf("4\n");
-    arena_rollback(&arena);
-    printf("on page: %p\n", arena.data);
-    printf("5\n");
-    arena_rollback(&arena);
-    printf("on page: %p\n", arena.data);
-
-    printf("Done!\n");
-}
-
-#endif
-
-// #endif

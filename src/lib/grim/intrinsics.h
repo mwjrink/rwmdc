@@ -248,6 +248,7 @@ static force_inline(u32)
 // ASCII candidates including NUL. Tags: unmatched = 0, NUL = 128.
 // Both outputs need count entries; returns their shared count. Starts are relative to src.
 // Zero-initialize carry. The first nonempty call includes start 0; continuations don't restart.
+// Single spaces between unmatched bytes merge into text within each 32-byte block.
 // A partial 32-byte block must be the final call. No EOF sentinel is emitted.
 static force_inline(u32) simd_byte_scan_runs(rop(ro u8) src,
                                              u32 count,
@@ -279,9 +280,26 @@ static force_inline(u32) simd_byte_scan_runs(rop(ro u8) src,
         tags = _mm256_or_si256(tags, _mm256_and_si256(_mm256_cmpeq_epi8(raw, zero), _mm256_set1_epi8((char)128)));
         simdv_i256 bridge    = _mm256_permute2x128_si256(carry->previous, tags, 0x21);
         simdv_i256 preceding = _mm256_alignr_epi8(tags, bridge, 15);
-        u32        changes   = ~(u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(tags, preceding));
-        changes              = (changes | first) & (u32)((UINT64_C(1) << take) - 1);
-        first                = 0;
+
+        // Temporary special case to remove spaces in prose
+        simdv_i256 text     = _mm256_cmpeq_epi8(tags, zero);
+        simdv_i256 spaces   = _mm256_cmpeq_epi8(tags, _mm256_set1_epi8(' '));
+        bridge              = _mm256_permute2x128_si256(zero, text, 0x20);
+        simdv_i256 left     = _mm256_alignr_epi8(text, bridge, 15);
+        bridge              = _mm256_permute2x128_si256(text, zero, 0x21);
+        simdv_i256 right    = _mm256_alignr_epi8(bridge, text, 1);
+        simdv_i256 interior = _mm256_and_si256(spaces, _mm256_and_si256(left, right));
+
+        // Drop both boundaries of 0-space-0; block edges stay unmerged.
+        bridge                = _mm256_permute2x128_si256(zero, interior, 0x20);
+        simdv_i256 following  = _mm256_alignr_epi8(interior, bridge, 15);
+        simdv_i256 drop       = _mm256_or_si256(interior, following);
+        simdv_i256 same       = _mm256_cmpeq_epi8(tags, preceding);
+        simdv_i256 boundaries = _mm256_andnot_si256(same, _mm256_cmpeq_epi8(zero, zero));
+        boundaries            = _mm256_andnot_si256(drop, boundaries);
+        u32 changes           = (u32)_mm256_movemask_epi8(boundaries);
+        changes               = (changes | first) & (u32)((UINT64_C(1) << take) - 1);
+        first                 = 0;
 
         if (changes) {
 #if defined(SIMD_USE_AVX512)

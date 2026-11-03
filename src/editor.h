@@ -158,7 +158,121 @@ void editor_undo(rop(rw Editor) editor);
 void editor_redo(rop(rw Editor) editor);
 
 // for rendering ui: status line ui at the bottom.
-DrawLayer editor_get_ui_layer(rop(rw Editor) editor);
+DrawLayer editor_get_ui_layer(rop(rw Editor) editor,
+                              rop(rw Arena) arena,
+                              rop(rw ScratchArena) scratch,
+                              rop(ro AppSettings) settings,
+                              rop(ro Theme) theme,
+                              rop(rw TTFont) font,
+                              u32 width,
+                              u32 height) {
+    u64 editor_layer_profiling_time = time_start();
+
+    // 1. Anchor at the byte under scroll.y (linear estimate for now), then
+    //    walk md blocks backward and forward until the viewport is covered.
+    DocumentStats doc_stats = document_get_stats(&editor->document);
+
+    const f32 base_scale = settings->font.size / (f32)font->upem;
+
+    time_checkpoint(SCOPE_DEBUG, "editor_get_ui_layer pre output", editor_layer_profiling_time);
+
+    DrawLayer layer = {0};
+    layer.glyphs    = arena_alloc_aligned(arena, GlyphDrawCmd, max(doc_stats.length, 1));
+    layer.rects     = arena_alloc_aligned(arena, GpuRect, max(10, 1)); // TODO real number not 10
+
+    // UI Structure:
+    // LEFT
+    // File Path
+    // FUTURE: vim mode
+    //
+    // # unsaved characters?
+    // Scroll as a percent
+    // File size in bytes
+    // RIGHT
+
+    // time_checkpoint(SCOPE_DEBUG, "editor_get_text_layer setup", editor_layer_profiling_time);
+    //
+    // // output one span of CONTENT (strip Markdown syntax):
+    // {
+    //     // u32 content_start = cur.start_idx + cur.content_offset;
+    //     u32 content_start = max(cur.start_idx + cur.content_offset, span_start);
+    //     u32 content_len   = min(cur.content_length, span_end - content_start);
+    //
+    //     u64 scratch_len_before = scratch->len;
+    //     u8* content_bytes      = scratch_alloc_aligned(scratch, u8, content_len);
+    //     u32 bytes_read         = document_read(&editor->document, content_start, content_len, content_bytes);
+    //
+    //     i32* codepoints = scratch_alloc_aligned(scratch, i32, bytes_read * 16);
+    //     i64  codepoint_count =
+    //         utf8proc_decompose(content_bytes, bytes_read, codepoints, bytes_read * 16, UTF8PROC_STABLE);
+    //
+    //     //   shape               codepoint[] -> glyphs (fontshaper, one run)
+    //     {
+    //
+    //         fontshaper_ResetGlyphStorage(&font->glyph_storage);
+    //         for (u32 codepoint_index = 0; codepoint_index < codepoint_count; codepoint_index++) {
+    //             fontshaper_glyph* glyph = fontshaper_PushGlyph(
+    //                 &font->glyph_storage, &font->shaper, codepoints[codepoint_index], NULL, (int)codepoint_index);
+    //             assert(SCOPE_EDITOR, glyph != NULL); // TODO proper scope + graceful failure
+    //         }
+    //
+    //         fontshaper_glyph_iterator iterator;
+    //         fontshaper_shape_error    shape_error = fontshaper_ShapeDirect(
+    //             font->shape_scratchpad, &font->glyph_storage, FONTSHAPER_DIRECTION_LTR, &iterator);
+    //         assert(SCOPE_EDITOR, shape_error == FONTSHAPER_SHAPE_ERROR_NONE);
+    //
+    //         fontshaper_glyph* glyph;
+    //
+    //         while (fontshaper_GlyphIteratorNext(&iterator, &glyph)) {
+    //             f32 advance = (f32)glyph->AdvanceX * scale;
+    //
+    //             // wrap at width on glyph boundaries (ligatures intact)
+    //             if (x + advance > (f32)width - MARGIN) {
+    //                 x = indent;
+    //                 y += font->line_height * scale;
+    //             }
+    //
+    //             // append GlyphDrawCmd
+    //             layer.glyphs[layer.glyph_count] = (GlyphDrawCmd){
+    //                 .x         = x + (f32)glyph->OffsetX * scale,
+    //                 .y         = y + (font->ascent + (f32)glyph->OffsetY) * scale,
+    //                 .sx        = scale,
+    //                 .sy        = -scale,
+    //                 .glyph_idx = glyph->Id,
+    //                 .color_idx = text_color_idx,
+    //             };
+    //
+    //             layer.glyph_count += 1;
+    //             x += advance;
+    //         }
+    //     }
+    //
+    //     //   Later: if the cursor is inside the span use span, if inside
+    //     //   content use content (for caret/caret-adjacent rendering).
+    //     //
+    //     // TODO decode + shape + wrap + append (single fontshaper run).
+    //
+    //     // TODO use checkpoints for this
+    //     memset(scratch->data + scratch_len_before, 0, scratch->len - scratch_len_before);
+    //     scratch->len = scratch_len_before;
+    // }
+    //
+    // layer.rects[layer.rect_count] = (GpuRect){
+    //     .x         = rect.x,
+    //     .y         = rect.start_y,
+    //     .width     = rect.width,
+    //     .height    = y - rect.start_y,
+    //     .color_idx = rect.color,
+    //     .flags     = 0,
+    // };
+    // layer.rect_count += 1;
+    //
+    // time_checkpoint(SCOPE_DEBUG, "editor_get_text_layer loop", editor_layer_profiling_time);
+
+    // 5. caret + selection are rects too; add them here.
+
+    return layer;
+}
 
 // ---- internal helpers (skeleton) -------------------------------------------
 

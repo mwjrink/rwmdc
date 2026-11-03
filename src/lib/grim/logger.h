@@ -526,6 +526,7 @@ u64 _clock_nano() {
 DWORD thread_id = GetCurrentThreadId();
 #endif
 
+#include <lib/grim/mem/arena.h>
 #include <lib/grim/mem/str.h>
 
 typedef struct _LogSpan {

@@ -1,4 +1,4 @@
-#include <lib/grim/logger.h>
+#pragma once
 
 // HACK to kill assert defined in std c headers
 #undef assert
@@ -21,6 +21,9 @@
 #endif
 
 #if ENABLE_ASSERT
+
+#include <lib/grim/logger.h>
+
 #define assert(scope, c)                                                                                               \
     stmnt(if (!(c)) {                                                                                                  \
         CRITICAL_LOG(scope, "Assert failed.");                                                                         \

@@ -176,7 +176,7 @@ typedef struct MdResult {
     u32 count;
 } MdResult;
 
-// Semantic tags stored as u8; source delimiters live in marker_byte.
+// Semantic tags stored as u8; source delimiter bytes and lengths live in L1.
 typedef enum MdL0Tag {
     MD_L0_NONE = 0,
     MD_L0_PARAGRAPH,
@@ -190,24 +190,18 @@ typedef enum MdL0Tag {
     MD_L0_EOF,
 } MdL0Tag;
 
-// Delimiter-specific payload layouts are specified separately.
-typedef struct MdL0Metadata {
-    u32 pre_indent;
-    u32 post_indent;
+typedef struct MdL0Common {
+    u16 pre_indent;    // Leading indentation columns.
+    u16 content_start; // Byte offset from the L0 start, past the raw prefix.
+} MdL0Common;
+STATIC_ASSERT(sizeof(MdL0Common) == 4);
 
-    u32 marker_offset       : 16; // Source bytes from the L0 boundary.
-    u32 marker_length       : 15;
-    u32 trailing_whitespace : 1;
-
-    union {
-        u32 marker_padding; // Bytes of space/tab after the marker.
-        u32 line_count;     // Physical lines in a blank run.
-    };
-
-    u8 marker_byte; // Source delimiter, independent of the semantic L0 tag.
-
-} MdL0Metadata;
-STATIC_ASSERT(sizeof(MdL0Metadata) == 20);
+// One entry per non-paragraph L0; the L0 tag selects the member.
+typedef union MdL0Extra {
+    u16 post_indent; // Column after marker and following whitespace.
+    u32 line_count;  // Physical blank-line count; pending blank count for EOF.
+} MdL0Extra;
+STATIC_ASSERT(sizeof(MdL0Extra) == 4);
 
 typedef struct MdL1Metadata MdL1Metadata;
 
@@ -231,7 +225,8 @@ typedef struct MdState {
     // Source lengths are the differences between adjacent offsets.
     rwp(rw u8) l0_tags;
     rwp(rw u32) l0_offsets;
-    rwp(rw MdL0Metadata) l0_metadata;
+    rwp(rw MdL0Common) l0_common;
+    rwp(rw MdL0Extra) l0_extra;
     u32 l0_count;
 
     // L1: raw delimiter runs, independent of provisional L0 candidates.
@@ -249,477 +244,59 @@ typedef struct MdState {
     u32 mappings_count;
 } MdState;
 
-// Only tracks the next source byte to copy. Scanning uses the filled buffer.
+// Tracks the next source byte to scan, directly or through the SIMD bridge.
 typedef struct MdCursor {
     const DocView* source;
     u32            piece;
     u32            piece_offset;
 } MdCursor;
 
-internal u32 md_fill(MdCursor* cursor, u8* buffer, u32 capacity) {
+// bridge must hold capacity bytes; copy only when a full window crosses pieces.
+internal u32 md_fill(MdCursor* cursor, u8* bridge, u32 capacity, const u8** bytes) {
+    *bytes = bridge;
+    while (cursor->piece < cursor->source->count &&
+           cursor->piece_offset == cursor->source->pieces[cursor->piece].length) {
+        cursor->piece += 1;
+        cursor->piece_offset = 0;
+    }
+    if (cursor->piece == cursor->source->count)
+        return 0;
+
+    const DocPiece* piece     = &cursor->source->pieces[cursor->piece];
+    u32             available = piece->length - cursor->piece_offset;
+
+    // Most common case
+    if (likely(available >= capacity)) {
+        *bytes = piece->bytes + cursor->piece_offset;
+        cursor->piece_offset += capacity;
+        return capacity;
+    }
+
     u32 filled = 0;
     while (filled < capacity && cursor->piece < cursor->source->count) {
-        const DocPiece* piece     = &cursor->source->pieces[cursor->piece];
-        u32             available = piece->length - cursor->piece_offset;
-        u32             take      = min(available, capacity - filled);
+        piece     = &cursor->source->pieces[cursor->piece];
+        available = piece->length - cursor->piece_offset;
 
-        memcpy(buffer + filled, piece->bytes + cursor->piece_offset, take);
+        if (available > 0) {
+            u32 take = min(capacity - filled, available);
+            memcpy(bridge + filled, piece->bytes + cursor->piece_offset, take);
+            filled += take;
+            cursor->piece_offset += take;
+        }
 
-        filled += take;
-        cursor->piece_offset += take;
-
-        if (cursor->piece_offset >= piece->length) {
-            ++cursor->piece;
+        if (cursor->piece_offset == piece->length) {
+            cursor->piece += 1;
             cursor->piece_offset = 0;
         }
     }
     return filled;
 }
 
-// MdState md_create(rop(ro DocView) source, rop(rw Arena) arena, rop(rw ScratchArena) scratch) {
-//     /* Fixed dialect: CommonMark 0.31.2 plus tables, strikethrough, task lists,
-//      * wikilinks, spoilers, and admonitions. No feature-selection flags.
-//      *
-//      * Strikethrough requires ~~ delimiters; a single ~ is not strikethrough.
-//      * Spoilers require || delimiters and follow the inline emphasis/strong
-//      * model (like **). Spoiler syntax is disabled inside tables.
-//      *
-//      * No bare URL/www/email autolinks or footnotes. Standard CommonMark
-//      * angle-bracket autolinks remain supported.
-//      * No math, underline, superscript/subscript, highlight, or insert syntax.
-//      * Keep CommonMark heading and whitespace rules; no permissive headings
-//      * or whitespace-collapsing mode.
-//      * Line endings: scan for LF; recognize CRLF by checking the preceding
-//      * byte. CR-only line endings are intentionally unsupported for now.
-//      */
-//
-//     MdCursor cursor = {
-//         .source = source,
-//     };
-//
-//     static const u8  candidates[]    = {'\n', 0,   '\t', '\r', ' ', '#', '>', '-', '+',  '=', '`',
-//                                         '*',  '_', '~',  '|',  '[', ']', '!', '<', '\\', '&'};
-//     SimdByteScanMany table           = simd_byte_scan_many_init(candidates, sizeof(candidates));
-//     SimdByteRunCarry run_carry       = {0};
-//     u32              run_start       = 0;
-//     u8               run_tag         = 0;
-//     u8               run_left_useful = 1;
-//
-//     const u32 buffer_capacity    = 4096;
-//     u8*       buffer             = scratch_alloc_aligned(scratch, u8, buffer_capacity);
-//     u8*       classified         = scratch_alloc_aligned(scratch, u8, buffer_capacity);
-//     u32*      starts             = scratch_alloc_aligned(scratch, u32, buffer_capacity);
-//     u32       buffer_file_offset = 0;
-//
-//     u32           l0_capacity = source->total_length;
-//     u8*           l0_tags     = scratch_alloc_aligned(scratch, u8, l0_capacity);
-//     u32*          l0_offsets  = scratch_alloc_aligned(scratch, u32, l0_capacity);
-//     u32*          l0_lengths  = scratch_alloc_aligned(scratch, u32, l0_capacity);
-//     MdL0Metadata* l0_metadata = scratch_alloc_aligned(scratch, MdL0Metadata, l0_capacity);
-//     u32           l0_count    = 0;
-//
-//     u32  l1_capacity = source->total_length;
-//     u8*  l1_tags     = scratch_alloc_aligned(scratch, u8, l1_capacity);
-//     u32* l1_offsets  = scratch_alloc_aligned(scratch, u32, l1_capacity);
-//     u32* l1_lengths  = scratch_alloc_aligned(scratch, u32, l1_capacity);
-//     u32  l1_count    = 0;
-//
-//     MdMap* mappings       = scratch_alloc_aligned(scratch, MdMap, source->total_length);
-//     u32    mappings_count = 0;
-//
-//     u32 line_begin = 0;
-//     u32 line_idx   = 0;
-//     u32 indent     = 0;
-//     u8  previous   = 0;
-//
-//     u8           line_tag      = MD_L0_PARAGRAPH;
-//     MdL0Metadata line_metadata = {0};
-//
-//     while (buffer_file_offset < source->total_length) {
-//         u32 buffer_bytes_read = md_fill(&cursor, buffer, buffer_capacity);
-//         u32 start_count       = simd_byte_scan_runs(buffer, buffer_bytes_read, &table, &run_carry, classified,
-//         starts);
-//
-//         u32 start_index      = 0;
-//         u32 whitespace_index = 0;
-//         if (buffer_file_offset == 0)
-//             goto line_indent;
-//
-//         while (start_index < start_count) {
-//             u32 index  = starts[start_index++];
-//             u8  byte   = buffer[index];
-//             u32 offset = buffer_file_offset + index;
-//
-//             // TODO handle code blocks in block comments, list items
-//             if (line_metadata.marker_length > 0 &&
-//                 line_idx == line_metadata.marker_offset + line_metadata.marker_length &&
-//                 (offset != line_idx || byte != line_metadata.marker_byte)) {
-//                 if ((line_metadata.marker_byte == '`' || line_metadata.marker_byte == '~' ||
-//                      line_metadata.marker_byte == '_') &&
-//                     line_metadata.marker_length < 3) {
-//                     l1_tags[l1_count]    = line_metadata.marker_byte;
-//                     l1_offsets[l1_count] = line_metadata.marker_offset;
-//                     l1_lengths[l1_count] = line_metadata.marker_length;
-//                     l1_count += 1;
-//                     line_tag      = MD_L0_PARAGRAPH;
-//                     line_metadata = (MdL0Metadata){0};
-//                 }
-//             }
-//
-//             // Can apply anywhere
-//             if (byte == '\n') {
-//                 u32 content_end = offset;
-//                 content_end -= ((index > 0 && buffer[index - 1] == '\r') || (index == 0 && previous == '\r'));
-//
-//                 if (line_tag == MD_L0_PARAGRAPH && line_metadata.marker_offset >= content_end)
-//                     line_tag = MD_L0_BLANK;
-//
-//                 if (line_tag == MD_L0_BLANK && l0_count > 0 && l0_tags[l0_count - 1] == MD_L0_BLANK) {
-//                     l0_lengths[l0_count - 1] = content_end - l0_offsets[l0_count - 1];
-//                     l0_metadata[l0_count - 1].line_count += 1;
-//                 } else {
-//                     l0_tags[l0_count]        = line_tag;
-//                     l0_offsets[l0_count]     = line_begin;
-//                     l0_lengths[l0_count]     = content_end - line_begin;
-//                     line_metadata.indent     = indent;
-//                     line_metadata.line_count = 1;
-//                     l0_metadata[l0_count]    = line_metadata;
-//                     l0_count += 1;
-//                 }
-//
-//                 line_begin       = offset + 1;
-//                 whitespace_index = index + 1;
-//
-//             line_indent:
-//                 line_idx      = line_begin;
-//                 indent        = 0;
-//                 line_tag      = MD_L0_PARAGRAPH;
-//                 line_metadata = (MdL0Metadata){0};
-//                 while (line_idx < source->total_length) {
-//                     while (whitespace_index < buffer_bytes_read) {
-//                         u8 indent_byte = buffer[whitespace_index];
-//                         if (indent_byte != ' ' && indent_byte != '\t')
-//                             goto newline_end;
-//
-//                         while (start_index < start_count && starts[start_index] <= whitespace_index)
-//                             start_index += 1;
-//                         u32 whitespace_end = buffer_bytes_read;
-//                         if (start_index < start_count)
-//                             whitespace_end = starts[start_index];
-//                         u32 length = whitespace_end - whitespace_index;
-//
-//                         if (indent_byte == ' ')
-//                             indent += length;
-//                         else
-//                             indent = ((indent >> 2) + length) << 2;
-//
-//                         whitespace_index = whitespace_end;
-//                         line_idx += length;
-//                     }
-//                     if (line_idx == source->total_length)
-//                         goto newline_end;
-//
-//                     previous = buffer[buffer_bytes_read - 1];
-//                     buffer_file_offset += buffer_bytes_read;
-//                     buffer_bytes_read = md_fill(&cursor, buffer, buffer_capacity);
-//                     start_count =
-//                         simd_byte_scan_runs(buffer, buffer_bytes_read, &table, &run_carry, classified, starts);
-//                     start_index      = 0;
-//                     whitespace_index = 0;
-//                 }
-//
-//             newline_end:
-//                 line_metadata.marker_offset = line_idx;
-//                 continue;
-//             }
-//
-//             if (line_idx == offset && line_idx == line_metadata.marker_offset + line_metadata.marker_length &&
-//                 (line_metadata.marker_length == 0 || byte == line_metadata.marker_byte)) {
-//                 // Start-of-line dispatch; handlers below share marker recording.
-//                 if (byte <= '-') {
-//                     if (byte == '#')
-//                         goto heading_marker;
-//                     if (byte == '-' || byte == '+' || byte == '*')
-//                         goto list_marker;
-//                     goto scan_l1;
-//                 }
-//                 if (byte <= '`') {
-//                     if (byte >= '_') {
-//                         if (!line_metadata.marker_length) {
-//                             if (byte == '_')
-//                                 line_tag = MD_L0_THEMATIC_BREAK;
-//                             else
-//                                 line_tag = MD_L0_FENCED_CODE_BLOCK;
-//                         }
-//                         goto record_l0_marker;
-//                     }
-//                     if (byte == '=' || byte == '>') {
-//                         if (!line_metadata.marker_length) {
-//                             if (byte == '>')
-//                                 line_tag = MD_L0_BLOCK_QUOTE;
-//                             else
-//                                 line_tag = MD_L0_SETEXT_HEADING;
-//                         }
-//                         goto record_l0_marker;
-//                     }
-//                     goto scan_l1;
-//                 }
-//                 if (byte != '~')
-//                     goto scan_l1;
-//                 if (!line_metadata.marker_length)
-//                     line_tag = MD_L0_FENCED_CODE_BLOCK;
-//                 goto record_l0_marker;
-//
-//             list_marker:
-//                 {
-//                     if (line_metadata.marker_length > 0) {
-//                         setif_u8(line_metadata.marker_length >= 2 && byte != '+', line_tag, MD_L0_THEMATIC_BREAK);
-//                         goto record_l0_marker;
-//                     }
-//
-//                     line_tag                          = MD_L0_UNORDERED_LIST;
-//                     line_metadata.marker_byte         = byte;
-//                     line_metadata.marker_offset       = offset;
-//                     line_metadata.marker_length       = 1;
-//                     line_metadata.trailing_whitespace = true;
-//                     line_metadata.post_indent         = indent + 1;
-//                     whitespace_index                  = index + 1;
-//                     u32 padding_offset                = offset + 1;
-//
-//                     while (padding_offset < source->total_length) {
-//                         while (whitespace_index < buffer_bytes_read) {
-//                             u8 padding_byte = buffer[whitespace_index];
-//                             if (!line_metadata.marker_padding && padding_byte == byte && byte != '+')
-//                                 goto hit_end;         // Continue counting a dash/star run.
-//                             if (padding_byte == '\n' || padding_byte == '\r')
-//                                 goto body_indent_end; // Empty items are valid.
-//                             if (padding_byte == ' ')
-//                                 line_metadata.post_indent += 1;
-//                             else if (padding_byte == '\t')
-//                                 line_metadata.post_indent += 4 - (line_metadata.post_indent & 3);
-//                             else if (!line_metadata.marker_padding) {
-//                                 line_tag      = MD_L0_PARAGRAPH;
-//                                 line_metadata = (MdL0Metadata){0};
-//                                 goto scan_l1;
-//                             } else {
-//                                 goto body_indent_end;
-//                             }
-//                             line_metadata.marker_padding += 1;
-//                             whitespace_index += 1;
-//                             padding_offset += 1;
-//                         }
-//                         if (padding_offset == source->total_length)
-//                             goto body_indent_end;
-//
-//                         previous = buffer[buffer_bytes_read - 1];
-//                         buffer_file_offset += buffer_bytes_read;
-//                         buffer_bytes_read = md_fill(&cursor, buffer, buffer_capacity);
-//                         start_count =
-//                             simd_byte_scan_runs(buffer, buffer_bytes_read, &table, &run_carry, classified, starts);
-//                         start_index      = 0;
-//                         whitespace_index = 0;
-//                     }
-//
-//                 body_indent_end:
-//                     if (line_metadata.post_indent - (indent + 1) < 1 || line_metadata.post_indent - (indent + 1) > 4)
-//                         line_metadata.post_indent = indent + 2;
-//                     // TODO validate list-marker padding and distinguish thematic breaks.
-//                     goto hit_end;
-//                 }
-//             heading_marker:
-//                 {
-//                     if (line_metadata.marker_length == 6) {
-//                         line_tag = MD_L0_PARAGRAPH;
-//                         goto hit_end;
-//                     }
-//                     line_tag                  = MD_L0_ATX_HEADING;
-//                     line_metadata.marker_byte = byte;
-//
-//                     setif(line_metadata.marker_length == 0, line_metadata.marker_offset, offset);
-//
-//                     line_metadata.marker_length += 1;
-//                     line_metadata.trailing_whitespace = true;
-//                     line_metadata.post_indent         = indent + line_metadata.marker_length;
-//                     whitespace_index                  = index + 1;
-//                     u32  padding_offset               = offset + 1;
-//                     bool heading_cr                   = false;
-//
-//                     while (padding_offset < source->total_length) {
-//                         while (whitespace_index < buffer_bytes_read) {
-//                             u8 padding_byte = buffer[whitespace_index];
-//                             if (heading_cr) {
-//                                 if (padding_byte != '\n')
-//                                     line_tag = MD_L0_PARAGRAPH;
-//                                 goto heading_padding_end;
-//                             }
-//                             if (padding_byte == ' ')
-//                                 line_metadata.post_indent += 1;
-//                             else if (padding_byte == '\t')
-//                                 line_metadata.post_indent += 4 - (line_metadata.post_indent & 3);
-//                             else if (padding_byte == '\r' && !line_metadata.marker_padding)
-//                                 heading_cr = true;
-//                             else {
-//                                 if (!line_metadata.marker_padding && padding_byte != '#' && padding_byte != '\n')
-//                                     line_tag = MD_L0_PARAGRAPH;
-//                                 goto heading_padding_end;
-//                             }
-//                             if (!heading_cr)
-//                                 line_metadata.marker_padding += 1;
-//                             whitespace_index += 1;
-//                             padding_offset += 1;
-//                         }
-//                         if (padding_offset == source->total_length)
-//                             goto heading_padding_end;
-//
-//                         previous = buffer[buffer_bytes_read - 1];
-//                         buffer_file_offset += buffer_bytes_read;
-//                         buffer_bytes_read = md_fill(&cursor, buffer, buffer_capacity);
-//                         start_count =
-//                             simd_byte_scan_runs(buffer, buffer_bytes_read, &table, &run_carry, classified, starts);
-//                         start_index      = 0;
-//                         whitespace_index = 0;
-//                     }
-//
-//                 heading_padding_end:
-//                     // setif(cond, line_tag, 0)
-//                     line_tag *= !(heading_cr && padding_offset == source->total_length);
-//
-//                     while (start_index < start_count && starts[start_index] < whitespace_index)
-//                         start_index += 1;
-//
-//                     line_idx = padding_offset;
-//                     continue;
-//                 }
-//             record_l0_marker:
-//                 line_metadata.marker_byte = byte;
-//                 setif(line_metadata.marker_length == 0, line_metadata.marker_offset, offset);
-//                 line_metadata.marker_length += 1;
-//                 line_metadata.trailing_whitespace = true;
-//                 // TODO clear trailing_whitespace for non-whitespace content after the marker.
-//                 goto hit_end;
-//             }
-//
-//         scan_l1:
-//             // l1 we always care about these
-//             switch (byte) {
-//                 case 0:
-//                     mappings[mappings_count] = (MdMap){
-//                         .offset      = offset,
-//                         .length      = 1,
-//                         .kind        = MD_NODE_REPLACEMENT,
-//                         .text        = {0xef, 0xbf, 0xbd},
-//                         .text_length = 3,
-//                     };
-//                     mappings_count += 1;
-//                     break;
-//                 case '`':
-//                 case '*':
-//                 case '_':
-//                 case '~':
-//                 case '|':
-//                 case '[':
-//                 case ']':
-//                 case '!':
-//                 case '<':
-//                 case '\\':
-//                 case '&': {
-//                     if (l1_count > 0 && l1_tags[l1_count - 1] == byte &&
-//                         l1_offsets[l1_count - 1] + l1_lengths[l1_count - 1] == offset) {
-//                         l1_lengths[l1_count - 1] += 1;
-//                     } else {
-//                         l1_tags[l1_count]    = byte;
-//                         l1_offsets[l1_count] = offset;
-//                         l1_lengths[l1_count] = 1;
-//                         l1_count += 1;
-//                     }
-//                     break;
-//                 }
-//             }
-//         hit_end:
-//             line_idx = offset + 1;
-//         }
-//
-//         if (buffer_bytes_read > 0)
-//             previous = buffer[buffer_bytes_read - 1];
-//         buffer_file_offset += buffer_bytes_read;
-//     }
-//
-//     if (line_begin < source->total_length) {
-//         if ((line_metadata.marker_byte == '`' || line_metadata.marker_byte == '~' ||
-//              line_metadata.marker_byte == '_') &&
-//             line_metadata.marker_length < 3) {
-//             l1_tags[l1_count]    = line_metadata.marker_byte;
-//             l1_offsets[l1_count] = line_metadata.marker_offset;
-//             l1_lengths[l1_count] = line_metadata.marker_length;
-//             l1_count += 1;
-//             line_tag      = MD_L0_PARAGRAPH;
-//             line_metadata = (MdL0Metadata){0};
-//         }
-//         if (line_tag == MD_L0_PARAGRAPH && line_metadata.marker_offset >= source->total_length)
-//             line_tag = MD_L0_BLANK;
-//         if (line_tag == MD_L0_BLANK && l0_count > 0 && l0_tags[l0_count - 1] == MD_L0_BLANK) {
-//             l0_lengths[l0_count - 1] = source->total_length - l0_offsets[l0_count - 1];
-//             l0_metadata[l0_count - 1].line_count += 1;
-//         } else {
-//             l0_tags[l0_count]        = line_tag;
-//             l0_offsets[l0_count]     = line_begin;
-//             l0_lengths[l0_count]     = source->total_length - line_begin;
-//             line_metadata.pre_indent = indent;
-//             line_metadata.line_count = 1;
-//             l0_metadata[l0_count]    = line_metadata;
-//             l0_count += 1;
-//         }
-//     }
-//
-//     MdState result = {
-//         .l0_count       = l0_count,
-//         .l1_count       = l1_count,
-//         .mappings_count = mappings_count,
-//     };
-//
-//     // TODO classify remaining L0 markers and resolve L1 candidates.
-//     if (result.l0_count) {
-//         u32 count = result.l0_count;
-//
-//         result.l0_tags = arena_alloc_aligned(arena, u8, count);
-//         memcpy(result.l0_tags, l0_tags, count * sizeof(u8));
-//
-//         result.l0_offsets = arena_alloc_aligned(arena, u32, count);
-//         memcpy(result.l0_offsets, l0_offsets, count * sizeof(u32));
-//
-//         result.l0_lengths = arena_alloc_aligned(arena, u32, count);
-//         memcpy(result.l0_lengths, l0_lengths, count * sizeof(u32));
-//
-//         result.l0_metadata = arena_alloc_aligned(arena, MdL0Metadata, count);
-//         memcpy(result.l0_metadata, l0_metadata, count * sizeof(MdL0Metadata));
-//     }
-//
-//     if (result.l1_count) {
-//         u32 count = result.l1_count;
-//
-//         result.l1_tags = arena_alloc_aligned(arena, u8, count);
-//         memcpy(result.l1_tags, l1_tags, count * sizeof(u8));
-//
-//         result.l1_offsets = arena_alloc_aligned(arena, u32, count);
-//         memcpy(result.l1_offsets, l1_offsets, count * sizeof(u32));
-//
-//         result.l1_lengths = arena_alloc_aligned(arena, u32, count);
-//         memcpy(result.l1_lengths, l1_lengths, count * sizeof(u32));
-//     }
-//
-//     if (result.mappings_count) {
-//         u32 count       = result.mappings_count;
-//         result.mappings = arena_alloc_aligned(arena, MdMap, count);
-//         memcpy(result.mappings, mappings, count * sizeof(MdMap));
-//     }
-//
-//     return result;
-// }
-
-MdState md_create_v2(rop(ro DocView) source, rop(rw Arena) arena, rop(rw ScratchArena) scratch) {
+MdState md_create(rop(ro DocView) source, rop(rw Arena) arena, rop(rw ScratchArena) scratch) {
     MdCursor         cursor       = {.source = source};
     static const u8  candidates[] = {'\n', 0,   '\t', '\r', ' ', '#', '>', '-', '+',  '=', '`',
                                      '*',  '_', '~',  '|',  '[', ']', '!', '<', '\\', '&'};
+    // TODO: Precompute the fixed scanner table instead of rebuilding it per parse.
     SimdByteScanMany table        = simd_byte_scan_many_init(candidates, sizeof(candidates));
     SimdByteRunCarry run_carry    = {0};
 
@@ -739,8 +316,9 @@ MdState md_create_v2(rop(ro DocView) source, rop(rw Arena) arena, rop(rw Scratch
         ['~']  = MD_L0_FENCED_CODE_BLOCK,
     };
 
-    const u32 buffer_capacity    = 4096;
-    u8*       buffer             = scratch_alloc_aligned(scratch, u8, buffer_capacity);
+    const u32 buffer_capacity = 4096;
+    u8*       bridge             = scratch_alloc_aligned(scratch, u8, buffer_capacity);
+    const u8* buffer             = NULL;
     u8*       lexical_tags       = scratch_alloc_aligned(scratch, u8, buffer_capacity);
     u32*      run_offsets        = scratch_alloc_aligned(scratch, u32, buffer_capacity);
     u32       buffer_file_offset = 0;
@@ -750,11 +328,13 @@ MdState md_create_v2(rop(ro DocView) source, rop(rw Arena) arena, rop(rw Scratch
     u32       run_offset         = 0;
     u8        run_tag            = 0;
 
-    usize         l0_capacity = (usize)source->total_length + 1;
-    u8*           l0_tags     = scratch_alloc_aligned(scratch, u8, l0_capacity);
-    u32*          l0_offsets  = scratch_alloc_aligned(scratch, u32, l0_capacity);
-    MdL0Metadata* l0_metadata = scratch_alloc_aligned(scratch, MdL0Metadata, l0_capacity);
-    u32           l0_count    = 0;
+    usize       l0_capacity = (usize)source->total_length + 1;
+    u8*         l0_tags     = scratch_alloc_aligned(scratch, u8, l0_capacity);
+    u32*        l0_offsets  = scratch_alloc_aligned(scratch, u32, l0_capacity);
+    MdL0Common* l0_common   = scratch_alloc_aligned(scratch, MdL0Common, l0_capacity);
+    MdL0Extra*  l0_extra    = scratch_alloc_aligned(scratch, MdL0Extra, l0_capacity);
+    u32         l0_count    = 0;
+    u32         extra_count = 0;
 
     u32  l1_capacity = source->total_length;
     u8*  l1_tags     = scratch_alloc_aligned(scratch, u8, l1_capacity);
@@ -762,19 +342,21 @@ MdState md_create_v2(rop(ro DocView) source, rop(rw Arena) arena, rop(rw Scratch
     u32* l1_lengths  = scratch_alloc_aligned(scratch, u32, l1_capacity);
     u32  l1_count    = 0;
 
-    MdMap* mappings       = scratch_alloc_aligned(scratch, MdMap, source->total_length);
-    u32    mappings_count = 0;
+    usize  mappings_capacity = ((usize)source->total_length + 1) / 2;
+    MdMap* mappings          = scratch_alloc_aligned(scratch, MdMap, mappings_capacity);
+    u32    mappings_count    = 0;
 
-    u32          line_offset      = 0;
-    u32          line_indent      = 0;
-    u32          blank_line_count = 0;
-    u32          at_line_start    = true;
-    u8           line_tag;
-    MdL0Metadata line_metadata;
+    u32        line_offset      = 0;
+    u32        line_indent      = 0;
+    u32        blank_line_count = 0;
+    u32        at_line_start    = true;
+    u8         line_tag;
+    MdL0Common line_common;
+    MdL0Extra  line_extra;
 
     l0_offsets[0] = 0;
     if (likely(source->total_length > 0)) {
-        buffer_length = md_fill(&cursor, buffer, min(buffer_capacity, source->total_length));
+        buffer_length = md_fill(&cursor, bridge, min(buffer_capacity, source->total_length), &buffer);
         run_count     = simd_byte_scan_runs(buffer, buffer_length, &table, &run_carry, lexical_tags, run_offsets);
         run_tag       = lexical_tags[0];
         run_index     = 1;
@@ -783,10 +365,10 @@ MdState md_create_v2(rop(ro DocView) source, rop(rw Arena) arena, rop(rw Scratch
     // Every iteration, we process the previous run because then we know it's length.
     while (run_offset < source->total_length) {
         // Continuations may emit no starts; refill until a boundary or EOF.
-        while (run_index == run_count && buffer_file_offset + buffer_length < source->total_length) {
+        while (unlikely(run_index == run_count) && buffer_file_offset + buffer_length < source->total_length) {
             buffer_file_offset += buffer_length;
             u32 remaining = source->total_length - buffer_file_offset;
-            buffer_length = md_fill(&cursor, buffer, min(buffer_capacity, remaining));
+            buffer_length = md_fill(&cursor, bridge, min(buffer_capacity, remaining), &buffer);
             // continued runs are NOT output again.
             // "abc     " run_count = 2
             // "  xyzlmn" run_count = 1 // only the text run is output.
@@ -801,10 +383,13 @@ MdState md_create_v2(rop(ro DocView) source, rop(rw Arena) arena, rop(rw Scratch
         else
             run_end = source->total_length;
 
-        u32 run_length            = run_end - run_offset;
-        u32 indent                = line_indent + run_length;
-        u32 whitespace_run_length = 0;
-        u8  l0_tag                = MD_L0_PARAGRAPH;
+        if (run_tag == 0 && !at_line_start) {
+            goto next_run;
+        }
+
+        u32 run_length = run_end - run_offset;
+        u32 indent;
+        u8  l0_tag = MD_L0_PARAGRAPH;
         if (run_tag > 32) {
             if (run_tag == 128) {
                 assert(SCOPE_MARKDOWN, run_length <= UINT16_MAX);
@@ -821,33 +406,6 @@ MdState md_create_v2(rop(ro DocView) source, rop(rw Arena) arena, rop(rw Scratch
                 l1_offsets[l1_count] = run_offset;
                 l1_lengths[l1_count] = run_length;
                 l1_count += 1;
-
-                if (!at_line_start) {
-                    goto set_l0_metadata;
-                }
-
-                u8 l0_tag_lookup = l0_tag_table[run_tag];
-
-                if (l0_tag_lookup == MD_L0_THEMATIC_BREAK || l0_tag_lookup == MD_L0_FENCED_CODE_BLOCK) {
-                    if (run_length < 3) {
-                        l0_tag_lookup = MD_L0_NONE;
-                    }
-                }
-
-                if (l0_tag_lookup == MD_L0_ATX_HEADING) {
-                    if (run_length > 6) {
-                        l0_tag_lookup = MD_L0_NONE;
-                    }
-                }
-
-                if (run_tag == '-' || run_tag == '*') {
-                    if (run_length >= 3)
-                        l0_tag_lookup = MD_L0_THEMATIC_BREAK;
-                }
-
-                if (l0_tag_lookup != MD_L0_NONE) {
-                    l0_tag = l0_tag_lookup;
-                }
             }
         } else {
             if (run_tag == '\n') {
@@ -855,56 +413,96 @@ MdState md_create_v2(rop(ro DocView) source, rop(rw Arena) arena, rop(rw Scratch
                     blank_line_count += run_length;
                 } else {
                     if (blank_line_count > 0) {
-                        l0_tags[l0_count]     = MD_L0_BLANK;
-                        l0_metadata[l0_count] = (MdL0Metadata){.line_count = blank_line_count};
+                        l0_tags[l0_count]       = MD_L0_BLANK;
+                        l0_common[l0_count]     = (MdL0Common){0};
+                        l0_extra[extra_count++] = (MdL0Extra){.line_count = blank_line_count};
                         l0_count += 1;
                         l0_offsets[l0_count] = line_offset;
                     }
-                    l0_tags[l0_count]     = line_tag;
-                    l0_metadata[l0_count] = line_metadata;
+                    l0_tags[l0_count]   = line_tag;
+                    l0_common[l0_count] = line_common;
+                    if (line_tag != MD_L0_PARAGRAPH) {
+                        l0_extra[extra_count++] = line_extra;
+                    }
                     l0_count += 1;
                     l0_offsets[l0_count] = run_offset + 1;
                     blank_line_count     = run_length - 1;
                 }
                 line_offset   = run_end;
-                l0_tag        = MD_L0_BLANK;
                 line_indent   = 0;
                 at_line_start = true;
-                indent        = 0;
                 goto next_run;
             } else if (run_tag == ' ' || run_tag == '\t') {
-                l0_tag = MD_L0_BLANK;
-                indent = line_indent;
-                goto whitespace;
+                if (!at_line_start) {
+                    goto next_run;
+                } else {
+                    l0_tag = MD_L0_BLANK;
+                    indent = line_indent;
+                    goto consume_whitespace;
+                }
             }
         }
 
-    set_l0_metadata:
-        if (at_line_start) {
-            assert(SCOPE_MARKDOWN, run_offset - line_offset <= UINT16_MAX);
-            assert(SCOPE_MARKDOWN, run_length < (1u << 15) || l0_tag == MD_L0_PARAGRAPH);
-            line_tag      = l0_tag;
-            line_metadata = (MdL0Metadata){
-                .marker_offset = run_offset - line_offset,
-                .marker_byte   = run_tag,
-                .marker_length = run_length * (l0_tag != MD_L0_PARAGRAPH),
-                .pre_indent    = line_indent,
-            };
+        if (!at_line_start) {
+            goto next_run;
         }
 
-    next_run:
+        if (run_tag > 32 && run_tag != 128) {
+            u8 l0_tag_lookup = l0_tag_table[run_tag];
+
+            switch (l0_tag_lookup) {
+                case MD_L0_THEMATIC_BREAK:
+                case MD_L0_FENCED_CODE_BLOCK: {
+                    if (run_length < 3) {
+                        l0_tag_lookup = MD_L0_NONE;
+                    }
+                    break;
+                }
+                case MD_L0_ATX_HEADING: {
+                    if (run_length > 6) {
+                        l0_tag_lookup = MD_L0_NONE;
+                    }
+                    break;
+                }
+                case MD_L0_UNORDERED_LIST: {
+                    if (run_tag == '-' || run_tag == '*') {
+                        if (run_length >= 3) {
+                            l0_tag_lookup = MD_L0_THEMATIC_BREAK;
+                        }
+                    }
+                    break;
+                }
+                case MD_L0_NONE:
+                    break;
+                default:
+                    break;
+            }
+
+            if (l0_tag_lookup != MD_L0_NONE) {
+                l0_tag = l0_tag_lookup;
+            }
+        }
+
+        line_tag               = l0_tag;
+        line_common.pre_indent = line_indent;
+        if (l0_tag == MD_L0_PARAGRAPH) {
+            line_common.content_start = run_offset - line_offset;
+            at_line_start             = false;
+            goto next_run;
+        }
+        indent = line_indent + run_length;
+
         run_offset = run_end;
         if (run_index < run_count) {
             run_tag = lexical_tags[run_index];
             run_index += 1;
         }
 
-    whitespace:
         while (run_offset < source->total_length && (run_tag == ' ' || run_tag == '\t')) {
-            while (run_index == run_count && buffer_file_offset + buffer_length < source->total_length) {
+            while (unlikely(run_index == run_count) && buffer_file_offset + buffer_length < source->total_length) {
                 buffer_file_offset += buffer_length;
                 u32 remaining = source->total_length - buffer_file_offset;
-                buffer_length = md_fill(&cursor, buffer, min(buffer_capacity, remaining));
+                buffer_length = md_fill(&cursor, bridge, min(buffer_capacity, remaining), &buffer);
                 run_count = simd_byte_scan_runs(buffer, buffer_length, &table, &run_carry, lexical_tags, run_offsets);
                 run_index = 0;
             }
@@ -914,7 +512,7 @@ MdState md_create_v2(rop(ro DocView) source, rop(rw Arena) arena, rop(rw Scratch
                 run_end = source->total_length;
             run_length = run_end - run_offset;
 
-            whitespace_run_length += run_length;
+        consume_whitespace:
             if (run_tag == ' ')
                 indent += run_length;
             else
@@ -927,38 +525,48 @@ MdState md_create_v2(rop(ro DocView) source, rop(rw Arena) arena, rop(rw Scratch
             }
         }
 
-        if (l0_tag == MD_L0_BLANK) {
-            line_indent = indent;
-            continue;
+        assert(SCOPE_MARKDOWN, indent <= UINT16_MAX);
+        line_indent   = indent;
+        at_line_start = l0_tag == MD_L0_BLANK;
+        if (!at_line_start) {
+            assert(SCOPE_MARKDOWN, run_offset - line_offset <= UINT16_MAX);
+            line_common.content_start = run_offset - line_offset;
+            line_extra                = (MdL0Extra){.post_indent = indent};
         }
+        continue;
 
-        if (at_line_start) {
-            line_metadata.marker_padding = whitespace_run_length;
-            line_metadata.post_indent    = indent;
-            at_line_start                = false;
+    next_run:
+        run_offset = run_end;
+        if (run_index < run_count) {
+            run_tag = lexical_tags[run_index];
+            run_index += 1;
         }
-        line_metadata.trailing_whitespace = whitespace_run_length > 0;
     }
 
     // flush pending line
     if (!at_line_start) {
         if (blank_line_count > 0) {
-            l0_tags[l0_count]     = MD_L0_BLANK;
-            l0_metadata[l0_count] = (MdL0Metadata){.line_count = blank_line_count};
+            l0_tags[l0_count]       = MD_L0_BLANK;
+            l0_common[l0_count]     = (MdL0Common){0};
+            l0_extra[extra_count++] = (MdL0Extra){.line_count = blank_line_count};
             l0_count += 1;
             l0_offsets[l0_count] = line_offset;
             blank_line_count     = 0;
         }
-        l0_tags[l0_count]     = line_tag;
-        l0_metadata[l0_count] = line_metadata;
+        l0_tags[l0_count]   = line_tag;
+        l0_common[l0_count] = line_common;
+        if (line_tag != MD_L0_PARAGRAPH) {
+            l0_extra[extra_count++] = line_extra;
+        }
         l0_count += 1;
         line_indent = 0;
     }
 
     // write EOF sentinel with pending trailing whitespace
-    l0_offsets[l0_count]  = source->total_length;
-    l0_tags[l0_count]     = MD_L0_EOF;
-    l0_metadata[l0_count] = (MdL0Metadata){.pre_indent = line_indent, .line_count = blank_line_count};
+    l0_offsets[l0_count]    = source->total_length;
+    l0_tags[l0_count]       = MD_L0_EOF;
+    l0_common[l0_count]     = (MdL0Common){.pre_indent = line_indent};
+    l0_extra[extra_count++] = (MdL0Extra){.line_count = blank_line_count};
     l0_count += 1;
 
     MdState result = {
@@ -971,8 +579,10 @@ MdState md_create_v2(rop(ro DocView) source, rop(rw Arena) arena, rop(rw Scratch
     memcpy(result.l0_tags, l0_tags, l0_count * sizeof(u8));
     result.l0_offsets = arena_alloc_aligned(arena, u32, l0_count);
     memcpy(result.l0_offsets, l0_offsets, l0_count * sizeof(u32));
-    result.l0_metadata = arena_alloc_aligned(arena, MdL0Metadata, l0_count);
-    memcpy(result.l0_metadata, l0_metadata, l0_count * sizeof(MdL0Metadata));
+    result.l0_common = arena_alloc_aligned(arena, MdL0Common, l0_count);
+    memcpy(result.l0_common, l0_common, l0_count * sizeof(MdL0Common));
+    result.l0_extra = arena_alloc_aligned(arena, MdL0Extra, extra_count);
+    memcpy(result.l0_extra, l0_extra, extra_count * sizeof(MdL0Extra));
 
     if (likely(result.l1_count > 0)) {
         u32 count      = result.l1_count;
@@ -984,7 +594,7 @@ MdState md_create_v2(rop(ro DocView) source, rop(rw Arena) arena, rop(rw Scratch
         memcpy(result.l1_lengths, l1_lengths, count * sizeof(u32));
     }
 
-    if (likely(result.mappings_count > 0)) {
+    if (result.mappings_count > 0) {
         u32 count       = result.mappings_count;
         result.mappings = arena_alloc_aligned(arena, MdMap, count);
         memcpy(result.mappings, mappings, count * sizeof(MdMap));

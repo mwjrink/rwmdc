@@ -35,6 +35,7 @@ typedef struct {
     u32 length;
 } DocPiece;
 
+// Prefer large contiguous aligned pieces
 typedef struct {
     DocPiece* pieces;
     u32       count;
