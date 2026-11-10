@@ -316,7 +316,7 @@ MdState md_create(rop(ro DocView) source, rop(rw Arena) arena, rop(rw ScratchAre
         ['~']  = MD_L0_FENCED_CODE_BLOCK,
     };
 
-    const u32 buffer_capacity = 4096;
+    const u32 buffer_capacity    = 4096;
     u8*       bridge             = scratch_alloc_aligned(scratch, u8, buffer_capacity);
     const u8* buffer             = NULL;
     u8*       lexical_tags       = scratch_alloc_aligned(scratch, u8, buffer_capacity);
@@ -614,192 +614,161 @@ void md_update(rop(rw MdState) state,
 MdResult md_get(rop(rw MdState) state, rop(rw Arena) arena, rop(rw ScratchArena) scratch, u32 begin, u32 end) {
     assert(SCOPE_MARKDOWN, end > begin);
 
+    // Setup: allocations, tables and state shared by both passes.
     static const u8 context_tags[] = {
         MD_L0_FENCED_CODE_BLOCK, MD_L0_BLOCK_QUOTE, MD_L0_THEMATIC_BREAK, MD_L0_UNORDERED_LIST};
     SimdByteScanMany context_table = simd_byte_scan_many_init(context_tags, sizeof(context_tags));
 
-    static const u8  query_tags[] = {MD_L0_PARAGRAPH,
-                                     MD_L0_BLANK,
-                                     MD_L0_ATX_HEADING,
-                                     MD_L0_BLOCK_QUOTE,
-                                     MD_L0_THEMATIC_BREAK,
-                                     MD_L0_UNORDERED_LIST,
-                                     MD_L0_SETEXT_HEADING,
-                                     MD_L0_FENCED_CODE_BLOCK};
-    SimdByteScanMany query_table  = simd_byte_scan_many_init(query_tags, sizeof(query_tags));
+    simdv_i128 paragraph_tag = splat(MD_L0_PARAGRAPH);
+    simdv_i128 fence_tag     = splat(MD_L0_FENCED_CODE_BLOCK);
 
-    static const u8  fence_tag[] = {MD_L0_FENCED_CODE_BLOCK};
-    SimdByteScanMany fence_table = simd_byte_scan_many_init(fence_tag, sizeof(fence_tag));
-
-    static const u8  inline_tags[] = {'`', '*', '_', '~', '|', '[', ']', '!', '<', '\\', '&'};
-    SimdByteScanMany inline_table  = simd_byte_scan_many_init(inline_tags, sizeof(inline_tags));
-
-    usize   capacity    = (usize)state->l0_count + state->l1_count + state->mappings_count;
+    // Include L1 output capacity when inline resolution is implemented.
+    usize   capacity    = (usize)state->l0_count + state->mappings_count;
     MdNode* nodes       = scratch_alloc_aligned(scratch, MdNode, capacity);
     u32     nodes_count = 0;
 
-    u32* l0_stack       = scratch_alloc_aligned(scratch, u32, state->l0_count);
-    u32  l0_stack_count = 0;
-    u32  fence_open     = false;
-    u32  fence_idx      = 0;
+    u32 fence_open          = false;
+    u8  fence_marker_byte   = 0;
+    u32 fence_marker_length = 0;
 
+    u32 extra_idx   = 0;
     u32 l1_idx      = 0;
     u32 mapping_idx = 0;
+    u32 chunk_start = 0;
 
-    rwp(ro SimdByteScanMany) current_mask = &context_table;
+    u32       buffer_cursor = 0;
+    u32       buffer_count  = 0;
+    const u8* buffer        = NULL;
+    u8*       tail          = scratch_alloc_aligned(scratch, u8, 4096);
+    u64       hits[64]; // One mask per 64 tags.
+    u64       nonparagraphs[64];
+    u32       hit_count = 0;
+    u32       extra_word = 0;
+    u32       extra_word_base = 0;
+    u32       hit_index = 0;
+    u64       active_hits = 0;
 
-    u8  buffer[64];
-    u32 buffer_l0_idx = 0;
+    // Loop 1: accumulate context before begin; never emit nodes.
+    while (chunk_start < state->l0_count) {
+        if (buffer_cursor == buffer_count) {
+            chunk_start += buffer_count;
+            if (chunk_start >= state->l0_count)
+                break;
 
-    while (buffer_l0_idx + 1 < state->l0_count) {
-        u32 buffer_bytes_read = min(64, state->l0_count - buffer_l0_idx - 1);
-        u32 last              = buffer_l0_idx + buffer_bytes_read - 1;
-        if (!fence_open && state->l0_offsets[last + 1] >= begin)
-            current_mask = &query_table;
-
-        memset(buffer, 0, sizeof(buffer));
-        memcpy(buffer, state->l0_tags + buffer_l0_idx, buffer_bytes_read);
-        u64 hits = 0;
-        simd_byte_scan_many(buffer, 64, current_mask, &hits);
-        hits &= UINT64_MAX >> ((64 - buffer_bytes_read) & 63);
-
-        MdNodeKind node_kind = MD_NODE_PARAGRAPH;
-
-        while (hits) {
-            u32 index = (u32)__tzcnt_u64(hits);
-            hits &= hits - 1;
-
-            u32 l0_idx    = buffer_l0_idx + index;
-            u32 l0_offset = state->l0_offsets[l0_idx];
-            if (l0_offset >= end) // TODO need to set a flag then only stop on next l0 because of setext header
-                goto get_end;
-
-            u8           l0_tag      = buffer[index];
-            u32          l0_end      = state->l0_offsets[l0_idx + 1];
-            u32          l0_length   = l0_end - l0_offset;
-            MdL0Metadata l0_metadata = state->l0_metadata[l0_idx];
-
-            u32 base_indent = 0;
-            if (l0_stack_count > 0) {
-                u32 container_idx = l0_stack[l0_stack_count - 1];
-                base_indent       = state->l0_metadata[container_idx].post_indent;
+            buffer_count   = min(4096, state->l0_count - chunk_start);
+            buffer_cursor  = 0;
+            buffer         = state->l0_tags + chunk_start;
+            u32 scan_count = (buffer_count + 63) & ~63u;
+            hit_count      = scan_count / 64;
+            if (scan_count != buffer_count) {
+                memcpy(tail, buffer, buffer_count);
+                memset(tail + buffer_count, 0, scan_count - buffer_count);
+                buffer = tail;
             }
-
-            node_kind          = MD_NODE_PARAGRAPH;
-            u32 content_offset = 0;
-
-            switch (l0_tag) {
-                case MD_L0_FENCED_CODE_BLOCK: {
-                    if (l0_metadata.pre_indent > base_indent + 3)
-                        continue;
-                    if (!fence_open) {
-                        // TODO validate info-string restrictions.
-                        fence_idx    = l0_idx;
-                        fence_open   = true;
-                        current_mask = &fence_table;
-                        simd_byte_scan_many(buffer, 64, current_mask, &hits);
-                        hits &= (UINT64_MAX << index) & ~(1ULL << index);
-                        hits &= UINT64_MAX >> ((64 - buffer_bytes_read) & 63);
-                    } else {
-                        MdL0Metadata opening = state->l0_metadata[fence_idx];
-                        if (l0_metadata.marker_byte != opening.marker_byte ||
-                            l0_metadata.marker_length < opening.marker_length)
-                            continue;
-                        // TODO validate trailing whitespace, then close the fence.
-                    }
-                    continue;
-                }
-                case MD_L0_BLOCK_QUOTE:
-                    node_kind = MD_NODE_QUOTE;
-                    // TODO strip quote markers and update quote containers in the L0 stack.
-                    break;
-                case MD_L0_THEMATIC_BREAK:
-                    if (l0_metadata.pre_indent > base_indent + 3)
-                        break;
-                    node_kind = MD_NODE_THEMATIC_BREAK;
-                    // TODO validate trailing whitespace and resolve setext headings.
-                    break;
-                case MD_L0_UNORDERED_LIST:
-                    // TODO populate post_indent from marker width and padding, then update the L0 stack.
-                    break;
-                case MD_L0_BLANK:
-                    node_kind = MD_NODE_BLANK;
-                    break;
-                case MD_L0_PARAGRAPH:
-                    // TODO match active container continuations.
-                    break;
-                case MD_L0_ATX_HEADING: {
-                    if (l0_metadata.pre_indent > base_indent + 3)
-                        break;
-                    u32 heading_offset =
-                        l0_metadata.marker_offset + l0_metadata.marker_length + l0_metadata.marker_padding;
-                    // paragraph fallback above 16-bit offsets; widen MdNode to support these headings.
-                    if (heading_offset > UINT16_MAX)
-                        break;
-                    node_kind      = MD_NODE_HEADING;
-                    content_offset = heading_offset;
-                    // TODO strip optional closing hashes and trailing whitespace.
-                    break;
-                }
-                case MD_L0_SETEXT_HEADING:
-                    // TODO match active container continuations.
-                    break;
-            }
-            // TODO examine skipped lines where container continuation requires it.
-            if (l0_end <= begin && l0_offset < begin)
-                continue;
-
-            MdNode node = {
-                .start_idx      = l0_offset,
-                .end_idx        = l0_end,
-                .content_offset = content_offset,
-                .content_length = l0_length - content_offset,
-                .kind           = node_kind,
-            };
-            if (node_kind == MD_NODE_QUOTE)
-                node.data.quote_depth = l0_metadata.marker_length;
-            if (node_kind == MD_NODE_HEADING)
-                node.data.heading_level = l0_metadata.marker_length;
-            if (node_kind == MD_NODE_BLANK)
-                node.data.line_count = l0_metadata.line_count;
-            nodes[nodes_count] = node;
-            nodes_count += 1;
-
-            // TODO binary search or better, checkpoint list
-            while (l1_idx < state->l1_count && state->l1_offsets[l1_idx] < l0_offset)
-                l1_idx += 1;
-            while (l1_idx < state->l1_count && state->l1_offsets[l1_idx] < l0_end) {
-                u32 l1_offset = state->l1_offsets[l1_idx];
-                u8  l1_tag    = state->l1_tags[l1_idx];
-                u32 l1_length = state->l1_lengths[l1_idx];
-                // TODO filter L1 tags with the active inline mask and resolve runs.
-                l1_idx += 1;
-            }
-
-            while (mapping_idx < state->mappings_count && state->mappings[mapping_idx].offset < l0_offset)
-                mapping_idx += 1;
-
-            while (mapping_idx < state->mappings_count && state->mappings[mapping_idx].offset < l0_end) {
-                rop(ro MdMap) mapping = &state->mappings[mapping_idx];
-                MdNode mapping_node   = {
-                    .start_idx      = mapping->offset,
-                    .end_idx        = mapping->offset + mapping->length,
-                    .kind           = mapping->kind,
-                    .content_length = mapping->length,
-                };
-                if (mapping->kind == MD_NODE_REPLACEMENT) {
-                    memcpy(mapping_node.data.replacement.text, mapping->text, mapping->text_length);
-                    mapping_node.data.replacement.length = mapping->text_length;
-                    mapping_node.data.replacement.repeat = 1;
-                }
-                nodes[nodes_count] = mapping_node;
-                nodes_count += 1;
-                mapping_idx += 1;
-            }
+            simd_byte_scan_many(buffer, scan_count, &context_table, hits);
+            hits[hit_count - 1] &= UINT64_MAX >> (scan_count - buffer_count);
+            simd_byte_scan(buffer, scan_count, paragraph_tag, nonparagraphs);
+            for (u32 i = 0; i < hit_count; ++i)
+                nonparagraphs[i] = ~nonparagraphs[i];
+            nonparagraphs[hit_count - 1] &= UINT64_MAX >> (scan_count - buffer_count);
+            extra_word = 0;
+            extra_word_base = extra_idx;
+            hit_index = 0;
+            while (hit_index < hit_count && !hits[hit_index])
+                hit_index += 1;
+            active_hits = 0;
+            if (hit_index < hit_count)
+                active_hits = hits[hit_index];
         }
-        buffer_l0_idx += buffer_bytes_read;
+
+        // With no more hits, check the window's last entry before refilling.
+        u32 next_cursor = buffer_count - 1;
+        if (hit_index < hit_count)
+            next_cursor = hit_index * 64 + (u32)__tzcnt_u64(active_hits);
+
+        u32 next_word = next_cursor / 64;
+        while (extra_word < next_word) {
+            extra_word_base += (u32)__builtin_popcountll(nonparagraphs[extra_word]);
+            extra_word += 1;
+        }
+        buffer_cursor = next_cursor;
+        extra_idx = extra_word_base + (u32)__builtin_popcountll(
+            nonparagraphs[next_word] & ((1ULL << (next_cursor & 63)) - 1));
+
+        u32 l0_idx = chunk_start + buffer_cursor;
+        u8 l0_tag = buffer[buffer_cursor];
+        u32 l0_end;
+        if (unlikely(l0_tag == MD_L0_EOF))
+            l0_end = state->l0_offsets[l0_idx];
+        else
+            l0_end = state->l0_offsets[l0_idx + 1];
+        if (l0_end > begin) {
+            // Rewind only the skipped entries in this boundary window.
+            while (buffer_cursor > 0 && state->l0_offsets[chunk_start + buffer_cursor] > begin) {
+                buffer_cursor -= 1;
+                if (buffer[buffer_cursor] != MD_L0_PARAGRAPH)
+                    extra_idx -= 1;
+            }
+            break;
+        }
+        if (unlikely(l0_tag == MD_L0_EOF))
+            goto get_end;
+
+        u32 l0_extra_idx = extra_idx;
+        if (l0_tag != MD_L0_PARAGRAPH)
+            extra_idx += 1;
+        buffer_cursor += 1;
+        if (hit_index == hit_count)
+            continue;
+        active_hits &= active_hits - 1;
+        hits[hit_index] = active_hits;
+        if (!active_hits) {
+            do {
+                hit_index += 1;
+            } while (hit_index < hit_count && !hits[hit_index]);
+            if (hit_index < hit_count)
+                active_hits = hits[hit_index];
+        }
+
+        // update state (fence, indent, blocks), using l0_idx and l0_extra_idx
     }
 
+    // AT THIS POINT: the current block is set, simd buffer is filled, cursor is set
+    // WE KNOW: the current block index overlaps begin/we care about it.
+
+    // Loop 2: create blocks overlapping [begin, end), using the accumulated state.
+    while (chunk_start < state->l0_count) {
+        if (buffer_cursor == buffer_count) {
+            chunk_start += buffer_count;
+            if (chunk_start >= state->l0_count)
+                break;
+
+            buffer_count   = min(4096, state->l0_count - chunk_start);
+            buffer_cursor  = 0;
+            buffer         = state->l0_tags + chunk_start;
+            u32 scan_count = (buffer_count + 63) & ~63u;
+            hit_count      = scan_count / 64;
+            if (scan_count != buffer_count) {
+                memcpy(tail, buffer, buffer_count);
+                memset(tail + buffer_count, 0, scan_count - buffer_count);
+                buffer = tail;
+            }
+            for (u32 i = 0; i < hit_count; ++i)
+                hits[i] = UINT64_MAX;
+            hits[hit_count - 1] &= UINT64_MAX >> (scan_count - buffer_count);
+        }
+
+        // scan through l0 tags from the current cursor position/index to end or EOF
+
+        // for each entry:
+        //     - update state (fence, indent, blocks)
+        //     - emit/write/stream out an md node
+        //     - if span end > end, exit
+
+        // advance
+    }
+
+    // Cleanup and output.
 get_end:
     {
         rop(rw MdNode) final_nodes = arena_alloc_aligned(arena, MdNode, nodes_count);

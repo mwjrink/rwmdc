@@ -6,7 +6,9 @@
 
 // #include <builtins>
 
-#define PREFETCH(p) __builtin_prefetch(p)
+#define PREFETCH(p)   __builtin_prefetch(p)
+#define SIMD_USE_AVX2 1
+#undef SIMD_USE_AVX512
 
 void test(void* x) {
     PREFETCH(x);
@@ -91,7 +93,7 @@ void simd_byte_scan_many(rop(ro u8) src, u32 count, rop(ro SimdByteScanMany) tab
     }
 }
 
-#if !defined(SIMD_USE_AVX512)
+#if defined(SIMD_USE_AVX2)
 static const u64 simd_bit_indices8[256] = {
     UINT64_C(0x8080808080808080), UINT64_C(0x8080808080808000), UINT64_C(0x8080808080808001),
     UINT64_C(0x8080808080800100), UINT64_C(0x8080808080808002), UINT64_C(0x8080808080800200),

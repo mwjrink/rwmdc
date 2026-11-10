@@ -157,6 +157,8 @@ void editor_handle_input(rop(rw Editor) editor, InputEvent event); // TODO defin
 void editor_undo(rop(rw Editor) editor);
 void editor_redo(rop(rw Editor) editor);
 
+#define MARGIN 12.0f
+
 // for rendering ui: status line ui at the bottom.
 DrawLayer editor_get_ui_layer(rop(rw Editor) editor,
                               rop(rw Arena) arena,
@@ -179,6 +181,11 @@ DrawLayer editor_get_ui_layer(rop(rw Editor) editor,
     DrawLayer layer = {0};
     layer.glyphs    = arena_alloc_aligned(arena, GlyphDrawCmd, max(doc_stats.length, 1));
     layer.rects     = arena_alloc_aligned(arena, GpuRect, max(10, 1)); // TODO real number not 10
+
+    f32 x = MARGIN;
+
+    for (u32 fn_idx = 0; fn_idx < editor->path.len; fn_idx++) {
+    }
 
     // UI Structure:
     // LEFT
@@ -275,8 +282,6 @@ DrawLayer editor_get_ui_layer(rop(rw Editor) editor,
 }
 
 // ---- internal helpers (skeleton) -------------------------------------------
-
-#define MARGIN 12.0f
 
 // Style bits parallel MD_STYLE_* (bold/italic/code/link), plus a placeholder
 // for link color. Keep these in sync with how glyph style/color is packed.
