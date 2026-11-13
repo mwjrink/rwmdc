@@ -513,10 +513,20 @@ static inline uint64_t fontshaper_profile_read_overhead(void) {
      SizeOfShapeContext/PlaceShapeContext describe fixed bookkeeping only. Push
      already-compiled borrowed fonts, then query SizeOfContextScratch for the
      language, input capacity and intermediate glyph capacity. Re-query after
-     changing the font stack. ShapeBegin takes destination glyph storage and this
-     per-pass scratch; previous pass pointers/output are invalidated at Begin.
-     Input, run, feature snapshots, config caches and execution workspace use
-     per-pass scratch; only the bounded font/feature stacks persist in the context.
+     changing the font stack or calling SetContextCache. ShapeBegin takes
+     destination glyph storage and this per-pass scratch; previous pass
+     pointers/output are invalidated at Begin.
+     Input, run, feature snapshots and execution workspace use per-pass scratch.
+     By default config caches also use per-pass scratch. SetContextCache opts into
+     caller-owned persistent config storage; it must not overlap context, fonts,
+     destination or scratch, and must outlive its use by the context. Set/rebind
+     it only between passes; this invalidates prior output/config pointers. NULL/0
+     disables it. Fonts remain immutable while borrowed. Font-stack changes clear
+     persistent configs at the next Begin; other keys are cached lazily until the
+     buffer fills. Cache exhaustion reports OUT_OF_MEMORY, never heap allocation
+     or eviction of live configs.
+     Scratch bounds are memoized by font stack, cache mode, language and
+     input/glyph limits.
      UTF input, user IDs, manual/automatic runs, breaks and feature values retain
      their existing semantics. Feature-stack values persist across Begin.
      Context errors are sticky: reconstruct the fixed context to recover. No
@@ -2874,7 +2884,12 @@ typedef struct fontshaper_run
 FONTSHAPER_EXPORT int fontshaper_SizeOfShapeContext(void);
 // Memory fits SizeOfShapeContext(); it remains live until the context is retired.
 FONTSHAPER_EXPORT fontshaper_shape_context *fontshaper_PlaceShapeContext(void *Memory, fontshaper_shape_context_flags Flags);
-// Query after pushing compiled fonts; re-query if the font stack changes.
+// Optional bounded persistent storage, independent of per-pass scratch. Set only
+// between passes; invalidates prior output and the scratch bound: re-query before
+// the next Begin. NULL/0 disables caching across passes.
+// Returns zero for invalid arguments or a context with a sticky error.
+FONTSHAPER_EXPORT int fontshaper_SetContextCache(fontshaper_shape_context *Context, void *Memory, fontshaper_un Size);
+// Query after pushing compiled fonts/setting cache storage; re-query if either changes.
 FONTSHAPER_EXPORT fontshaper_un fontshaper_SizeOfContextScratch(fontshaper_shape_context *Context, fontshaper_language Language, fontshaper_un CodepointCapacity, fontshaper_un GlyphCapacity);
 FONTSHAPER_EXPORT fontshaper_font *fontshaper_ShapePushFont(fontshaper_shape_context *Context, fontshaper_font *Font);
 FONTSHAPER_EXPORT fontshaper_font *fontshaper_ShapePopFont(fontshaper_shape_context *Context);
@@ -12590,6 +12605,7 @@ typedef struct fontshaper__existing_glyph_config
 {
   fontshaper_shape_config *ShapeConfig;
   fontshaper_feature_override *FeatureOverrides;
+  fontshaper_u32 FeatureOverrideCount;
   fontshaper_glyph_config *GlyphConfig;
 } fontshaper__existing_glyph_config;
 
@@ -12639,6 +12655,12 @@ struct fontshaper_shape_context
   fontshaper__arena ScratchArena;
   fontshaper__memory PassMemory;
   fontshaper_un CodepointCapacity, GlyphCapacity, ExecutionMark;
+  fontshaper_un CachedScratchSize, CachedCodepointCapacity, CachedGlyphCapacity;
+  fontshaper_language CachedScratchLanguage;
+  // ponytail: append-only cache; add between-pass eviction for unbounded style churn.
+  fontshaper__arena CacheArena;
+  fontshaper__memory CacheMemory;
+  fontshaper_b32 ConfigCacheDirty;
 
   fontshaper_shape_codepoint *LastGraphemeBreak;
   fontshaper_u32 LastGraphemeBreakIndex;
@@ -24181,6 +24203,30 @@ FONTSHAPER_EXPORT fontshaper_shape_context *fontshaper_PlaceShapeContext(void *M
   return Result;
 }
 
+static void fontshaper__ResetContextConfigs(fontshaper_shape_context *Context)
+{
+  Context->CacheMemory.Used = 0;
+  Context->CacheMemory.Error = Context->CacheArena.Error = 0;
+  Context->ConfigCacheDirty = 0;
+  FONTSHAPER__DLLIST_SENTINEL_INIT(&Context->ExistingShapeConfigBlockSentinel);
+  FONTSHAPER__DLLIST_SENTINEL_INIT(&Context->ExistingGlyphConfigBlockSentinel);
+  Context->PreparedShapeConfig = 0;
+  Context->PreparedFeatureOverrides = 0;
+  Context->PreparedGlyphConfig = 0;
+}
+
+FONTSHAPER_EXPORT int fontshaper_SetContextCache(fontshaper_shape_context *Context, void *Memory, fontshaper_un Size)
+{
+  if(!Context || Context->Error || (!Memory && Size) || (Memory && !Size)) return 0;
+  Context->CacheMemory = FONTSHAPER__ZERO_TYPE(fontshaper__memory);
+  Context->CacheMemory.Data = Memory;
+  Context->CacheMemory.Capacity = Size;
+  Context->CacheArena.Memory = &Context->CacheMemory;
+  Context->CachedScratchSize = 0;
+  fontshaper__ResetContextConfigs(Context);
+  return 1;
+}
+
 FONTSHAPER_EXPORT fontshaper_direction fontshaper_ScriptDirection(fontshaper_script Script)
 {
   fontshaper_direction Result = ((Script == FONTSHAPER_SCRIPT_ARABIC) || (Script == FONTSHAPER_SCRIPT_HEBREW)) ? FONTSHAPER_DIRECTION_RTL : FONTSHAPER_DIRECTION_LTR;
@@ -24209,6 +24255,8 @@ FONTSHAPER_EXPORT fontshaper_font *fontshaper_ShapePushFont(fontshaper_shape_con
     if(ContextFont)
     {
       ContextFont->Font = Font;
+      Context->CachedScratchSize = 0;
+      Context->ConfigCacheDirty = 1;
     }
   }
 
@@ -24226,6 +24274,8 @@ FONTSHAPER_EXPORT fontshaper_font *fontshaper_ShapePopFont(fontshaper_shape_cont
 
 
     Context->FontCount -= 1;
+    Context->CachedScratchSize = 0;
+    Context->ConfigCacheDirty = 1;
   }
 
   return Result;
@@ -24348,12 +24398,17 @@ FONTSHAPER_EXPORT fontshaper_shape_error fontshaper_ShapeError(fontshaper_shape_
 /* The pass has at most N feature snapshots, N glyph configs, N+1 runs/config
  * keys, and one execution workspace. Script/font config keys are also bounded
  * by the finite font stack times the library's script domain. Count every such
- * key without allocating, then use the tighter total / per-input maximum. */
+ * key without allocating, then use the tighter total / per-input maximum.
+ * Persistent caches own config payloads/blocks, not paragraph scratch. Keep
+ * construction/execution maxima over all scripts so cold/new scripts still fit. */
 FONTSHAPER_EXPORT fontshaper_un fontshaper_SizeOfContextScratch(fontshaper_shape_context *Context, fontshaper_language Language,
     fontshaper_un CodepointCapacity, fontshaper_un GlyphCapacity)
 {
   if(!Context || CodepointCapacity >= ((fontshaper_un)1 << FONTSHAPER__INPUT_CODEPOINT_ONE_PAST_LAST_BLOCK_MSB) ||
       !fontshaper_SizeOfGlyphStorage(GlyphCapacity)) return 0;
+  if(Context->CachedScratchSize && Context->CachedScratchLanguage == Language &&
+     Context->CachedCodepointCapacity == CodepointCapacity && Context->CachedGlyphCapacity == GlyphCapacity)
+    return Context->CachedScratchSize;
   fontshaper_un ConfigTotal = 0, ConfigMax = 0, GlyphMax = 0, ExecutionMax = 0, Keys = 0;
   for(fontshaper_u32 F = 0; F < Context->FontCount; ++F)
   {
@@ -24405,16 +24460,22 @@ FONTSHAPER_EXPORT fontshaper_un fontshaper_SizeOfContextScratch(fontshaper_shape
   fontshaper_un FeatureBytes = sizeof(fontshaper__effective_features) +
       (FONTSHAPER_MAX_SIMULTANEOUS_FEATURES - 1) * sizeof(fontshaper_feature_override) +
       FONTSHAPER_ALIGNOF(fontshaper__effective_features) - 1;
-  if(!fontshaper__BoundAdd(&Size, CodepointCapacity, FeatureBytes, 1) ||
-     !fontshaper__BoundAdd(&Size, CodepointCapacity, GlyphMax, 1) ||
-     !fontshaper__BoundAdd(&Size, 1, ConfigTotal, 1)) return 0;
+  if(!fontshaper__BoundAdd(&Size, CodepointCapacity, FeatureBytes, 1)) return 0;
+  if(!Context->CacheMemory.Data &&
+     (!fontshaper__BoundAdd(&Size, CodepointCapacity, GlyphMax, 1) ||
+      !fontshaper__BoundAdd(&Size, 1, ConfigTotal, 1))) return 0;
   // Blocks each need their own alignment, unlike a single contiguous array.
   fontshaper_un ShapeBlocks = (Keys + FONTSHAPER__EXISTING_SHAPE_CONFIGS_PER_BLOCK - 1) / FONTSHAPER__EXISTING_SHAPE_CONFIGS_PER_BLOCK;
   fontshaper_un GlyphBlocks = (CodepointCapacity + FONTSHAPER__EXISTING_GLYPH_CONFIGS_PER_BLOCK - 1) / FONTSHAPER__EXISTING_GLYPH_CONFIGS_PER_BLOCK;
-  if(!fontshaper__BoundAdd(&Size, ShapeBlocks, sizeof(fontshaper__existing_shape_config_block) + FONTSHAPER_ALIGNOF(fontshaper__existing_shape_config_block) - 1, 1) ||
-     !fontshaper__BoundAdd(&Size, GlyphBlocks, sizeof(fontshaper__existing_glyph_config_block) + FONTSHAPER_ALIGNOF(fontshaper__existing_glyph_config_block) - 1, 1) ||
-     !fontshaper__BoundAdd(&Size, 1, FONTSHAPER__MAX(ConfigMax, ExecutionMax), 1)) return 0;
+  if(!Context->CacheMemory.Data &&
+     (!fontshaper__BoundAdd(&Size, ShapeBlocks, sizeof(fontshaper__existing_shape_config_block) + FONTSHAPER_ALIGNOF(fontshaper__existing_shape_config_block) - 1, 1) ||
+      !fontshaper__BoundAdd(&Size, GlyphBlocks, sizeof(fontshaper__existing_glyph_config_block) + FONTSHAPER_ALIGNOF(fontshaper__existing_glyph_config_block) - 1, 1))) return 0;
+  if(!fontshaper__BoundAdd(&Size, 1, FONTSHAPER__MAX(ConfigMax, ExecutionMax), 1)) return 0;
 #undef FONTSHAPER__PASS
+  Context->CachedScratchLanguage = Language;
+  Context->CachedCodepointCapacity = CodepointCapacity;
+  Context->CachedGlyphCapacity = GlyphCapacity;
+  Context->CachedScratchSize = Size;
   return Size;
 }
 
@@ -24439,8 +24500,8 @@ FONTSHAPER_EXPORT void fontshaper_ShapeBegin(fontshaper_shape_context *Context, 
     Context->PreparedShapeConfig = 0;
     Context->PreparedFeatureOverrides = 0;
     Context->PreparedGlyphConfig = 0;
-    FONTSHAPER__DLLIST_SENTINEL_INIT(&Context->ExistingShapeConfigBlockSentinel);
-    FONTSHAPER__DLLIST_SENTINEL_INIT(&Context->ExistingGlyphConfigBlockSentinel);
+    if(!Context->CacheMemory.Data || Context->ConfigCacheDirty)
+      fontshaper__ResetContextConfigs(Context);
     FONTSHAPER_MEMSET(Context->InputBlocks, 0, sizeof(Context->InputBlocks));
     Context->RunCapacity = (fontshaper_u32)CodepointCapacity + 1;
     Context->RunBoundaries = fontshaper__PushArray(&Context->ScratchArena, fontshaper_u32, (fontshaper_un)Context->RunCapacity + 1);
@@ -24762,7 +24823,7 @@ FONTSHAPER_EXPORT void fontshaper_ShapeManualBreak(fontshaper_shape_context *Con
 }
 
 /* Last-wins values are sorted once and interned for the current shaping pass.
- * Both input spans and derived-configuration keys borrow these immutable values. */
+ * Input spans borrow these values; persistent glyph-config keys copy them. */
 static fontshaper_b32 fontshaper__ResolveEffectiveFeatures(fontshaper_shape_context *Context)
 {
   fontshaper_feature_override Values[FONTSHAPER_MAX_SIMULTANEOUS_FEATURES];
@@ -25159,6 +25220,8 @@ FONTSHAPER_EXPORT void fontshaper_ShapeEnd(fontshaper_shape_context *Context)
 
 static fontshaper_shape_config *fontshaper__FindOrCreateShapeConfig(fontshaper_shape_context *Context, fontshaper_font *Font, fontshaper_script Script, fontshaper_language Language)
 {
+  fontshaper__arena *ConfigArena = &Context->ScratchArena;
+  if(Context->CacheMemory.Data) ConfigArena = &Context->CacheArena;
   for(fontshaper__existing_shape_config_block *Block = (fontshaper__existing_shape_config_block *)Context->ExistingShapeConfigBlockSentinel.Next;
       fontshaper__ExistingShapeConfigBlockIsValid(Context, Block);
       Block = (fontshaper__existing_shape_config_block *)Block->Header.Next)
@@ -25174,7 +25237,7 @@ static fontshaper_shape_config *fontshaper__FindOrCreateShapeConfig(fontshaper_s
   if(!fontshaper__ExistingShapeConfigBlockIsValid(Context, Last) ||
      Last->Count == FONTSHAPER__EXISTING_SHAPE_CONFIGS_PER_BLOCK)
   {
-    fontshaper__existing_shape_config_block *Block = fontshaper__PushType(&Context->ScratchArena, fontshaper__existing_shape_config_block);
+    fontshaper__existing_shape_config_block *Block = fontshaper__PushType(ConfigArena, fontshaper__existing_shape_config_block);
     if(!Block)
     {
       Context->Error = FONTSHAPER_SHAPE_ERROR_OUT_OF_MEMORY;
@@ -25185,7 +25248,8 @@ static fontshaper_shape_config *fontshaper__FindOrCreateShapeConfig(fontshaper_s
     Last = Block;
   }
   fontshaper_un Size = (fontshaper_un)fontshaper_SizeOfShapeConfig(Font, Script, Language);
-  void *Output = Size ? fontshaper__PushSize(&Context->ScratchArena, Size, 1) : 0;
+  void *Output = 0;
+  if(Size) Output = fontshaper__PushSize(ConfigArena, Size, 1);
   fontshaper__arena_lifetime Lifetime = fontshaper__BeginLifetime(&Context->ScratchArena);
   void *Scratch = Size ? fontshaper__PushSize(&Context->ScratchArena, Size, 1) : 0;
   fontshaper_shape_config *Result = Output && Scratch ? fontshaper_PlaceShapeConfig(Font, Script, Language,
@@ -25207,6 +25271,8 @@ static fontshaper_shape_config *fontshaper__FindOrCreateShapeConfig(fontshaper_s
 static fontshaper_glyph_config *fontshaper__FindOrCreateGlyphConfig(fontshaper_shape_context *Context, fontshaper_shape_config *ShapeConfig, fontshaper_feature_override *FeatureOverrides, int FeatureOverrideCount)
 {
   if(!FeatureOverrideCount) return 0;
+  fontshaper__arena *ConfigArena = &Context->ScratchArena;
+  if(Context->CacheMemory.Data) ConfigArena = &Context->CacheArena;
   for(fontshaper__existing_glyph_config_block *Block = (fontshaper__existing_glyph_config_block *)Context->ExistingGlyphConfigBlockSentinel.Next;
       fontshaper__ExistingGlyphConfigBlockIsValid(Context, Block);
       Block = (fontshaper__existing_glyph_config_block *)Block->Header.Next)
@@ -25214,15 +25280,20 @@ static fontshaper_glyph_config *fontshaper__FindOrCreateGlyphConfig(fontshaper_s
     FONTSHAPER__FOR(I, 0, Block->Count)
     {
       fontshaper__existing_glyph_config *Existing = &Block->Items[I];
-      if(Existing->ShapeConfig == ShapeConfig && Existing->FeatureOverrides == FeatureOverrides)
-        return Existing->GlyphConfig;
+      if(Existing->ShapeConfig != ShapeConfig || Existing->FeatureOverrideCount != (fontshaper_u32)FeatureOverrideCount)
+        continue;
+      fontshaper_u32 Match = 0;
+      while(Match < Existing->FeatureOverrideCount &&
+            Existing->FeatureOverrides[Match].Tag == FeatureOverrides[Match].Tag &&
+            Existing->FeatureOverrides[Match].Value == FeatureOverrides[Match].Value) ++Match;
+      if(Match == Existing->FeatureOverrideCount) return Existing->GlyphConfig;
     }
   }
   fontshaper__existing_glyph_config_block *Last = (fontshaper__existing_glyph_config_block *)Context->ExistingGlyphConfigBlockSentinel.Prev;
   if(!fontshaper__ExistingGlyphConfigBlockIsValid(Context, Last) ||
      Last->Count == FONTSHAPER__EXISTING_GLYPH_CONFIGS_PER_BLOCK)
   {
-    fontshaper__existing_glyph_config_block *Block = fontshaper__PushType(&Context->ScratchArena, fontshaper__existing_glyph_config_block);
+    fontshaper__existing_glyph_config_block *Block = fontshaper__PushType(ConfigArena, fontshaper__existing_glyph_config_block);
     if(!Block)
     {
       Context->Error = FONTSHAPER_SHAPE_ERROR_OUT_OF_MEMORY;
@@ -25232,9 +25303,22 @@ static fontshaper_glyph_config *fontshaper__FindOrCreateGlyphConfig(fontshaper_s
     Block->Count = 0;
     Last = Block;
   }
+  if(Context->CacheMemory.Data)
+  {
+    fontshaper_feature_override *Copy = fontshaper__PushArray(ConfigArena, fontshaper_feature_override, (fontshaper_un)FeatureOverrideCount);
+    if(!Copy)
+    {
+      Context->Error = FONTSHAPER_SHAPE_ERROR_OUT_OF_MEMORY;
+      return 0;
+    }
+    FONTSHAPER_MEMCPY(Copy, FeatureOverrides, (fontshaper_un)FeatureOverrideCount * sizeof(*Copy));
+    FeatureOverrides = Copy;
+  }
   fontshaper_un Size = (fontshaper_un)fontshaper_SizeOfGlyphConfig(ShapeConfig, FeatureOverrides, FeatureOverrideCount);
-  void *Output = Size ? fontshaper__PushSize(&Context->ScratchArena, Size, 1) : 0;
-  fontshaper_glyph_config *Result = Output ? fontshaper_PlaceGlyphConfig(ShapeConfig, FeatureOverrides, FeatureOverrideCount, Output) : 0;
+  void *Output = 0;
+  if(Size) Output = fontshaper__PushSize(ConfigArena, Size, 1);
+  fontshaper_glyph_config *Result = 0;
+  if(Output) Result = fontshaper_PlaceGlyphConfig(ShapeConfig, FeatureOverrides, FeatureOverrideCount, Output);
   if(!Result)
   {
     Context->Error = FONTSHAPER_SHAPE_ERROR_OUT_OF_MEMORY;
@@ -25243,6 +25327,7 @@ static fontshaper_glyph_config *fontshaper__FindOrCreateGlyphConfig(fontshaper_s
   fontshaper__existing_glyph_config *Existing = &Last->Items[Last->Count++];
   Existing->ShapeConfig = ShapeConfig;
   Existing->FeatureOverrides = FeatureOverrides;
+  Existing->FeatureOverrideCount = (fontshaper_u32)FeatureOverrideCount;
   Existing->GlyphConfig = Result;
   return Result;
 }

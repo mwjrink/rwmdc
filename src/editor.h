@@ -159,6 +159,53 @@ void editor_redo(rop(rw Editor) editor);
 
 #define MARGIN 12.0f
 
+// ---- internal helpers (skeleton) -------------------------------------------
+
+// Style bits parallel MD_STYLE_* (bold/italic/code/link), plus a placeholder
+// for link color. Keep these in sync with how glyph style/color is packed.
+enum {
+    STYLE_BOLD   = 1,
+    STYLE_ITALIC = 2,
+    STYLE_CODE   = 4,
+    STYLE_LINK   = 8,
+};
+
+internal force_inline(f32) output_glyphs_reverse(
+    rop(rw DrawLayer) layer, rop(ro ShapedGlyph) glyphs, u32 glyphs_count, f32 scale, f32 x, f32 y, u32 color_idx) {
+    for (u32 idx = glyphs_count; idx > 0; idx--) {
+        const ShapedGlyph* glyph = &glyphs[idx - 1];
+        x -= glyph->advance * scale;
+        layer->glyphs[layer->glyph_count] = (GlyphDrawCmd){
+            .x         = x + glyph->offset_x * scale,
+            .y         = y + glyph->offset_y * scale,
+            .sx        = scale,
+            .sy        = -scale,
+            .glyph_idx = glyph->id,
+            .color_idx = color_idx,
+        };
+        layer->glyph_count += 1;
+    }
+    return x;
+}
+
+internal force_inline(f32) output_glyphs(
+    rop(rw DrawLayer) layer, rop(ro ShapedGlyph) glyphs, u32 glyphs_count, f32 scale, f32 x, f32 y, u32 color_idx) {
+    for (u32 idx = 0; idx < glyphs_count; idx++) {
+        const ShapedGlyph* glyph = &glyphs[idx];
+        x += glyph->advance * scale;
+        layer->glyphs[layer->glyph_count] = (GlyphDrawCmd){
+            .x         = x + glyph->offset_x * scale,
+            .y         = y + glyph->offset_y * scale,
+            .sx        = scale,
+            .sy        = -scale,
+            .glyph_idx = glyph->id,
+            .color_idx = color_idx,
+        };
+        layer->glyph_count += 1;
+    }
+    return x;
+}
+
 // for rendering ui: status line ui at the bottom.
 DrawLayer editor_get_ui_layer(rop(rw Editor) editor,
                               rop(rw Arena) arena,
@@ -184,7 +231,32 @@ DrawLayer editor_get_ui_layer(rop(rw Editor) editor,
 
     f32 x = MARGIN;
 
+    u32 glyph_idx = 0;
+    u32 rect_idx  = 0;
+
+    layer.rects[rect_idx] = (GpuRect){
+        .x      = 0,
+        .y      = height,
+        .width  = width,
+        .height = font_height + 8,
+
+        .color_idx = 0,
+        .flags     = 0,
+    };
+    rect_idx += 1;
+
+    output_glyphs();
     for (u32 fn_idx = 0; fn_idx < editor->path.len; fn_idx++) {
+        layer.glyphs[glyph_idx] = (GlyphDrawCmd){
+            .x  = x,
+            .y  = 0,
+            .sx = 0,
+            .sy = 0,
+
+            .glyph_idx = 0,
+            .color_idx = 0,
+        };
+        glyph_idx += 1;
     }
 
     // UI Structure:
@@ -279,53 +351,6 @@ DrawLayer editor_get_ui_layer(rop(rw Editor) editor,
     // 5. caret + selection are rects too; add them here.
 
     return layer;
-}
-
-// ---- internal helpers (skeleton) -------------------------------------------
-
-// Style bits parallel MD_STYLE_* (bold/italic/code/link), plus a placeholder
-// for link color. Keep these in sync with how glyph style/color is packed.
-enum {
-    STYLE_BOLD   = 1,
-    STYLE_ITALIC = 2,
-    STYLE_CODE   = 4,
-    STYLE_LINK   = 8,
-};
-
-internal force_inline(f32) output_glyphs_reverse(
-    rop(rw DrawLayer) layer, rop(ro ShapedGlyph) glyphs, u32 glyphs_count, f32 scale, f32 x, f32 y, u32 color_idx) {
-    for (u32 idx = glyphs_count; idx > 0; idx--) {
-        const ShapedGlyph* glyph = &glyphs[idx - 1];
-        x -= glyph->advance * scale;
-        layer->glyphs[layer->glyph_count] = (GlyphDrawCmd){
-            .x         = x + glyph->offset_x * scale,
-            .y         = y + glyph->offset_y * scale,
-            .sx        = scale,
-            .sy        = -scale,
-            .glyph_idx = glyph->id,
-            .color_idx = color_idx,
-        };
-        layer->glyph_count += 1;
-    }
-    return x;
-}
-
-internal force_inline(f32) output_glyphs(
-    rop(rw DrawLayer) layer, rop(ro ShapedGlyph) glyphs, u32 glyphs_count, f32 scale, f32 x, f32 y, u32 color_idx) {
-    for (u32 idx = 0; idx < glyphs_count; idx++) {
-        const ShapedGlyph* glyph = &glyphs[idx];
-        x += glyph->advance * scale;
-        layer->glyphs[layer->glyph_count] = (GlyphDrawCmd){
-            .x         = x + glyph->offset_x * scale,
-            .y         = y + glyph->offset_y * scale,
-            .sx        = scale,
-            .sy        = -scale,
-            .glyph_idx = glyph->id,
-            .color_idx = color_idx,
-        };
-        layer->glyph_count += 1;
-    }
-    return x;
 }
 
 // Compute everything render needs for this frame: visible byte range from
