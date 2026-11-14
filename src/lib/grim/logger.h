@@ -403,7 +403,7 @@ void __attribute__((format(printf, 5, 6))) _log(
 
 #ifdef linux
 #include <time.h>
-#undef assert
+// #undef assert // this is in assert.h
 #include <lib/grim/assert.h>
 
 u64 _clock_nano() {

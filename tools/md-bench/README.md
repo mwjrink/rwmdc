@@ -17,8 +17,24 @@ long refills and fragmented/empty pieces. Direct helper checks cover direct read
 batching, NULL empty pieces and exhausted cursors. Optional file arguments add real inputs (up to 16 MiB each).
 Sources and logs are kept in a fresh `/tmp/md-check-create-*` directory.
 
-`bench.c` and `compare.py` support both the legacy 12-byte metadata and the new split Common/Extra layout.
-Both paths exclude `md_get`, so the constructor can be benchmarked independently during its migration.
+Common is a 4-byte tagged union: BLANK stores its physical line count; other tags store pre-indent and
+content-start. Extra is a packed 2-byte post-indent only for quote/list candidates. EOF's pending blank
+count lives once in `MdState.trailing_blank_count`, alongside its Common indentation.
+
+`bench.c` and `compare.py` support legacy metadata, the previous split layout, and this thin Extra layout.
+They exclude `md_get`, so the constructor can be benchmarked independently during its migration.
+
+## First-loop cursor check
+
+```sh
+python3 tools/md-bench/check-context.py
+```
+
+This compiles the full parser and exercises the actual first-loop source with a scalar cursor/Extra oracle.
+It covers quote/list-only Extra ownership, skipped headings/blanks, sparse/dense/no-hit windows, mask/refill
+boundaries, guarded tails, rewind and EOF in Clang/GCC release and Clang ASan/UBSan. It also checks the
+second loop's refill block directly, without invoking its unfinished output body or claiming to test semantic state updates. `check-get.py` remains the full output oracle
+for when those loop bodies are implemented.
 
 ## Use
 
@@ -51,7 +67,7 @@ python3 tools/md-bench/compare.py \
 ## What it measures
 
 Both bodies compile into **one binary per compiler**, in fixed baseline/candidate order. Each retains its
-native MdState return layout; metadata declarations may use either the legacy or split layout. Small generated
+native MdState return layout; metadata declarations may use the legacy, split or thin Extra layout. Small generated
 O(1) adapters copy returned pointers/counts into the harness view; this constant overhead is timed, but no
 per-entry conversion or fingerprinting occurs inside the timed loop. The large constructor bodies remain
 separate out-of-line functions in that binary, without LTO.
@@ -65,10 +81,10 @@ Builds use `-O3 -g -march=x86-64-v3 -DWAYLAND`, without `__DEBUG`, sanitizers or
 Clang sanitizer checks, when requested, use a separate binary.
 
 Before timing, both variants must match normalized L0/L1/mapping fingerprints. Legacy metadata is decoded into
-the split layout's facts: pre-indent, content start, marker post-indent or blank/EOF line count. Deliberately
-removed trailing flags and paragraph marker/padding/post-indent artifacts are not compared. Marker bytes and
-lengths are checked through the complete raw L1 stream. All Common/active Extra fields are compared for split
-metadata. Self-checks include expected marker tags, empty input, random bytes, source NUL, empty/fragmented
+retained facts: pre-indent, content start, quote/list post-indent and blank/EOF line count. Deliberately
+removed trailing flags and post-indent for other marker candidates are not compared. Marker bytes and
+lengths are checked through the complete raw L1 stream. Thin Extra ownership and blank/EOF placement are
+also independently checked by the source oracle. Self-checks include expected marker tags, empty input, random bytes, source NUL, empty/fragmented
 pieces, exact scanner capacities, lane/tail positions and long refills. Use the constructor-only source oracle
 above for independent validation of the new representation.
 

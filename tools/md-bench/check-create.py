@@ -48,7 +48,8 @@ static u64 validate(const MdState* s, const u8* bytes, u32 length) {
         u8 tag = s->l0_tags[i];
         MdL0Common common = s->l0_common[i];
         u32 start = s->l0_offsets[i];
-        HASH(tag); HASH(start); HASH(common.pre_indent); HASH(common.content_start);
+        HASH(tag); HASH(start);
+        if (tag != MD_L0_BLANK) { HASH(common.pre_indent); HASH(common.content_start); }
         if (tag == MD_L0_EOF) break;
         u32 end = s->l0_offsets[i + 1];
         CHECK(start < end && end <= length);
@@ -58,9 +59,8 @@ static u64 validate(const MdState* s, const u8* bytes, u32 length) {
                 CHECK(bytes[j] == ' ' || bytes[j] == '\t' || bytes[j] == '\n');
                 if (bytes[j] == '\n') lines += 1;
             }
-            CHECK(common.pre_indent == 0 && common.content_start == 0);
-            CHECK(s->l0_extra[extra].line_count == lines);
-            HASH(lines); extra += 1;
+            CHECK(common.line_count == lines);
+            HASH(lines);
             continue;
         }
         u32 pos = start;
@@ -88,8 +88,10 @@ static u64 validate(const MdState* s, const u8* bytes, u32 length) {
             col += n;
             pos = marker_end;
             col = whitespace(bytes, end, &pos, col);
-            CHECK(s->l0_extra[extra].post_indent == col);
-            HASH(col); extra += 1;
+            if (tag == MD_L0_BLOCK_QUOTE || tag == MD_L0_UNORDERED_LIST) {
+                CHECK(s->l0_extra[extra].post_indent == col);
+                HASH(col); extra += 1;
+            }
         }
         CHECK(common.content_start == pos - start);
     }
@@ -107,7 +109,7 @@ static u64 validate(const MdState* s, const u8* bytes, u32 length) {
     if (blank && lines) lines -= 1;
     CHECK(s->l0_common[s->l0_count - 1].pre_indent == tail_col);
     CHECK(s->l0_common[s->l0_count - 1].content_start == 0);
-    CHECK(s->l0_extra[extra].line_count == lines);
+    CHECK(s->trailing_blank_count == lines);
     HASH(lines);
     u32 l1 = 0, maps = 0;
     for (u32 i = 0; i < length;) {
@@ -190,7 +192,14 @@ int main(int argc, char** argv) {
         "    - x\n    -\tx\n", " \t###\ttext\n", "***\n___\n+ x\n= x\n~~~\n"};
     for (u32 i = 0; i < sizeof(cases) / sizeof(*cases); ++i)
         check((const u8*)cases[i], strlen(cases[i]), &arena, &scratch);
-    u8 bytes[40000];
+    CHECK(sizeof(MdL0Common) == 4 && sizeof(MdL0Extra) == 2);
+    u8 bytes[80000];
+    memcpy(bytes, "p\n", 2); memset(bytes + 2, '\n', 70000);
+    check(bytes, 70002, &arena, &scratch); // EOF count stays u32.
+    bytes[70002] = '\t';
+    check(bytes, 70003, &arena, &scratch); // Preserve EOF indentation and count together.
+    memcpy(bytes + 70002, "q\n", 2);
+    check(bytes, 70004, &arena, &scratch); // Interior BLANK Common count stays u32.
     memset(bytes, ' ', 12345); memcpy(bytes + 12345, "#\tx\n", 4);
     check(bytes, 12349, &arena, &scratch);
     memset(bytes, '`', 33000); bytes[33000] = '\n';

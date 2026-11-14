@@ -245,19 +245,9 @@ DrawLayer editor_get_ui_layer(rop(rw Editor) editor,
     };
     rect_idx += 1;
 
+    rop(rw ShapedGlyph) shaped_glyphs = scratch_alloc_aligned(scratch, ShapedGlyph, editor->path.len);
+    u32 glyph_count                   = font_shape_run(font, cp, cp_count, shaped_glyphs);
     output_glyphs();
-    for (u32 fn_idx = 0; fn_idx < editor->path.len; fn_idx++) {
-        layer.glyphs[glyph_idx] = (GlyphDrawCmd){
-            .x  = x,
-            .y  = 0,
-            .sx = 0,
-            .sy = 0,
-
-            .glyph_idx = 0,
-            .color_idx = 0,
-        };
-        glyph_idx += 1;
-    }
 
     // UI Structure:
     // LEFT

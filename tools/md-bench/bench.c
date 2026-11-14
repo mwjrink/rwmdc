@@ -13,6 +13,8 @@ typedef struct BenchState {
     const void* l0_extra;
     const void* l0_metadata;
     u32 l0_count;
+    u32 thin_metadata;
+    u32 trailing_blank_count;
     const u8* l1_tags;
     const u32* l1_offsets;
     const u32* l1_lengths;
@@ -38,13 +40,26 @@ static u64 check(const BenchState* state, const DocView* source) {
         hash = (hash ^ state->l0_tags[i]) * 1099511628211ULL;
         u8 tag = state->l0_tags[i];
         u32 pre_indent = 0, content_start = 0, extra = 0;
+#if BENCH_THIN
+        if (state->thin_metadata) {
+            MdL0CommonThin common = ((const MdL0CommonThin*)state->l0_common)[i];
+            if (tag == MD_L0_BLANK) extra = common.line_count;
+            else {
+                pre_indent = common.pre_indent;
+                content_start = common.content_start;
+            }
+            if (tag == MD_L0_EOF) extra = state->trailing_blank_count;
+            if (tag == MD_L0_BLOCK_QUOTE || tag == MD_L0_UNORDERED_LIST)
+                extra = ((const MdL0ExtraThin*)state->l0_extra)[extra_index++].post_indent;
+        } else
+#endif
         if (state->l0_common) {
 #if BENCH_SPLIT
             MdL0Common common = ((const MdL0Common*)state->l0_common)[i];
             pre_indent = common.pre_indent;
             content_start = common.content_start;
             if (tag != MD_L0_PARAGRAPH) {
-                MdL0Extra metadata = ((const MdL0Extra*)state->l0_extra)[extra_index];
+                MdL0Extra metadata = ((const MdL0Extra*)state->l0_extra)[extra_index++];
                 if (tag == MD_L0_BLANK || tag == MD_L0_EOF) extra = metadata.line_count;
                 else extra = metadata.post_indent;
             }
@@ -63,12 +78,14 @@ static u64 check(const BenchState* state, const DocView* source) {
             }
 #endif
         }
+        // Compare facts retained by all schemas, not discarded marker padding columns.
+        if (tag != MD_L0_BLANK && tag != MD_L0_EOF &&
+            tag != MD_L0_BLOCK_QUOTE && tag != MD_L0_UNORDERED_LIST)
+            extra = 0;
         hash = (hash ^ pre_indent) * 1099511628211ULL;
         hash = (hash ^ content_start) * 1099511628211ULL;
-        if (tag != MD_L0_PARAGRAPH) {
+        if (tag != MD_L0_PARAGRAPH)
             hash = (hash ^ extra) * 1099511628211ULL;
-            extra_index += 1;
-        }
     }
     for (u32 i = 0; i + 1 < state->l0_count; ++i)
         if (state->l0_offsets[i] >= state->l0_offsets[i + 1] || state->l0_tags[i] == MD_L0_NONE) abort();
@@ -93,6 +110,15 @@ static u64 check(const BenchState* state, const DocView* source) {
 
 
 static usize metadata_bytes(const BenchState* state) {
+#if BENCH_THIN
+    if (state->thin_metadata) {
+        usize extras = 0;
+        for (u32 i = 0; i < state->l0_count; ++i)
+            if (state->l0_tags[i] == MD_L0_BLOCK_QUOTE || state->l0_tags[i] == MD_L0_UNORDERED_LIST)
+                extras += 1;
+        return state->l0_count * sizeof(MdL0CommonThin) + extras * sizeof(MdL0ExtraThin);
+    }
+#endif
     if (state->l0_common) {
 #if BENCH_SPLIT
         usize extras = 0;

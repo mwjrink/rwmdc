@@ -106,14 +106,6 @@ typedef struct {
 
     fontshaper_font shaper; // compiled shaping font, owned for the font's lifetime
 
-    // Shape workspace: one compiled per-script config + reusable glyph storage
-    // and scratchpad, so spans shape without recompiling/reallocating.
-    fontshaper_shape_config*     shape_config;
-    fontshaper_script            shape_config_script;
-    fontshaper_glyph_storage     glyph_storage;
-    fontshaper_shape_scratchpad* shape_scratchpad;
-    void*                        storage_memory;
-    void*                        scratchpad_memory;
 } TTFont;
 
 internal u32 tt_read_u32(rop(rw TTCursor) file) {
@@ -606,43 +598,7 @@ TTFont font_load(rop(rw Arena) arena, rop(rw ScratchArena) scratch, const char* 
             scratch->len = scratch_len_before;
         }
 
-        // Build the reusable shape workspace: a default (Latin) shape config,
-        // a bounded glyph storage, and its scratchpad.
-        {
-            u32 glyph_cap = 256 * 1024; // TODO tune; bounds simultaneous glyphs
 
-            i32 shape_cfg_bytes =
-                fontshaper_SizeOfShapeConfig(&font.shaper, FONTSHAPER_SCRIPT_LATIN, FONTSHAPER_LANGUAGE_DONT_KNOW);
-            i64 shape_cfg_scratch_bytes = fontshaper_SizeOfShapeConfigScratch(
-                &font.shaper, FONTSHAPER_SCRIPT_LATIN, FONTSHAPER_LANGUAGE_DONT_KNOW);
-            assert(SCOPE_FONT_LOAD, shape_cfg_bytes > 0);
-
-            font.shape_config        = arena_alloc_aligned(arena, u32, shape_cfg_bytes);
-            void* cfg_scratch        = scratch_alloc(scratch, (usize)shape_cfg_scratch_bytes);
-            font.shape_config        = fontshaper_PlaceShapeConfig(&font.shaper,
-                                                                   FONTSHAPER_SCRIPT_LATIN,
-                                                                   FONTSHAPER_LANGUAGE_DONT_KNOW,
-                                                                   font.shape_config,
-                                                                   cfg_scratch,
-                                                                   NULL);
-            font.shape_config_script = FONTSHAPER_SCRIPT_LATIN;
-            assert(SCOPE_FONT_LOAD, font.shape_config != NULL);
-
-            fontshaper_un storage_bytes = fontshaper_SizeOfGlyphStorage(glyph_cap);
-            font.storage_memory         = arena_alloc_aligned(arena, u8, storage_bytes);
-            assert(SCOPE_FONT_LOAD,
-                   fontshaper_InitializeGlyphStorage(&font.glyph_storage, font.storage_memory, glyph_cap));
-
-            fontshaper_un scratchpad_bytes = fontshaper_SizeOfShapeScratchpad(font.shape_config, glyph_cap);
-            font.scratchpad_memory         = arena_alloc_aligned(arena, u8, scratchpad_bytes);
-            font.shape_scratchpad =
-                fontshaper_PlaceShapeScratchpad(font.shape_config, font.scratchpad_memory, glyph_cap);
-            assert(SCOPE_FONT_LOAD, font.shape_scratchpad != NULL);
-
-            // TODO checkpoints instead
-            memset(scratch->data + scratch_len_before, 0, scratch->len - scratch_len_before);
-            scratch->len = scratch_len_before;
-        }
     }
 
     tt_release_data(&loader);

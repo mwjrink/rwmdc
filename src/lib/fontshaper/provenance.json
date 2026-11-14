@@ -2,7 +2,7 @@
   "generator_sha256": "bb0ffbb5eab1cd6897f68904a779bcaf80e654300b01896ef280b3928827f4e1",
   "header": "fontshaper.h",
   "header_sha256": "53215920827a9827a66f1f559468193c259ceb928f29cf2887bfe15c2b74a9f8",
-  "note": "Initial commit intentionally deferred by the user. Source and generated header are checksum-pinned; no Git revision is claimed. After the first commit, tools/vendor.py replaces this snapshot with a committed revision pin.",
+  "note": "Historical extraction/source/generator pins are retained below; they do not describe the current locally modified header. Modular sources and the generator are not present/synchronized in this checkout. See local_patch for the maintained vendored artifact.",
   "project": "Fontshaper",
   "revision": null,
   "schema": 1,
@@ -26,10 +26,17 @@
     "src/fontshaper_profile.h": "a7f74ec8b0e25582e49b762ffbaeb231fbe68e7475ce0b1acf03d1b459844cd2",
     "src/fontshaper_script_shape.inc": "f0ddd52f8097acc96fbe1aa7ac2a395fb6d80110017953f64c947b969c06982a"
   },
-  "state": "uncommitted-extraction-snapshot",
+  "state": "locally-modified-vendored-header",
   "upstream": {
     "license": "Zlib",
     "project": "https://github.com/JimmyLefevre/kb",
     "revision": "b07373ded395b61d33a290181b957994db8edcfb"
+  },
+  "local_patch": {
+    "base_git_revision": "4c74e406b9a1ab1f2838e51784d0895caf4f74ef",
+    "base_header_sha256": "895f73ec8af35158856cd2d3abfbadab86b4cd4d39b9cf7e7a172bbfa57c0aec",
+    "header_sha256": "e76c10a5f13fa6e2b37275eb75cea86227b02ecceafc48601798a63ef1aaf568",
+    "changes": "API-refactor steps 2–3 plus caller-storage API version 4: deterministic font-aware size query, creation in one caller-owned block with no stored allocator/free callback/destructor; all-language scratch bounds, eager retained results, passive count-bounded traversal, direct whole-buffer UTF-8 preparation, per-call canonical options, corrected byte-source offsets and recoverable state errors. The base already contains local config-cache/scratch optimizations not reflected in the historical modular-source pins. API version 5 consistently names the mutable object fontshaper_state, its descriptor fontshaper_state_info and its flags/cache/scratch/header APIs State; no production context aliases.",
+    "plan": "docs/plans/fontshaper-api-refactor.md"
   }
 }

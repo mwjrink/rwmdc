@@ -1,7 +1,7 @@
 /* Built against both headers by fontshaper_ascii_spike_bench.py.
  * Compare glyphs plus complete break/run metadata on fast and fallback paths.
  */
-#define main context_regression_main
+#define main state_regression_main
 #include "fontshaper_context_test.c"
 #undef main
 
@@ -12,44 +12,44 @@ static int font_index(fontshaper_font* font, TestFont* fonts) {
     return -1;
 }
 
-static void check_end(TestContext* state, TestFont* fonts, int fast, unsigned misses) {
-    fontshaper_shape_context* context = state->context;
-    fontshaper_ShapeEnd(context);
-    CHECK(fontshaper_ShapeError(context) == FONTSHAPER_SHAPE_ERROR_NONE);
+static void check_end(TestState* state, TestFont* fonts, int fast, unsigned misses) {
+    fontshaper_state* shaper = state->shaper;
+    fontshaper_ShapeEnd(shaper);
+    CHECK(fontshaper_ShapeError(shaper) == FONTSHAPER_SHAPE_ERROR_NONE);
 #ifdef SPIKE_TEST
-    CHECK((context->AsciiState == 2) == fast);
-    CHECK(context->AsciiMissCount == misses);
+    CHECK((shaper->AsciiState == 2) == fast);
+    CHECK(shaper->AsciiMissCount == misses);
 #else
     (void)misses;
     (void)fast;
 #endif
     fontshaper_run run;
-    while (fontshaper_ShapeRun(context, &run)) {
+    while (fontshaper_ShapeRun(shaper, &run)) {
         printf("R %d %u %u %u %u\n", font_index(run.Font, fonts),
                run.Script, run.Direction, run.ParagraphDirection, run.Flags);
         fontshaper_glyph* glyph;
         while (fontshaper_GlyphIteratorNext(&run.Glyphs, &glyph)) {
             fontshaper_shape_codepoint input;
-            CHECK(fontshaper_ShapeGetShapeCodepoint(context, glyph->UserIdOrCodepointIndex, &input));
+            CHECK(fontshaper_ShapeGetShapeCodepoint(shaper, glyph->UserIdOrCodepointIndex, &input));
             printf("G %d %d %u %d %d %d %d %d %d %u %u %u\n", font_index(run.Font, fonts),
                    glyph->Id, glyph->Codepoint, glyph->UserIdOrCodepointIndex, input.UserId,
                    glyph->AdvanceX, glyph->AdvanceY, glyph->OffsetX, glyph->OffsetY,
                    run.Direction, run.ParagraphDirection, run.Script);
         }
     }
-    CHECK(fontshaper_ShapeError(context) == FONTSHAPER_SHAPE_ERROR_NONE);
-    for (fontshaper_un i = 0; i <= context->InputCodepointCount; ++i) {
-        fontshaper_shape_codepoint* input = fontshaper__InputCodepoint(context, i, 0);
+    CHECK(fontshaper_ShapeError(shaper) == FONTSHAPER_SHAPE_ERROR_NONE);
+    for (fontshaper_un i = 0; i <= shaper->InputCodepointCount; ++i) {
+        fontshaper_shape_codepoint* input = fontshaper__InputCodepoint(shaper, i, 0);
         CHECK(input);
         printf("B %u %u %u %u %u %d %d %d %u\n", input->Codepoint, input->BreakFlags,
                input->Script, input->Direction, input->ParagraphDirection, input->UserId,
                font_index(input->Font, fonts), font_index(input->MappedFont, fonts), input->MappedGlyphId);
     }
-    memset(context->PassMemory.Data, 0xa5, (size_t)context->PassMemory.Used);
+    memset(shaper->PassMemory.Data, 0xa5, (size_t)shaper->PassMemory.Used);
 }
 
-static void add(fontshaper_shape_context* context, const char* text) {
-    fontshaper_ShapeUtf8(context, text, (int)strlen(text), FONTSHAPER_USER_ID_GENERATION_MODE_SOURCE_INDEX);
+static void add(fontshaper_state* shaper, const char* text) {
+    fontshaper_ShapeUtf8(shaper, text, (int)strlen(text), FONTSHAPER_USER_ID_GENERATION_MODE_SOURCE_INDEX);
 }
 
 int main(void) {
@@ -65,100 +65,100 @@ int main(void) {
         {"() office fi", 1}, {"office 123 AV", 1},
     };
     for (unsigned i = 0; i < sizeof(cases) / sizeof(*cases); ++i) {
-        TestContext state = make_context(fonts, 1, CACHE_BYTES);
+        TestState state = make_test_state(fonts, 1, CACHE_BYTES);
         for (unsigned repeat = 0; repeat < 2; ++repeat) {
             printf("case %u repeat %u\n", i, repeat);
-            fontshaper_ShapeBegin(state.context, FONTSHAPER_DIRECTION_LTR, 0, state.destination,
+            fontshaper_ShapeBeginWithMemory(state.shaper, FONTSHAPER_DIRECTION_LTR, 0, state.destination,
                                  state.scratch[repeat], INPUT_CAPACITY, GLYPH_CAPACITY);
-            add(state.context, cases[i].text);
+            add(state.shaper, cases[i].text);
             unsigned misses = 1;
             if (cases[i].fast) misses = 0;
             check_end(&state, fonts, cases[i].fast, misses);
         }
-        destroy_context(&state);
+        free_test_state(&state);
     }
     for (unsigned scenario = 0; scenario < 8; ++scenario) {
-        TestContext state = make_context(fonts, 1, CACHE_BYTES);
-        fontshaper_shape_context* context = state.context;
+        TestState state = make_test_state(fonts, 1, CACHE_BYTES);
+        fontshaper_state* shaper = state.shaper;
         printf("scenario %u\n", scenario);
         fontshaper_direction direction = FONTSHAPER_DIRECTION_LTR;
         if (scenario == 5) direction = FONTSHAPER_DIRECTION_RTL;
         if (scenario == 6) direction = FONTSHAPER_DIRECTION_DONT_KNOW;
         resize_scratch(&state, FONTSHAPER_LANGUAGE_TURKISH);
-        fontshaper_ShapeBegin(context, direction, FONTSHAPER_LANGUAGE_TURKISH, state.destination,
+        fontshaper_ShapeBeginWithMemory(shaper, direction, FONTSHAPER_LANGUAGE_TURKISH, state.destination,
                              state.scratch[0], INPUT_CAPACITY, GLYPH_CAPACITY);
         /* Source IDs are deliberately unrelated to codepoint positions. */
-        fontshaper_ShapeUtf8WithUserId(context, "office ", 7, 100, FONTSHAPER_USER_ID_GENERATION_MODE_SOURCE_INDEX);
+        fontshaper_ShapeUtf8WithUserId(shaper, "office ", 7, 100, FONTSHAPER_USER_ID_GENERATION_MODE_SOURCE_INDEX);
         if (scenario == 0) {
-            fontshaper_ShapePushFeature(context, FONTSHAPER_FEATURE_TAG_liga, 0);
-            add(context, "office fi");
-            CHECK(fontshaper_ShapePopFeature(context, FONTSHAPER_FEATURE_TAG_liga));
+            fontshaper_ShapePushFeature(shaper, FONTSHAPER_FEATURE_TAG_liga, 0);
+            add(shaper, "office fi");
+            CHECK(fontshaper_ShapePopFeature(shaper, FONTSHAPER_FEATURE_TAG_liga));
         } else if (scenario == 1) {
-            fontshaper_ShapeBeginManualRuns(context);
-            fontshaper_ShapeNextManualRun(context, FONTSHAPER_DIRECTION_LTR, FONTSHAPER_SCRIPT_LATIN);
-            add(context, "office fi");
-            fontshaper_ShapeEndManualRuns(context);
+            fontshaper_ShapeBeginManualRuns(shaper);
+            fontshaper_ShapeNextManualRun(shaper, FONTSHAPER_DIRECTION_LTR, FONTSHAPER_SCRIPT_LATIN);
+            add(shaper, "office fi");
+            fontshaper_ShapeEndManualRuns(shaper);
         } else if (scenario == 2) {
-            fontshaper_ShapeManualBreak(context);
-            add(context, "office fi");
+            fontshaper_ShapeManualBreak(shaper);
+            add(shaper, "office fi");
         } else if (scenario == 3) {
-            CHECK(fontshaper_ShapePushFont(context, &fonts[0].font));
-            CHECK(fontshaper_ShapePopFont(context) == &fonts[0].font);
-            add(context, "office fi");
+            CHECK(fontshaper_ShapePushFont(shaper, &fonts[0].font));
+            CHECK(fontshaper_ShapePopFont(shaper) == &fonts[0].font);
+            add(shaper, "office fi");
         } else if (scenario == 4) {
             int points[] = {'A', 'V', 0x301};
-            fontshaper_ShapeUtf32WithUserId(context, points, 3, 200, 2);
+            fontshaper_ShapeUtf32WithUserId(shaper, points, 3, 200, 2);
         } else if (scenario == 7) {
-            fontshaper_ShapeUtf8WithUserId(context, "\xff fi", 4, 300, FONTSHAPER_USER_ID_GENERATION_MODE_SOURCE_INDEX);
-        } else add(context, "office fi");
+            fontshaper_ShapeUtf8WithUserId(shaper, "\xff fi", 4, 300, FONTSHAPER_USER_ID_GENERATION_MODE_SOURCE_INDEX);
+        } else add(shaper, "office fi");
         unsigned misses = 1;
         if (scenario == 5 || scenario == 6) misses = 0;
         check_end(&state, fonts, 0, misses);
-        destroy_context(&state);
+        free_test_state(&state);
     }
-    TestContext equivalent = make_context(fonts, 1, CACHE_BYTES);
-    fontshaper_ShapeBegin(equivalent.context, FONTSHAPER_DIRECTION_LTR, 0, equivalent.destination,
+    TestState equivalent = make_test_state(fonts, 1, CACHE_BYTES);
+    fontshaper_ShapeBeginWithMemory(equivalent.shaper, FONTSHAPER_DIRECTION_LTR, 0, equivalent.destination,
                          equivalent.scratch[0], INPUT_CAPACITY, GLYPH_CAPACITY);
-    fontshaper_ShapePushFeature(equivalent.context, FONTSHAPER_FEATURE_TAG_liga, 0);
-    fontshaper_ShapePushFeature(equivalent.context, FONTSHAPER_FEATURE_TAG_kern, 1);
-    add(equivalent.context, "office ");
-    CHECK(fontshaper_ShapePopFeature(equivalent.context, FONTSHAPER_FEATURE_TAG_kern));
-    CHECK(fontshaper_ShapePopFeature(equivalent.context, FONTSHAPER_FEATURE_TAG_liga));
-    fontshaper_ShapePushFeature(equivalent.context, FONTSHAPER_FEATURE_TAG_kern, 1);
-    fontshaper_ShapePushFeature(equivalent.context, FONTSHAPER_FEATURE_TAG_liga, 0);
-    add(equivalent.context, "office fi");
+    fontshaper_ShapePushFeature(equivalent.shaper, FONTSHAPER_FEATURE_TAG_liga, 0);
+    fontshaper_ShapePushFeature(equivalent.shaper, FONTSHAPER_FEATURE_TAG_kern, 1);
+    add(equivalent.shaper, "office ");
+    CHECK(fontshaper_ShapePopFeature(equivalent.shaper, FONTSHAPER_FEATURE_TAG_kern));
+    CHECK(fontshaper_ShapePopFeature(equivalent.shaper, FONTSHAPER_FEATURE_TAG_liga));
+    fontshaper_ShapePushFeature(equivalent.shaper, FONTSHAPER_FEATURE_TAG_kern, 1);
+    fontshaper_ShapePushFeature(equivalent.shaper, FONTSHAPER_FEATURE_TAG_liga, 0);
+    add(equivalent.shaper, "office fi");
     check_end(&equivalent, fonts, 1, 0);
-    destroy_context(&equivalent);
-    TestContext missing = make_context(fonts + 1, 1, CACHE_BYTES);
+    free_test_state(&equivalent);
+    TestState missing = make_test_state(fonts + 1, 1, CACHE_BYTES);
     for (int point = 32; point <= 126; ++point) {
         if (fontshaper_CodepointToGlyphId(&fonts[1].font, point)) continue;
-        fontshaper_ShapeBegin(missing.context, FONTSHAPER_DIRECTION_LTR, 0, missing.destination,
+        fontshaper_ShapeBeginWithMemory(missing.shaper, FONTSHAPER_DIRECTION_LTR, 0, missing.destination,
                              missing.scratch[0], INPUT_CAPACITY, GLYPH_CAPACITY);
-        fontshaper_ShapeCodepoint(missing.context, point);
+        fontshaper_ShapeCodepoint(missing.shaper, point);
 #ifdef SPIKE_TEST
-        CHECK(missing.context->AsciiState == 0 && missing.context->AsciiMissCount == 1);
+        CHECK(missing.shaper->AsciiState == 0 && missing.shaper->AsciiMissCount == 1);
 #endif
-        fontshaper_ShapeEnd(missing.context);
-        printf("missing-glyph error %u\n", fontshaper_ShapeError(missing.context));
+        fontshaper_ShapeEnd(missing.shaper);
+        printf("missing-glyph error %u\n", fontshaper_ShapeError(missing.shaper));
         break;
     }
-    destroy_context(&missing);
-    TestContext multilingual = make_context(fonts, 3, CACHE_BYTES);
-    fontshaper_ShapeBegin(multilingual.context, FONTSHAPER_DIRECTION_LTR, 0, multilingual.destination,
+    free_test_state(&missing);
+    TestState multilingual = make_test_state(fonts, 3, CACHE_BYTES);
+    fontshaper_ShapeBeginWithMemory(multilingual.shaper, FONTSHAPER_DIRECTION_LTR, 0, multilingual.destination,
                          multilingual.scratch[0], INPUT_CAPACITY, GLYPH_CAPACITY);
-    add(multilingual.context, "office العربية देवनागरी office");
+    add(multilingual.shaper, "office العربية देवनागरी office");
     check_end(&multilingual, fonts, 0, 0);
-    destroy_context(&multilingual);
+    free_test_state(&multilingual);
     /* Real resource failures must not be mistaken for eligibility misses. */
-    TestContext limited = make_context(fonts, 1, CACHE_BYTES);
-    fontshaper_ShapeBegin(limited.context, FONTSHAPER_DIRECTION_LTR, 0, limited.destination,
+    TestState limited = make_test_state(fonts, 1, CACHE_BYTES);
+    fontshaper_ShapeBeginWithMemory(limited.shaper, FONTSHAPER_DIRECTION_LTR, 0, limited.destination,
                          limited.scratch[0], 1, GLYPH_CAPACITY);
-    add(limited.context, "office");
-    CHECK(fontshaper_ShapeError(limited.context) == FONTSHAPER_SHAPE_ERROR_OUT_OF_MEMORY);
+    add(limited.shaper, "office");
+    CHECK(fontshaper_ShapeError(limited.shaper) == FONTSHAPER_SHAPE_ERROR_OUT_OF_MEMORY);
 #ifdef SPIKE_TEST
-    CHECK(limited.context->AsciiMissCount == 0);
+    CHECK(limited.shaper->AsciiMissCount == 0);
 #endif
-    destroy_context(&limited);
+    free_test_state(&limited);
     for (unsigned i = 0; i < 3; ++i) { free(fonts[i].compiled); free(fonts[i].blob); }
     return 0;
 }

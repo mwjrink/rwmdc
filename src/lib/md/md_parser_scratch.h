@@ -190,18 +190,20 @@ typedef enum MdL0Tag {
     MD_L0_EOF,
 } MdL0Tag;
 
-typedef struct MdL0Common {
-    u16 pre_indent;    // Leading indentation columns.
-    u16 content_start; // Byte offset from the L0 start, past the raw prefix.
+typedef union MdL0Common {
+    struct {
+        u16 pre_indent;    // Leading indentation columns.
+        u16 content_start; // Byte offset from the L0 start, past the raw prefix.
+    };
+    u32 line_count; // BLANK: physical blank-line count.
 } MdL0Common;
 STATIC_ASSERT(sizeof(MdL0Common) == 4);
 
-// One entry per non-paragraph L0; the L0 tag selects the member.
-typedef union MdL0Extra {
+// One entry per quote/list candidate, in L0 order.
+typedef struct MdL0Extra {
     u16 post_indent; // Column after marker and following whitespace.
-    u32 line_count;  // Physical blank-line count; pending blank count for EOF.
 } MdL0Extra;
-STATIC_ASSERT(sizeof(MdL0Extra) == 4);
+STATIC_ASSERT(sizeof(MdL0Extra) == 2);
 
 typedef struct MdL1Metadata MdL1Metadata;
 
@@ -228,6 +230,7 @@ typedef struct MdState {
     rwp(rw MdL0Common) l0_common;
     rwp(rw MdL0Extra) l0_extra;
     u32 l0_count;
+    u32 trailing_blank_count; // Pending physical blank-line count at EOF.
 
     // L1: raw delimiter runs, independent of provisional L0 candidates.
     // Tags can be searched without loading offsets or metadata.
@@ -318,7 +321,7 @@ MdState md_create(rop(ro DocView) source, rop(rw Arena) arena, rop(rw ScratchAre
 
     const u32 buffer_capacity    = 4096;
     u8*       bridge             = scratch_alloc_aligned(scratch, u8, buffer_capacity);
-    const u8* buffer             = NULL;
+    const u8* buffer_ptr         = NULL;
     u8*       lexical_tags       = scratch_alloc_aligned(scratch, u8, buffer_capacity);
     u32*      run_offsets        = scratch_alloc_aligned(scratch, u32, buffer_capacity);
     u32       buffer_file_offset = 0;
@@ -352,12 +355,12 @@ MdState md_create(rop(ro DocView) source, rop(rw Arena) arena, rop(rw ScratchAre
     u32        at_line_start    = true;
     u8         line_tag;
     MdL0Common line_common;
-    MdL0Extra  line_extra;
+    MdL0Extra  line_extra = {0};
 
     l0_offsets[0] = 0;
     if (likely(source->total_length > 0)) {
-        buffer_length = md_fill(&cursor, bridge, min(buffer_capacity, source->total_length), &buffer);
-        run_count     = simd_byte_scan_runs(buffer, buffer_length, &table, &run_carry, lexical_tags, run_offsets);
+        buffer_length = md_fill(&cursor, bridge, min(buffer_capacity, source->total_length), &buffer_ptr);
+        run_count     = simd_byte_scan_runs(buffer_ptr, buffer_length, &table, &run_carry, lexical_tags, run_offsets);
         run_tag       = lexical_tags[0];
         run_index     = 1;
     }
@@ -368,12 +371,12 @@ MdState md_create(rop(ro DocView) source, rop(rw Arena) arena, rop(rw ScratchAre
         while (unlikely(run_index == run_count) && buffer_file_offset + buffer_length < source->total_length) {
             buffer_file_offset += buffer_length;
             u32 remaining = source->total_length - buffer_file_offset;
-            buffer_length = md_fill(&cursor, bridge, min(buffer_capacity, remaining), &buffer);
+            buffer_length = md_fill(&cursor, bridge, min(buffer_capacity, remaining), &buffer_ptr);
             // continued runs are NOT output again.
             // "abc     " run_count = 2
             // "  xyzlmn" run_count = 1 // only the text run is output.
-            run_count     = simd_byte_scan_runs(buffer, buffer_length, &table, &run_carry, lexical_tags, run_offsets);
-            run_index     = 0;
+            run_count = simd_byte_scan_runs(buffer_ptr, buffer_length, &table, &run_carry, lexical_tags, run_offsets);
+            run_index = 0;
         }
 
         u32 run_end;
@@ -393,7 +396,7 @@ MdState md_create(rop(ro DocView) source, rop(rw Arena) arena, rop(rw ScratchAre
         if (run_tag > 32) {
             if (run_tag == 128) {
                 assert(SCOPE_MARKDOWN, run_length <= UINT16_MAX);
-                mappings[mappings_count++] = (MdMap){
+                mappings[mappings_count] = (MdMap){
                     .offset      = run_offset,
                     .length      = run_length,
                     .repeat      = run_length,
@@ -401,6 +404,7 @@ MdState md_create(rop(ro DocView) source, rop(rw Arena) arena, rop(rw ScratchAre
                     .text        = {0xef, 0xbf, 0xbd},
                     .text_length = 3,
                 };
+                mappings_count += 1;
             } else {
                 l1_tags[l1_count]    = run_tag;
                 l1_offsets[l1_count] = run_offset;
@@ -413,17 +417,15 @@ MdState md_create(rop(ro DocView) source, rop(rw Arena) arena, rop(rw ScratchAre
                     blank_line_count += run_length;
                 } else {
                     if (blank_line_count > 0) {
-                        l0_tags[l0_count]       = MD_L0_BLANK;
-                        l0_common[l0_count]     = (MdL0Common){0};
-                        l0_extra[extra_count++] = (MdL0Extra){.line_count = blank_line_count};
+                        l0_tags[l0_count]   = MD_L0_BLANK;
+                        l0_common[l0_count] = (MdL0Common){.line_count = blank_line_count};
                         l0_count += 1;
                         l0_offsets[l0_count] = line_offset;
                     }
-                    l0_tags[l0_count]   = line_tag;
-                    l0_common[l0_count] = line_common;
-                    if (line_tag != MD_L0_PARAGRAPH) {
-                        l0_extra[extra_count++] = line_extra;
-                    }
+                    l0_tags[l0_count]     = line_tag;
+                    l0_common[l0_count]   = line_common;
+                    l0_extra[extra_count] = line_extra;
+                    extra_count += (line_tag == MD_L0_BLOCK_QUOTE || line_tag == MD_L0_UNORDERED_LIST);
                     l0_count += 1;
                     l0_offsets[l0_count] = run_offset + 1;
                     blank_line_count     = run_length - 1;
@@ -502,8 +504,9 @@ MdState md_create(rop(ro DocView) source, rop(rw Arena) arena, rop(rw ScratchAre
             while (unlikely(run_index == run_count) && buffer_file_offset + buffer_length < source->total_length) {
                 buffer_file_offset += buffer_length;
                 u32 remaining = source->total_length - buffer_file_offset;
-                buffer_length = md_fill(&cursor, bridge, min(buffer_capacity, remaining), &buffer);
-                run_count = simd_byte_scan_runs(buffer, buffer_length, &table, &run_carry, lexical_tags, run_offsets);
+                buffer_length = md_fill(&cursor, bridge, min(buffer_capacity, remaining), &buffer_ptr);
+                run_count =
+                    simd_byte_scan_runs(buffer_ptr, buffer_length, &table, &run_carry, lexical_tags, run_offsets);
                 run_index = 0;
             }
             if (run_index < run_count)
@@ -546,33 +549,32 @@ MdState md_create(rop(ro DocView) source, rop(rw Arena) arena, rop(rw ScratchAre
     // flush pending line
     if (!at_line_start) {
         if (blank_line_count > 0) {
-            l0_tags[l0_count]       = MD_L0_BLANK;
-            l0_common[l0_count]     = (MdL0Common){0};
-            l0_extra[extra_count++] = (MdL0Extra){.line_count = blank_line_count};
+            l0_tags[l0_count]   = MD_L0_BLANK;
+            l0_common[l0_count] = (MdL0Common){.line_count = blank_line_count};
             l0_count += 1;
             l0_offsets[l0_count] = line_offset;
             blank_line_count     = 0;
         }
-        l0_tags[l0_count]   = line_tag;
-        l0_common[l0_count] = line_common;
-        if (line_tag != MD_L0_PARAGRAPH) {
-            l0_extra[extra_count++] = line_extra;
-        }
+        l0_tags[l0_count]     = line_tag;
+        l0_common[l0_count]   = line_common;
+        l0_extra[extra_count] = line_extra;
+        if (line_tag == MD_L0_BLOCK_QUOTE || line_tag == MD_L0_UNORDERED_LIST)
+            extra_count += 1;
         l0_count += 1;
         line_indent = 0;
     }
 
     // write EOF sentinel with pending trailing whitespace
-    l0_offsets[l0_count]    = source->total_length;
-    l0_tags[l0_count]       = MD_L0_EOF;
-    l0_common[l0_count]     = (MdL0Common){.pre_indent = line_indent};
-    l0_extra[extra_count++] = (MdL0Extra){.line_count = blank_line_count};
+    l0_offsets[l0_count] = source->total_length;
+    l0_tags[l0_count]    = MD_L0_EOF;
+    l0_common[l0_count]  = (MdL0Common){.pre_indent = line_indent};
     l0_count += 1;
 
     MdState result = {
-        .l0_count       = l0_count,
-        .l1_count       = l1_count,
-        .mappings_count = mappings_count,
+        .l0_count             = l0_count,
+        .trailing_blank_count = blank_line_count,
+        .l1_count             = l1_count,
+        .mappings_count       = mappings_count,
     };
 
     result.l0_tags = arena_alloc_aligned(arena, u8, l0_count);
@@ -603,7 +605,7 @@ MdState md_create(rop(ro DocView) source, rop(rw Arena) arena, rop(rw ScratchAre
     return result;
 }
 
-// TODO internal store should be the same gap buffer as document. then updates are cheap and minimal memmoves.
+// TODO internal store should be the same gap buffer_ptr as document. then updates are cheap and minimal memmoves.
 void md_update(rop(rw MdState) state,
                rop(rw ScratchArena) scratch,
                rop(ro DocView) source,
@@ -619,8 +621,7 @@ MdResult md_get(rop(rw MdState) state, rop(rw Arena) arena, rop(rw ScratchArena)
         MD_L0_FENCED_CODE_BLOCK, MD_L0_BLOCK_QUOTE, MD_L0_THEMATIC_BREAK, MD_L0_UNORDERED_LIST};
     SimdByteScanMany context_table = simd_byte_scan_many_init(context_tags, sizeof(context_tags));
 
-    simdv_i128 paragraph_tag = splat(MD_L0_PARAGRAPH);
-    simdv_i128 fence_tag     = splat(MD_L0_FENCED_CODE_BLOCK);
+    simdv_i128 fence_tag = splat(MD_L0_FENCED_CODE_BLOCK);
 
     // Include L1 output capacity when inline resolution is implemented.
     usize   capacity    = (usize)state->l0_count + state->mappings_count;
@@ -637,66 +638,61 @@ MdResult md_get(rop(rw MdState) state, rop(rw Arena) arena, rop(rw ScratchArena)
     u32 chunk_start = 0;
 
     u32       buffer_cursor = 0;
-    u32       buffer_count  = 0;
-    const u8* buffer        = NULL;
-    u8*       tail          = scratch_alloc_aligned(scratch, u8, 4096);
-    u64       hits[64]; // One mask per 64 tags.
-    u64       nonparagraphs[64];
-    u32       hit_count = 0;
-    u32       extra_word = 0;
-    u32       extra_word_base = 0;
-    u32       hit_index = 0;
-    u64       active_hits = 0;
+    u32       buffer_size   = 0;
+    const u8* buffer_ptr    = NULL;
+
+    u8* tail_buffer = scratch_alloc_aligned(scratch, u8, 4096);
+
+    u64 hit_masks[64]; // One mask per 64 tags.
+    u32 hit_mask_count = 0;
+    u32 hit_mask_idx   = 0;
+
+    u64 active_hit_mask = 0;
 
     // Loop 1: accumulate context before begin; never emit nodes.
     while (chunk_start < state->l0_count) {
-        if (buffer_cursor == buffer_count) {
-            chunk_start += buffer_count;
+        if (buffer_cursor == buffer_size) {
+            chunk_start += buffer_size;
             if (chunk_start >= state->l0_count)
                 break;
 
-            buffer_count   = min(4096, state->l0_count - chunk_start);
-            buffer_cursor  = 0;
-            buffer         = state->l0_tags + chunk_start;
-            u32 scan_count = (buffer_count + 63) & ~63u;
-            hit_count      = scan_count / 64;
-            if (scan_count != buffer_count) {
-                memcpy(tail, buffer, buffer_count);
-                memset(tail + buffer_count, 0, scan_count - buffer_count);
-                buffer = tail;
+            u32 remaining = state->l0_count - chunk_start;
+            buffer_cursor = 0;
+            buffer_ptr    = state->l0_tags + chunk_start;
+            if (likely(remaining >= 4096)) {
+                buffer_size    = 4096;
+                hit_mask_count = 64;
+                simd_byte_scan_many(buffer_ptr, 4096, &context_table, hit_masks);
+            } else {
+                buffer_size    = remaining;
+                u32 scan_count = (buffer_size + 63) & ~63u;
+                hit_mask_count = scan_count / 64;
+                memcpy(tail_buffer, buffer_ptr, buffer_size);
+                memset(tail_buffer + buffer_size, 0, scan_count - buffer_size);
+                buffer_ptr = tail_buffer;
+                simd_byte_scan_many(buffer_ptr, scan_count, &context_table, hit_masks);
+                hit_masks[hit_mask_count - 1] &= UINT64_MAX >> (scan_count - buffer_size);
             }
-            simd_byte_scan_many(buffer, scan_count, &context_table, hits);
-            hits[hit_count - 1] &= UINT64_MAX >> (scan_count - buffer_count);
-            simd_byte_scan(buffer, scan_count, paragraph_tag, nonparagraphs);
-            for (u32 i = 0; i < hit_count; ++i)
-                nonparagraphs[i] = ~nonparagraphs[i];
-            nonparagraphs[hit_count - 1] &= UINT64_MAX >> (scan_count - buffer_count);
-            extra_word = 0;
-            extra_word_base = extra_idx;
-            hit_index = 0;
-            while (hit_index < hit_count && !hits[hit_index])
-                hit_index += 1;
-            active_hits = 0;
-            if (hit_index < hit_count)
-                active_hits = hits[hit_index];
+
+            // skip empty masks in array
+            hit_mask_idx = 0;
+            while (hit_mask_idx < hit_mask_count && hit_masks[hit_mask_idx] == 0)
+                hit_mask_idx += 1;
+
+            // set the active mask
+            active_hit_mask = 0;
+            if (hit_mask_idx < hit_mask_count)
+                active_hit_mask = hit_masks[hit_mask_idx];
         }
 
-        // With no more hits, check the window's last entry before refilling.
-        u32 next_cursor = buffer_count - 1;
-        if (hit_index < hit_count)
-            next_cursor = hit_index * 64 + (u32)__tzcnt_u64(active_hits);
-
-        u32 next_word = next_cursor / 64;
-        while (extra_word < next_word) {
-            extra_word_base += (u32)__builtin_popcountll(nonparagraphs[extra_word]);
-            extra_word += 1;
-        }
+        // With no more hit_masks, check the window's last entry before refilling.
+        u32 next_cursor = buffer_size - 1;
+        if (hit_mask_idx < hit_mask_count)
+            next_cursor = hit_mask_idx * 64 + (u32)__tzcnt_u64(active_hit_mask);
         buffer_cursor = next_cursor;
-        extra_idx = extra_word_base + (u32)__builtin_popcountll(
-            nonparagraphs[next_word] & ((1ULL << (next_cursor & 63)) - 1));
 
         u32 l0_idx = chunk_start + buffer_cursor;
-        u8 l0_tag = buffer[buffer_cursor];
+        u8  l0_tag = buffer_ptr[buffer_cursor];
         u32 l0_end;
         if (unlikely(l0_tag == MD_L0_EOF))
             l0_end = state->l0_offsets[l0_idx];
@@ -706,56 +702,56 @@ MdResult md_get(rop(rw MdState) state, rop(rw Arena) arena, rop(rw ScratchArena)
             // Rewind only the skipped entries in this boundary window.
             while (buffer_cursor > 0 && state->l0_offsets[chunk_start + buffer_cursor] > begin) {
                 buffer_cursor -= 1;
-                if (buffer[buffer_cursor] != MD_L0_PARAGRAPH)
-                    extra_idx -= 1;
             }
             break;
         }
         if (unlikely(l0_tag == MD_L0_EOF))
             goto get_end;
 
-        u32 l0_extra_idx = extra_idx;
-        if (l0_tag != MD_L0_PARAGRAPH)
-            extra_idx += 1;
+        extra_idx += (l0_tag == MD_L0_BLOCK_QUOTE || l0_tag == MD_L0_UNORDERED_LIST);
         buffer_cursor += 1;
-        if (hit_index == hit_count)
+        if (hit_mask_idx == hit_mask_count)
             continue;
-        active_hits &= active_hits - 1;
-        hits[hit_index] = active_hits;
-        if (!active_hits) {
+        active_hit_mask &= active_hit_mask - 1;
+        hit_masks[hit_mask_idx] = active_hit_mask;
+        if (!active_hit_mask) {
             do {
-                hit_index += 1;
-            } while (hit_index < hit_count && !hits[hit_index]);
-            if (hit_index < hit_count)
-                active_hits = hits[hit_index];
+                hit_mask_idx += 1;
+            } while (hit_mask_idx < hit_mask_count && !hit_masks[hit_mask_idx]);
+            if (hit_mask_idx < hit_mask_count)
+                active_hit_mask = hit_masks[hit_mask_idx];
         }
 
-        // update state (fence, indent, blocks), using l0_idx and l0_extra_idx
+        // update state (fence, indent, blocks); l0_extra_idx applies only to quote/list candidates
     }
 
-    // AT THIS POINT: the current block is set, simd buffer is filled, cursor is set
+    // AT THIS POINT: the current block is set, simd buffer_ptr is filled, cursor is set
     // WE KNOW: the current block index overlaps begin/we care about it.
 
     // Loop 2: create blocks overlapping [begin, end), using the accumulated state.
     while (chunk_start < state->l0_count) {
-        if (buffer_cursor == buffer_count) {
-            chunk_start += buffer_count;
+        if (buffer_cursor == buffer_size) {
+            chunk_start += buffer_size;
             if (chunk_start >= state->l0_count)
                 break;
 
-            buffer_count   = min(4096, state->l0_count - chunk_start);
-            buffer_cursor  = 0;
-            buffer         = state->l0_tags + chunk_start;
-            u32 scan_count = (buffer_count + 63) & ~63u;
-            hit_count      = scan_count / 64;
-            if (scan_count != buffer_count) {
-                memcpy(tail, buffer, buffer_count);
-                memset(tail + buffer_count, 0, scan_count - buffer_count);
-                buffer = tail;
+            u32 remaining = state->l0_count - chunk_start;
+            buffer_cursor = 0;
+            buffer_ptr    = state->l0_tags + chunk_start;
+            if (likely(remaining >= 4096)) {
+                buffer_size    = 4096;
+                hit_mask_count = 64;
+                memset(hit_masks, 0xff, sizeof(hit_masks));
+            } else {
+                buffer_size    = remaining;
+                u32 scan_count = (buffer_size + 63) & ~63u;
+                hit_mask_count = scan_count / 64;
+                memcpy(tail_buffer, buffer_ptr, buffer_size);
+                memset(tail_buffer + buffer_size, 0, scan_count - buffer_size);
+                buffer_ptr = tail_buffer;
+                memset(hit_masks, 0xff, hit_mask_count * sizeof(*hit_masks));
+                hit_masks[hit_mask_count - 1] &= UINT64_MAX >> (scan_count - buffer_size);
             }
-            for (u32 i = 0; i < hit_count; ++i)
-                hits[i] = UINT64_MAX;
-            hits[hit_count - 1] &= UINT64_MAX >> (scan_count - buffer_count);
         }
 
         // scan through l0 tags from the current cursor position/index to end or EOF

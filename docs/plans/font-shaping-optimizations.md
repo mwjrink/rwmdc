@@ -1,5 +1,10 @@
 # Font-shaping optimization plan
 
+For the current public API/lifecycle redesign and grouped refactor steps, see
+[Fontshaper API and execution refactor](fontshaper-api-refactor.md). This file
+retains the optimization goals, experiments and measurements; the API plan
+supersedes its earlier caller-managed setup examples as the intended interface.
+
 ## Goal
 
 Expose a paragraph-oriented API with UTF-8 or codepoint input, a line width,

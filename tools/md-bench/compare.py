@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare md_create throughput, counters and memory across legacy/split metadata."""
+"""Compare md_create throughput, counters and memory across legacy/split/thin metadata."""
 import argparse
 import hashlib
 import json
@@ -39,7 +39,10 @@ def function(source, declaration="MdState md_create("):
 def declarations(source):
     start, end = function(source)
     fill_start, fill_end = function(source, "internal u32 md_fill(")
-    if "typedef struct MdL0Common {" in source[:start]:
+    if "typedef union MdL0Common {" in source[:start]:
+        metadata_start = source.index("typedef union MdL0Common {")
+        schema = "thin"
+    elif "typedef struct MdL0Common {" in source[:start]:
         metadata_start = source.index("typedef struct MdL0Common {")
         schema = "split"
     else:
@@ -57,11 +60,15 @@ def declarations(source):
 def adapter(variant, schema):
     fields = ["l0_tags", "l0_offsets", "l0_count", "l1_tags", "l1_offsets", "l1_lengths", "l1_count",
               "mappings", "mappings_count"]
-    if schema == "split":
+    if schema in {"split", "thin"}:
         fields += ["l0_common", "l0_extra"]
     else:
         fields += ["l0_metadata"]
+    if schema == "thin":
+        fields += ["trailing_blank_count"]
     initializers = ", ".join("." + field + " = s." + field for field in fields)
+    if schema == "thin":
+        initializers += ", .thin_metadata = 1"
     return (f"static BenchState create_{variant}(const DocView* source, Arena* arena, ScratchArena* scratch) {{\n"
             f"    MdState{variant.title()} s = md_create_{variant}(source, arena, scratch);\n"
             f"    return (BenchState){{{initializers}}};\n}}\n")
@@ -125,11 +132,15 @@ def main():
         parser.error("Shared declarations differ outside metadata/MdState/md_fill")
     schemas = {old["schema"], new["schema"]}
     if old["schema"] == new["schema"] and old["metadata"] != new["metadata"]:
-        parser.error("Only the legacy and split metadata layouts are supported")
+        parser.error("Metadata declarations differ within the same schema")
     (out / "baseline-source.h").write_text(baseline)
     (out / "candidate-source.h").write_text(candidate)
-    flags = f'#define BENCH_LEGACY {int("legacy" in schemas)}\n#define BENCH_SPLIT {int("split" in schemas)}\n'
+    flags = (f'#define BENCH_LEGACY {int("legacy" in schemas)}\n'
+             f'#define BENCH_SPLIT {int("split" in schemas)}\n'
+             f'#define BENCH_THIN {int("thin" in schemas)}\n')
     baseline_body = baseline[:old["end"]].replace("MdState", "MdStateBaseline")
+    if old["schema"] == "thin":
+        baseline_body = baseline_body.replace("MdL0Common", "MdL0CommonThin").replace("MdL0Extra", "MdL0ExtraThin")
     baseline_body = baseline_body.replace("md_create(", "md_create_baseline(", 1)
     (out / "baseline.h").write_text(flags + baseline_body)
     candidate_decls = ""
@@ -137,6 +148,9 @@ def main():
         candidate_decls += new["metadata"]
     candidate_decls += new["state"].replace("MdState", "MdStateCandidate") + "\n"
     candidate_body = candidate[new["start"]:new["end"]].replace("MdState", "MdStateCandidate")
+    if new["schema"] == "thin":
+        candidate_decls = candidate_decls.replace("MdL0Common", "MdL0CommonThin").replace("MdL0Extra", "MdL0ExtraThin")
+        candidate_body = candidate_body.replace("MdL0Common", "MdL0CommonThin").replace("MdL0Extra", "MdL0ExtraThin")
     candidate_body = candidate_body.replace("md_create(", "md_create_candidate(", 1)
     if old["fill"] != new["fill"]:
         candidate_decls += new["fill"].replace("md_fill(", "md_fill_candidate(") + "\n"

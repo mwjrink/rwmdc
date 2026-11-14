@@ -30,7 +30,7 @@
         assert_break();                                                                                                \
     })
 #else
-#define assert(c)
+#define assert(scope, c)
 #endif
 
 // #define static_assert(c, l) typedef u8 glue(l, __LINE__)[(c) ? 1 : -1]
