@@ -355,7 +355,7 @@ MdState md_create(rop(ro DocView) source, rop(rw Arena) arena, rop(rw ScratchAre
     u32        at_line_start    = true;
     u8         line_tag;
     MdL0Common line_common;
-    MdL0Extra  line_extra = {0};
+    MdL0Extra  line_extra;
 
     l0_offsets[0] = 0;
     if (likely(source->total_length > 0)) {
@@ -422,10 +422,12 @@ MdState md_create(rop(ro DocView) source, rop(rw Arena) arena, rop(rw ScratchAre
                         l0_count += 1;
                         l0_offsets[l0_count] = line_offset;
                     }
-                    l0_tags[l0_count]     = line_tag;
-                    l0_common[l0_count]   = line_common;
-                    l0_extra[extra_count] = line_extra;
-                    extra_count += (line_tag == MD_L0_BLOCK_QUOTE || line_tag == MD_L0_UNORDERED_LIST);
+                    l0_tags[l0_count]   = line_tag;
+                    l0_common[l0_count] = line_common;
+                    if (line_tag == MD_L0_BLOCK_QUOTE || line_tag == MD_L0_UNORDERED_LIST) {
+                        l0_extra[extra_count] = line_extra;
+                        extra_count += 1;
+                    }
                     l0_count += 1;
                     l0_offsets[l0_count] = run_offset + 1;
                     blank_line_count     = run_length - 1;
@@ -555,11 +557,12 @@ MdState md_create(rop(ro DocView) source, rop(rw Arena) arena, rop(rw ScratchAre
             l0_offsets[l0_count] = line_offset;
             blank_line_count     = 0;
         }
-        l0_tags[l0_count]     = line_tag;
-        l0_common[l0_count]   = line_common;
-        l0_extra[extra_count] = line_extra;
-        if (line_tag == MD_L0_BLOCK_QUOTE || line_tag == MD_L0_UNORDERED_LIST)
+        l0_tags[l0_count]   = line_tag;
+        l0_common[l0_count] = line_common;
+        if (line_tag == MD_L0_BLOCK_QUOTE || line_tag == MD_L0_UNORDERED_LIST) {
+            l0_extra[extra_count] = line_extra;
             extra_count += 1;
+        }
         l0_count += 1;
         line_indent = 0;
     }
@@ -637,9 +640,9 @@ MdResult md_get(rop(rw MdState) state, rop(rw Arena) arena, rop(rw ScratchArena)
     u32 mapping_idx = 0;
     u32 chunk_start = 0;
 
-    u32       buffer_cursor = 0;
-    u32       buffer_size   = 0;
-    const u8* buffer_ptr    = NULL;
+    u32       chunk_idx   = 0;
+    u32       buffer_size = 0;
+    const u8* buffer_ptr  = NULL;
 
     u8* tail_buffer = scratch_alloc_aligned(scratch, u8, 4096);
 
@@ -651,13 +654,13 @@ MdResult md_get(rop(rw MdState) state, rop(rw Arena) arena, rop(rw ScratchArena)
 
     // Loop 1: accumulate context before begin; never emit nodes.
     while (chunk_start < state->l0_count) {
-        if (buffer_cursor == buffer_size) {
+        if (chunk_idx == buffer_size) {
             chunk_start += buffer_size;
             if (chunk_start >= state->l0_count)
                 break;
 
             u32 remaining = state->l0_count - chunk_start;
-            buffer_cursor = 0;
+            chunk_idx     = 0;
             buffer_ptr    = state->l0_tags + chunk_start;
             if (likely(remaining >= 4096)) {
                 buffer_size    = 4096;
@@ -674,53 +677,39 @@ MdResult md_get(rop(rw MdState) state, rop(rw Arena) arena, rop(rw ScratchArena)
                 hit_masks[hit_mask_count - 1] &= UINT64_MAX >> (scan_count - buffer_size);
             }
 
-            // skip empty masks in array
-            hit_mask_idx = 0;
-            while (hit_mask_idx < hit_mask_count && hit_masks[hit_mask_idx] == 0)
-                hit_mask_idx += 1;
-
-            // set the active mask
-            active_hit_mask = 0;
-            if (hit_mask_idx < hit_mask_count)
-                active_hit_mask = hit_masks[hit_mask_idx];
+            hit_mask_idx    = 0;
+            active_hit_mask = hit_masks[0];
         }
 
-        // With no more hit_masks, check the window's last entry before refilling.
-        u32 next_cursor = buffer_size - 1;
-        if (hit_mask_idx < hit_mask_count)
-            next_cursor = hit_mask_idx * 64 + (u32)__tzcnt_u64(active_hit_mask);
-        buffer_cursor = next_cursor;
+        while (active_hit_mask == 0 && hit_mask_idx + 1 < hit_mask_count) {
+            hit_mask_idx += 1;
+            active_hit_mask = hit_masks[hit_mask_idx];
+        }
 
-        u32 l0_idx = chunk_start + buffer_cursor;
-        u8  l0_tag = buffer_ptr[buffer_cursor];
+        // Select the next hit, or the window's last entry if no hits remain.
+        chunk_idx = buffer_size - 1;
+        if (active_hit_mask != 0)
+            chunk_idx = hit_mask_idx * 64 + (u32)__tzcnt_u64(active_hit_mask);
+
+        u32 l0_idx = chunk_start + chunk_idx;
+        u8  l0_tag = buffer_ptr[chunk_idx];
         u32 l0_end;
-        if (unlikely(l0_tag == MD_L0_EOF))
-            l0_end = state->l0_offsets[l0_idx];
-        else
-            l0_end = state->l0_offsets[l0_idx + 1];
+
+        // EOF is a 0 len sentinel, use it's offset for end. otherwise, use l0_idx + 1
+        l0_end = state->l0_offsets[l0_idx + (1 * l0_tag != MD_L0_EOF)];
+
         if (l0_end > begin) {
             // Rewind only the skipped entries in this boundary window.
-            while (buffer_cursor > 0 && state->l0_offsets[chunk_start + buffer_cursor] > begin) {
-                buffer_cursor -= 1;
+            while (chunk_idx > 0 && state->l0_offsets[chunk_start + chunk_idx] > begin) {
+                chunk_idx -= 1;
             }
             break;
         }
-        if (unlikely(l0_tag == MD_L0_EOF))
-            goto get_end;
 
         extra_idx += (l0_tag == MD_L0_BLOCK_QUOTE || l0_tag == MD_L0_UNORDERED_LIST);
-        buffer_cursor += 1;
-        if (hit_mask_idx == hit_mask_count)
-            continue;
+        chunk_idx += 1;
+
         active_hit_mask &= active_hit_mask - 1;
-        hit_masks[hit_mask_idx] = active_hit_mask;
-        if (!active_hit_mask) {
-            do {
-                hit_mask_idx += 1;
-            } while (hit_mask_idx < hit_mask_count && !hit_masks[hit_mask_idx]);
-            if (hit_mask_idx < hit_mask_count)
-                active_hit_mask = hit_masks[hit_mask_idx];
-        }
 
         // update state (fence, indent, blocks); l0_extra_idx applies only to quote/list candidates
     }
@@ -730,13 +719,13 @@ MdResult md_get(rop(rw MdState) state, rop(rw Arena) arena, rop(rw ScratchArena)
 
     // Loop 2: create blocks overlapping [begin, end), using the accumulated state.
     while (chunk_start < state->l0_count) {
-        if (buffer_cursor == buffer_size) {
+        if (chunk_idx == buffer_size) {
             chunk_start += buffer_size;
             if (chunk_start >= state->l0_count)
                 break;
 
             u32 remaining = state->l0_count - chunk_start;
-            buffer_cursor = 0;
+            chunk_idx     = 0;
             buffer_ptr    = state->l0_tags + chunk_start;
             if (likely(remaining >= 4096)) {
                 buffer_size    = 4096;

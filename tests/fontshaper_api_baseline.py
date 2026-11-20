@@ -5,7 +5,7 @@ python tests/fontshaper_api_baseline.py --output /tmp/fontshaper-api-baseline.js
 python tests/fontshaper_api_baseline.py --check tests/data/fontshaper_api_baseline.json
 
 Timings include UTF-8 context shaping, flat copying/source lookup and the existing
-simple English wrapper. Output fingerprints exclude timings; no ASCII spike is built.
+simple English wrapper. output fingerprints exclude timings; no ASCII spike is built.
 """
 import argparse
 import hashlib

@@ -505,3 +505,402 @@ All four headers passed independent source-oracle checks with Clang/GCC and sepa
 including fragmented/empty pieces, direct/buffered windows, EOF and maximum NUL-run count.
 Oracle logs: `/tmp/md-check-create-{nqfgtzyp,mcra7s6k,zg_tm91b,t52qsvez}/`.
 Race results: `/tmp/md-marker-bench/cursor-races/{volatile,likely,both}-{contiguous,large-pieces,gap-like}/`.
+
+## 12. Thin Extra throughput: code placement changes the answer
+
+Compared the previous 4-byte Extra for every nonparagraph against the current 2-byte Extra for
+quote/list only, Common's BLANK union member, and one EOF blank count in `MdState`. The current
+snapshot includes unconditional Extra assignments/stores and the Boolean `extra_count` increment
+in the hot newline flush. No production code was changed during this investigation.
+
+Artifacts: `/tmp/md-marker-bench/thin-extra-throughput/`. Frozen headers are `wide.h`,
+`thin-guarded.h`, and `current.h`; each comparison retains source hashes, linked assembly, raw
+trials, selected-only memory results and perf counters. CPU 6, Clang/GCC release AVX2, eleven
+rotating paired rounds, reused arenas, full native construction including output copies.
+Four large contiguous inputs: README, prose, spec and dense. Positive means thin is faster.
+
+| Constructor placement | Clang initial / repeat | GCC initial / repeat |
+|---|---:|---:|
+| Default compiler placement | -2.8% / -3.1% | -6.1% / -5.4% |
+| Both constructors aligned to 64 bytes | +1.2% / +1.4% | +1.5% / +1.7% |
+| Both constructors aligned to 4096 bytes | +2.1% / -0.6% | +1.7% / +1.6% |
+
+These are geomeans of per-input median paired thread-CPU throughput ratios. Repeats rerun the
+same linked executables, not newly compiled bodies. Default-placement per-input regressions
+were Clang 1.8–3.5%, GCC 2.4–10.9%; the small original README was also measured separately
+(Clang -4.6%, GCC -10.3%) but is excluded from the four-large-input geomeans above.
+
+The alignment controls change only a temporary function attribute, not either constructor body.
+Linked disassembly was compared between default and 64-byte controls: after ignoring padding,
+absolute code locations and RIP-relative relocation displacements, all instructions/registers
+match for both constructors and both compilers. The timing change is therefore placement-sensitive,
+not evidence that a different constructor algorithm suddenly became faster. It does not establish
+which exact frontend mechanism dominates. Do not select the best alignment result and advertise
+it as an optimization, or extrapolate the default binary's slowdown to the application binary.
+
+The default spec counters show thin executing about 3.0% more instructions with Clang and 2.0%
+more with GCC; dense about 3.0% and 1.0%. Both reduce branch counts. The hot newline flush now
+builds quote/list ownership with two comparisons, SETcc/OR and an addition instead of the old
+single nonparagraph test and conditional increment. This is real extra work, but it does not
+explain the full timing result: changing placement reverses the net throughput comparison.
+Counters include setup/validation/warmup and were collected separately from paired timing.
+Cycle sampling/annotations are in `wide-v-current/`; sample skid prevents per-instruction blame.
+
+Other temporary controls:
+- Thin guarded writes versus current unconditional writes: across all five inputs, Clang +3.3%
+  geomean, GCC -0.8%. This combines pending-field/output-write changes with the current hot
+  Boolean increment; it is not a pure single-store ablation.
+- Restoring an explicit conditional count increment did not provide a consistent win.
+- Caching ownership when classifying a line looked promising in the default thin/thin binary
+  (Clang +2.5%, GCC +7.3% across four large inputs), but lost its advantage in other placements:
+  aligned thin/thin Clang -4.8%, GCC +0.8%. Not promoted.
+
+Retained L0 metadata fell 21.2–34.1% on the large inputs. This saving is independent of timing.
+Native fingerprint/self-checks passed for every comparison; the default wide/current,
+thin-guarded/current and ownership experiments also passed separate Clang ASan/UBSan checks.
+The unfinished getter was not benchmarked or claimed to be validated here.
+
+Conclusion: the default comparator binary really is slower, but a general thin-layout throughput
+regression is not established. Keep the smaller representation; no count-caching or alignment
+change is justified by these measurements alone. Constructor throughput in the final application
+binary remains to be measured once that path is runnable independently.
+
+## 13. Controlled thin-metadata ablations and scoped original-binary counters
+
+Artifacts and reproducible scripts: `/tmp/md-marker-bench/controlled-thin/`.
+`frozen/` contains the project source and existing benchmark tools used for every new build;
+`current-source.h` is the unmodified parser snapshot. Its SHA-256 is
+`f959fc4afeb50c30d3ba52154eaa651cf504d319b0d1a7ccc654b4483c5abfb3`.
+No production parser change was made or promoted.
+
+### Method
+
+Each initial ablation changes one source factor relative to the completed thin constructor.
+Both functions have 4096-byte entry alignment to remove differing entry offsets within a page;
+this is an experimental control, not a proposed production optimization. The source scanner,
+metadata schema, inputs and allocator implementation are frozen. Eleven rotating paired rounds,
+CPU 6, full construction/copies, large contiguous README/prose/spec/dense inputs, both compilers.
+Generated code is inspected: a single C change need not translate into a single machine-code change.
+Store-guard tests also run with reversed baseline/candidate roles and with 64-byte entry alignment.
+
+Every initial ablation passes native fingerprint/scanner/parser self-checks and separate Clang
+ASan/UBSan checks. The eager-prefix variant additionally passes the independent source oracle,
+including random/fragmented/empty pieces, long refills/blank counts, with Clang/GCC and ASan/UBSan:
+`/tmp/md-check-create-bji26kg2/`.
+
+### Ablation results
+
+Geomean paired CPU-throughput improvement relative to current, four large inputs, fixed 4096-byte
+entry alignment. Positive is faster. These are complete-constructor measurements, not isolated
+store latency measurements.
+
+| Change from current | Clang | GCC |
+|---|---:|---:|
+| Guard only Extra output stores; retain count expression | -4.4% | +1.0% |
+| Explicit branch for count increment; retain unconditional stores | -0.8% | -0.5% |
+| Guard output stores and branch count increment | -6.3% | +0.0% |
+| Guard only pending Extra assignment | -0.1% | -0.8% |
+| Restore old Extra scratch footprint/alignment; keep thin retained arrays | -0.6% | -2.0% |
+| Cache quote/list ownership when classifying the line | -2.3% | +0.3% |
+| Pending Common struct instead of union; retain indexed union | +1.1% | -0.0% |
+
+The pending-Common struct and union compile to identical constructor instructions, registers,
+internal branch offsets and padding for both compilers (ignoring external address relocations).
+Its apparent Clang gain is not an instruction-level optimization. Likewise, GCC's explicit-count
+branch compiles identically to its Boolean count expression. Small timing deltas from these null
+controls should not be attributed to their source spelling.
+
+Clang store-guard losses survive reversed function roles: current beats guard-only by 4.5% and
+guard-both by 6.8%. At 64-byte entry alignment, guard-only loses 6.4% and guard-both loses 5.7%.
+GCC guard-only gains 2.4% at 64 bytes, but its roughly 1% gain at 4096 bytes does not survive the
+reversed-role comparison consistently. There is no shared Clang/GCC win from restoring guards.
+
+### Why the store guard hurts Clang
+
+In current's L1-emission path, `l1_count` stays in `r14d`, with a register increment. In the
+otherwise identical store-guard source variant it lives at `[rsp+0xe0]`, with a load/increment/store;
+`run_offset` also reloads from `[rsp+0x120]`. This affects ordinary L1 events, not just quote/list
+lines. See `guard-store/clang-{baseline,candidate}.asm`, around `l1_tags[l1_count] = run_tag`.
+
+Scoped counters, medians of three separately launched measurements per variant/group, show the
+consequence on spec: dispatched loads +23.1%, stores +8.1%, frontend-empty slots +23.8%, cycles
++5–6%. Dense dispatched loads also rise about 23% and stores 8%. Eliminating logical Extra stores
+has increased actual spill/reload traffic. This is compiler register-allocation/code-generation
+sensitivity, not proof that an unconditional metadata store is expensive. Architectural physical-
+register-file stalls are a different phenomenon from compiler spilling and were tiny here.
+
+### Scoped counters on the original regression, without relinking
+
+The first scoped-ablation harness uses perf control FIFOs around timed batches, excluding setup,
+fingerprinting and warmup. To investigate the earlier default-versus-aligned comparisons without
+changing their code placement, `clock-gate.c` interposes only their existing `clock_gettime` calls:
+thread-CPU-clock entry/exit gates perf counters around the timed constructor loop. The original
+linked executables are neither rebuilt nor patched. This preload is used only for counters, not
+for throughput claims. Native addresses/instructions remain those of the original experiment.
+
+`original-counters.py` collects three repetitions, rotating selected-variant process order, with
+six or fewer counters per group; CSVs report 100% scheduling, without multiplexing. The counter
+scope includes the small timer/control boundary and loop/sink overhead, but not source validation
+or constructor warmup. `original-scoped-counters.json` and `original-counter-summary.txt` retain
+all values. Cycle values from different groups are separate measurements, not additive samples.
+
+The strongest original regression is GCC dense. Default placement, old wider layout -> current:
+
+| Scoped metric | Change |
+|---|---:|
+| Retired instructions | +1.0% |
+| Cycles (memory / frontend groups) | +12.8% / +11.8% |
+| Dispatched loads | -0.4% |
+| Dispatched stores | -3.0% |
+| Store-queue resource-stall cycles | -13.8% |
+| Branch misses | +0.2% |
+| Frontend-empty dispatch slots | +70.8% |
+| Backend-stalled dispatch slots | -2.6% |
+
+GCC spec similarly shows cycles +5.7%, frontend-empty slots +25.7%, branch misses +1.6%, with
+store-queue stalls down 30%. Clang default spec/dense retire about 3% more instructions; dense
+cycles rise about 5–6%, frontend-empty slots 15.7%, and backend-stalled slots 11.8%. Thus the
+larger GCC loss has a particularly strong frontend-supply signature; Clang is less cleanly isolated.
+
+With aligned entries, GCC dense's frontend comparison reverses: current has about 11–13% fewer
+frontend-empty slots and 2–3% fewer cycles than old. Importantly, most of this is the *old* function
+losing its unusually favorable default frontend behavior; it is not a large alignment speedup for
+current. Store-pressure and branch-miss explanations do not fit that reversal.
+
+`icache.py` adds original-binary GCC dense counters. L1 instruction-cache misses are only about
+10–20 thousand per measurement and op-cache misses about 1.4–2.6 million, versus billions of
+instructions. Default old/current op-cache hit events are 2.283/2.757 billion; aligned old is about
+2.804–2.808 billion for essentially the same retired instruction stream. This is consistent with
+less efficient op-cache fetch/dispatch packing, rather than a surge of cache misses. It does not
+identify a particular Zen 4 bank conflict, fetch-boundary rule or branch-layout mechanism.
+
+### A simpler pending-state alternative
+
+`eager-extra.h` writes quote/list Extra immediately after prefix padding is known, rather than
+holding `line_extra` until newline/EOF. It deletes pending Extra state and both flush-site Extra
+stores/count tests. Extra records remain in source order and retained facts are unchanged. This
+combines lifetime shortening with moving the ownership branch off the common flush path; it is
+not a single-factor store ablation.
+
+Four-large-input geomeans, initial / repeat of the same linked binaries:
+
+| Eager prefix Extra versus current | Clang | GCC |
+|---|---:|---:|
+| 4096-byte entry alignment | +3.5% / +4.2% | +2.7% / +3.5% |
+| 64-byte entry alignment | +0.4% / +2.0% | +2.9% / +2.5% |
+
+Clang dense at 64 bytes is unstable: initial -6.1%, repeat +2.0%; do not promise a universal win.
+GCC dense is consistently +6–7% in uninstrumented timings. Scoped 4096-byte GCC spec/dense counters
+show retired instructions down 3.3%/2.1%, dispatched stores down 6.8%/6.3%, and cycles down roughly
+2%/4–6%. This candidate is worth a separate focused decision, but was not applied automatically.
+
+### Conclusion
+
+The large original GCC regression is primarily consistent with frontend delivery/layout, not
+extra stores, store-queue saturation or branch misprediction. There is real additional ownership
+arithmetic (about 1–3% more retired instructions), but no single data-layout operation explains the
+full loss. Guarding writes can make register allocation substantially worse in Clang. Pending
+Common's union spelling itself emits no extra instructions relative to a struct in the controlled
+ablation. Keep causal claims at that level; precise op-cache/fetch-boundary attribution remains open.
+
+## 14. Actual change-backout matrix (supersedes section 13's causal scope)
+
+This investigation reverts the actual old-to-new changes, rather than substituting alternative
+implementations. Artifacts: `/tmp/md-marker-bench/backout/`. `prepare.py` records eight changes,
+creates dependent/combined reversions, verifies the original endpoint, and creates a private
+comparator able to decode intermediate layouts. The public benchmark and production parser were
+not modified. The source hash remains `f959fc4afeb50c30d3ba52154eaa651cf504d319b0d1a7ccc654b4483c5abfb3`.
+
+### Endpoints and controls
+
+- `old-original.h`: the saved pre-regression constructor, Common struct, four-byte Extra for all
+  nonparagraphs, blank/EOF counts in Extra, guarded/postincrement ordinary-line emission.
+- `new-original.h`: completed thin representation with unconditional ordinary-line Extra stores,
+  quote/list-only count advancement, initialized pending Extra, Common BLANK counts and state EOF count.
+- `full-rollback.h`: generated by backing every change out of new, not by copying old.
+- Assertions verify the generated full rollback matches original constructor tokens, ignoring only
+  whitespace/comments and the buffer variable rename. Metadata declarations, MdState, shared
+  declarations and md_fill also match. See `endpoint-check.txt` and the preparation assertions.
+- Old-versus-old tests produce instruction-equivalent native constructors, including register choices
+  and control-flow targets after removing padding/relocations. Thus they measure the placement floor.
+
+The private decoder reads each intermediate schema using its actual Extra stride, owner set and
+blank/EOF storage. Adapters remain O(1); decoding and fingerprinting are outside timed construction.
+No required writes are simply deleted, and no uninitialized value is deliberately read. All variants
+retain the normalized source facts. Initialization removal is permitted only with conditional stores.
+Restoring blank/EOF Extra facts requires four-byte Extra; restoring the Common struct requires moving
+blank counts back out of Common. These dependencies are explicit rather than hidden in an invalid test.
+
+### Matrix
+
+28 labeled configurations, 24 distinct flag sets, include individual reversions, combinations, an
+8-step cumulative rollback and reintroducing individual changes into original code. Both compiler-
+default placement and matched 4096-byte entry alignment are measured; alignment is a control only.
+Every configuration compares against the same original implementation, not against current.
+
+Actual changes, with private matrix codes:
+- S: restore the old guarded store/postincrement flush structure (ordinary owner predicate is separate).
+- O: restore the old nonparagraph owner predicate for ordinary lines.
+- W: restore the original four-byte Extra union.
+- B: restore blank counts and blank Extra commits.
+- E: restore EOF Extra storage and original MdState layout.
+- U: restore the indexed Common struct, not merely the pending local variable.
+- P: remove the new pending Extra zero initializer, once guarded stores make that safe.
+- N: restore the original NUL-mapping postincrement expression, an incidental actual diff change.
+
+The complete matrix and all forward-reintroduction cases are in `summary.md`, `summary.json`,
+`variants.json`, `aliases.json`, and per-case `results.json`. Three large contiguous inputs—prose,
+spec and dense—eleven rotating paired rounds, CPU 6, full creation/copies and reused arenas.
+All 48 distinct configuration/placement runs pass native Clang/GCC checks and separate Clang
+ASan/UBSan checks, including randomized inputs, empty/fragmented pieces and added 70,000-line
+interior/trailing blank cases. Selected cases were repeated using the same linked executables.
+
+### Strongest backout result: flush structure plus pending initialization
+
+GCC paired CPU-throughput changes **relative to the original wider implementation**. Initial / repeat
+are three-input geomeans; positive is faster than original, not merely faster than regressed current.
+
+| Constructor/backout | Default placement | Matched 4096-byte entries |
+|---|---:|---:|
+| Completed new code | -6.3% / -6.8% | +1.9% / +0.9% |
+| Restore guarded/postincrement flush only (S) | -6.5% / -6.1% | +1.8% / +1.4% |
+| Also remove pending zero initializer (S+P) | -0.2% / -0.4% | +9.1% / +8.5% |
+| Restore four-byte Extra and blank Extra facts (W+B) | +0.9% / -0.1% | +8.5% / +8.0% |
+| Full rollback / old-versus-old | -0.3% / -0.6% | +0.0% / -0.1% |
+
+Thus S+P is a small valid rollback that recovers the GCC default regression while retaining the
+new Common union, two-byte quote/list Extra and state EOF fact. Restoring S alone does not recover it.
+W+B is an alternative recovery involving more of the representation. Width alone, ownership alone,
+and width+EOF restoration do not recover the regression. The behavior is not a monotonic cost per
+additional write; cumulative rollback crosses fast and slow generated-code shapes.
+
+Forward controls reinforce the interaction: original plus the new pending initializer alone measures
+GCC -7.3% / -6.7% at default placement, while adding only the Common union or changing ordinary owners
+is roughly neutral there. Moving EOF storage alone also yields a roughly 7–8% default loss. However,
+these losses do not survive matched-alignment controls as comparable algorithmic costs.
+
+### Counters and assembly distinguish initializer cost from layout
+
+Scoped original-linked-binary counters use the existing clock-gate preload, without rebuilding or
+moving the constructors. `counters.py` and `backout-counters.json` retain three repetitions per
+selected variant/group; setup, validation and warmup are excluded.
+
+On GCC dense, guarded-flush S versus S+P at matched entry alignment:
+- Retired instructions: both approximately **14.798618 billion**; initialization differences are
+  negligible at that scale, not a per-line instruction saving.
+- Dispatched loads/stores: approximately **2.419/1.176 billion** versus **2.423/1.178 billion**.
+  There is no large spill/reload-traffic reduction explaining the faster S+P.
+- Frontend-group cycles: **3.501 -> 3.160 billion**.
+- Frontend-empty slots: **5.284 -> 3.171 billion**.
+- Op-cache hit events: **2.724 -> 2.320 billion**; branch misses are nearly unchanged.
+
+Assembly shows that deleting the initializer removes cold initialization operations and changes
+scheduling/register choices. In particular, the main loop's first compare moves from function offset
+**0x830 to 0x820**. That observation alone is not sufficient attribution, so a padding-only experiment
+follows. It would be wrong to claim that the cost of writing two zero bytes once per parse directly
+accounts for a 7–10% throughput difference.
+
+### Padding-only experiment: no C/code-generation changes
+
+`padding/` retains GCC's emitted assembly and reassembles it with 0/16/32/48/64 NOP bytes inserted
+immediately before the main loop label. Padding is outside the backedge target: it executes only on
+initial fallthrough, not on every iteration. Instructions, operands, register allocation and semantic
+branch targets are verified unchanged (branch targets normalized to instruction ordinals, not just
+ignored). Native parser/scanner/fact checks also pass for every binary. This avoids treating a new C
+annotation as a supposedly layout-only change when the compiler might regenerate the whole function.
+
+The S and S+P forms show a repeatable approximately 64-byte placement pattern. GCC dense, median of
+two fixed-order/reversed-order runs, throughput relative to original:
+
+| Padding before loop | S, initializer retained | S+P, initializer removed |
+|---|---:|---:|
+| 0 bytes | +2.3% | +14.0% |
+| 16 bytes | -5.1% | +2.0% |
+| 32 bytes | +1.3% | -5.3% |
+| 48 bytes | +13.3% | +1.4% |
+| 64 bytes | +2.6% | +11.3% |
+
+Adding 48 bytes to S makes the still-initialized constructor approximately as fast as S+P; shifting
+S+P by 16/32 bytes loses most/all of its advantage. Prose/spec show the same phase pattern at smaller
+magnitudes. This demonstrates that layout, not the runtime zero store, can explain the S -> S+P swing.
+It does not identify a particular documented Zen 4 bank or decoded-op packing rule.
+
+Crucial negative control: the same padding sweep was applied to completed current, at both default
+and matched entry placements (`padding/current-sweep-results.json`). It did **not** recover current's
+full default GCC regression. The favorable phase of one generated loop is not a universal recipe for
+another. Therefore do not claim that aligning the loop to 32/64 bytes alone fixes the original change,
+or promote the best padding value as production code. The flush/pending-state interaction produces a
+different generated shape, and layout amplifies its behavior.
+
+### Clang and limits
+
+Clang does not give the same clean culprit. Completed current defaults measure -3.0% / -3.2%, while
+instruction-equivalent old-versus-old defaults measure -1.6% / -3.5%. At matched entries both are near
+zero on aggregate. S+P is not a consistent Clang improvement. Restoring only the NUL increment spelling
+can move Clang results even though none of the timed inputs has a NUL mapping, further demonstrating
+unexecuted-path/code-generation sensitivity rather than a simple runtime operation count.
+
+Conclusion: the faithful backout matrix isolates **guarded flush + no pending initialization** as a
+small practical GCC recovery, without discarding the compact metadata representation. The initialization
+is a code-generation/layout trigger, not an expensive zero store. There is no demonstrated universal
+single-operation culprit across both compilers. No production patch, alignment attribute or padding
+change was applied; choose any implementation change separately, with the Clang tradeoff explicit.
+
+The small S+P rollback also passes the independent thin-schema source oracle on random/fragmented/
+empty pieces, long blank counts/refills and real spec/dense inputs, with Clang/GCC and ASan/UBSan:
+`/tmp/md-check-create-4yggxzv9/`.
+
+## 15. No-initializer guarded assignment versus unconditional representation copy
+
+Requested direct comparison against the pre-regression wider constructor. Artifacts:
+`/tmp/md-marker-bench/guard-v-memcpy/`. The frozen/private comparator and three-input workload are
+unchanged from section 14. Both candidates remove `line_extra = {0}`:
+
+- `guarded.h`: quote/list guard around assignment and postincrement at both flush sites (S+P).
+- `memcpy.h`: unconditional `memcpy(&l0_extra[extra_count], &line_extra, sizeof line_extra)` at both
+  flush sites; retain current hot Boolean count addition and final conditional count advancement.
+
+This compares those complete implementations, not a pure store-instruction ablation. Both retain the
+Common union, two-byte quote/list Extra and state EOF count. Source/parser production code is unchanged.
+
+Three large inputs (prose/spec/dense), eleven rotating paired rounds, CPU 6, full native creation and
+output copies, Clang/GCC release AVX2. Each candidate is paired directly with original, and the same
+linked binaries are repeated. Old-versus-old controls measure the placement floor. Positive means
+faster than the **original pre-regression constructor**, not faster than regressed current.
+
+| Variant | Default Clang, initial / repeat | Default GCC, initial / repeat |
+|---|---:|---:|
+| Guarded assignment, no initialization | -2.9% / -3.1% | +0.3% / +0.3% |
+| Unconditional memcpy, no initialization | -3.6% / -3.4% | -4.6% / -4.6% |
+| Old-versus-old control | -3.7% / -3.8% | -0.7% / -0.5% |
+
+| Variant | Matched 4096-byte entries, Clang | Matched 4096-byte entries, GCC |
+|---|---:|---:|
+| Guarded assignment, no initialization | +1.1% / +0.0% | +7.8% / +8.4% |
+| Unconditional memcpy, no initialization | +1.4% / +1.1% | +3.7% / +3.5% |
+| Old-versus-old control | +0.4% / -0.6% | -0.0% / -0.4% |
+
+The alignment lane remains a placement control, not a recommendation to align production functions.
+GCC consistently favors guarded assignment in both lanes: default placement recovers the original
+throughput, while memcpy retains about a 4.6% loss. Clang does not distinguish them reliably beyond
+placement effects; both default results are comparable to its instruction-equivalent old/old control.
+
+Linked assembly confirms both compilers inline the two-byte memcpy: stack load plus 16-bit store,
+not a memcpy library call. Thus the GCC loss cannot be blamed on a tiny-copy function-call overhead.
+Clang's shown source local is at `[rsp+0x26]`, GCC's at `[rsp+0x72]` in default memcpy builds.
+
+Both candidates pass the independent source oracle for Common/sparse Extra, source partitions,
+EOF, raw L1/NUL mappings, fragmented/empty pieces and long blank runs/refills, including real
+spec/dense inputs, in Clang/GCC and separate ASan/UBSan builds:
+`/tmp/md-check-create-cg_sljia/` (guarded), `/tmp/md-check-create-tgoxaz5_/` (memcpy).
+
+Additionally, Clang MemorySanitizer with origin tracking, `-O1 -fPIE -pie`, passes the full native
+benchmark self-checks for both guarded and memcpy candidates. The memcpy MSan binary also passes
+real spec input validation/timed creation. Uncommitted indeterminate bytes propagate through the
+representation copies without being consumed by the retained-fact reader; committed records do not
+trigger uninitialized-value reports. This supplies the missing uninitialized-read check that ASan/
+UBSan cannot provide. Logs: `msan-*`, `guarded-msan-*`, `msan-real-spec.txt` in the artifact directory.
+
+No implementation was promoted automatically. Among these two options, guarded assignment is the
+supported GCC performance choice; unconditional representation copying is correct under the tested
+commit invariant but does not recover all of the default-placement regression.

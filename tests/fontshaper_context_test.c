@@ -17,16 +17,16 @@
 #ifdef FONTSHAPER_CONTEXT_API_VERSION
 #define FONTSHAPER_STATE_API_VERSION FONTSHAPER_CONTEXT_API_VERSION
 #endif
-#define fontshaper_state fontshaper_shape_context
-#define fontshaper_state_info fontshaper_shape_create_info
-#define fontshaper_state_flags fontshaper_shape_context_flags
-#define fontshaper_SizeOfStateHeader fontshaper_SizeOfShapeContext
-#define fontshaper_PlaceStateHeader fontshaper_PlaceShapeContext
-#define fontshaper_SetStateCache fontshaper_SetContextCache
-#define fontshaper_SizeOfStateScratch fontshaper_SizeOfContextScratch
+#define FontShaperState FontShaperShapeContext
+#define FontShaperStateInfo fontshaper_shape_create_info
+#define FontShaperStateFlags FontShaperShapeContextFlags
+#define font_shaper_size_of_state_header font_shaper_size_of_shape_context
+#define font_shaper_place_state_header font_shaper_place_shape_context
+#define font_shaper_set_state_cache font_shaper_set_context_cache
+#define font_shaper_size_of_state_scratch font_shaper_size_of_context_scratch
 #endif
 #ifndef FONTSHAPER_STATE_API_VERSION
-#define fontshaper_ShapeBeginWithMemory fontshaper_ShapeBegin
+#define font_shaper_shape_begin_with_memory font_shaper_shape_begin
 #endif
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #x); exit(1); } } while (0)
@@ -35,24 +35,24 @@
 #define CACHE_BYTES (8 * 1024 * 1024)
 
 typedef struct TestFont {
-    fontshaper_font font;
+    FontShaperFont font;
     void* blob;
     void* compiled;
 } TestFont;
 
 typedef struct TestState {
-    fontshaper_state* shaper;
+    FontShaperState* shaper;
     void* memory;
     void* destination;
     void* scratch[2];
     void* cache;
-    fontshaper_un scratch_size;
-    fontshaper_un input_capacity, glyph_capacity;
+    FontShaperUn scratch_size;
+    FontShaperUn input_capacity, glyph_capacity;
     unsigned pass;
 } TestState;
 
 typedef struct Glyph {
-    fontshaper_font* font;
+    FontShaperFont* font;
     int id, codepoint, source, user_id, advance_x, advance_y, offset_x, offset_y;
     int direction, paragraph_direction;
 } Glyph;
@@ -62,7 +62,7 @@ typedef struct Result {
     Glyph glyphs[GLYPH_CAPACITY];
 } Result;
 
-static void* allocate(fontshaper_un bytes) {
+static void* allocate(FontShaperUn bytes) {
     CHECK(bytes && bytes <= SIZE_MAX);
     void* result = malloc((size_t)bytes);
     CHECK(result);
@@ -76,28 +76,28 @@ static TestFont load_font(const char* path) {
     long length = ftell(file);
     CHECK(length > 0 && length <= INT32_MAX);
     rewind(file);
-    void* bytes = allocate((fontshaper_un)length);
+    void* bytes = allocate((FontShaperUn)length);
     CHECK(fread(bytes, 1, (size_t)length, file) == (size_t)length);
     fclose(file);
     TestFont result = {0};
-    fontshaper_load_font_state state = {0};
+    FontShaperLoadFontState state = {0};
     int scratch_size = 0, blob_size = 0;
-    CHECK(fontshaper_LoadFont(&result.font, &state, bytes, (int)length, 0, &scratch_size, &blob_size) ==
+    CHECK(font_shaper_load_font(&result.font, &state, bytes, (int)length, 0, &scratch_size, &blob_size) ==
           FONTSHAPER_LOAD_FONT_ERROR_NEED_TO_CREATE_BLOB);
-    void* scratch = allocate((fontshaper_un)scratch_size);
-    result.blob = allocate((fontshaper_un)blob_size);
-    CHECK(fontshaper_PlaceBlob(&result.font, &state, scratch, result.blob) == FONTSHAPER_LOAD_FONT_ERROR_NONE);
+    void* scratch = allocate((FontShaperUn)scratch_size);
+    result.blob = allocate((FontShaperUn)blob_size);
+    CHECK(font_shaper_place_blob(&result.font, &state, scratch, result.blob) == FONTSHAPER_LOAD_FONT_ERROR_NONE);
     free(scratch);
     free(bytes);
-    result.compiled = allocate(fontshaper_SizeOfCompiledFont(&result.font));
-    scratch = allocate(fontshaper_SizeOfFontCompileScratch(&result.font));
-    CHECK(fontshaper_CompileFont(&result.font, result.compiled, scratch, NULL) == FONTSHAPER_LOAD_FONT_ERROR_NONE);
+    result.compiled = allocate(font_shaper_size_of_compiled_font(&result.font));
+    scratch = allocate(font_shaper_size_of_font_compile_scratch(&result.font));
+    CHECK(font_shaper_compile_font(&result.font, result.compiled, scratch, NULL) == FONTSHAPER_LOAD_FONT_ERROR_NONE);
     free(scratch);
     return result;
 }
 
-static void resize_scratch(TestState* state, fontshaper_language language) {
-    fontshaper_un size = fontshaper_SizeOfStateScratch(state->shaper, language,
+static void resize_scratch(TestState* state, FontShaperLanguage language) {
+    FontShaperUn size = font_shaper_size_of_state_scratch(state->shaper, language,
                                                         state->input_capacity, state->glyph_capacity);
     CHECK(size);
     if (size == state->scratch_size) return;
@@ -108,19 +108,19 @@ static void resize_scratch(TestState* state, fontshaper_language language) {
     }
 }
 
-static TestState make_test_state(TestFont* fonts, unsigned font_count, fontshaper_un cache_size) {
+static TestState make_test_state(TestFont* fonts, unsigned font_count, FontShaperUn cache_size) {
     TestState result = {0};
     result.input_capacity = INPUT_CAPACITY;
     result.glyph_capacity = GLYPH_CAPACITY;
-    result.memory = allocate((fontshaper_un)fontshaper_SizeOfStateHeader());
-    result.shaper = fontshaper_PlaceStateHeader(result.memory, 0);
+    result.memory = allocate((FontShaperUn)font_shaper_size_of_state_header());
+    result.shaper = font_shaper_place_state_header(result.memory, 0);
     CHECK(result.shaper);
     for (unsigned i = 0; i < font_count; ++i)
-        CHECK(fontshaper_ShapePushFont(result.shaper, &fonts[i].font) == &fonts[i].font);
-    result.destination = allocate(fontshaper_SizeOfGlyphStorage(GLYPH_CAPACITY));
+        CHECK(font_shaper_shape_push_font(result.shaper, &fonts[i].font) == &fonts[i].font);
+    result.destination = allocate(font_shaper_size_of_glyph_storage(GLYPH_CAPACITY));
     if (cache_size) {
         result.cache = allocate(cache_size);
-        CHECK(fontshaper_SetStateCache(result.shaper, result.cache, cache_size));
+        CHECK(font_shaper_set_state_cache(result.shaper, result.cache, cache_size));
     }
     resize_scratch(&result, FONTSHAPER_LANGUAGE_DONT_KNOW);
     return result;
@@ -135,59 +135,59 @@ static void free_test_state(TestState* shaper) {
 }
 
 static Result finish(TestState* state) {
-    fontshaper_state* shaper = state->shaper;
-    fontshaper_ShapeEnd(shaper);
-    CHECK(fontshaper_ShapeError(shaper) == FONTSHAPER_SHAPE_ERROR_NONE);
+    FontShaperState* shaper = state->shaper;
+    font_shaper_shape_end(shaper);
+    CHECK(font_shaper_shape_error(shaper) == FONTSHAPER_SHAPE_ERROR_NONE);
     Result result = {0};
-    fontshaper_run run;
-    while (fontshaper_ShapeRun(shaper, &run)) {
-        fontshaper_glyph* glyph;
-        while (fontshaper_GlyphIteratorNext(&run.Glyphs, &glyph)) {
+    FontShaperRun run;
+    while (font_shaper_shape_run(shaper, &run)) {
+        FontShaperGlyph* glyph;
+        while (font_shaper_glyph_iterator_next(&run.glyphs, &glyph)) {
             CHECK(result.count < GLYPH_CAPACITY);
-            fontshaper_shape_codepoint input;
-            CHECK(fontshaper_ShapeGetShapeCodepoint(shaper, glyph->UserIdOrCodepointIndex, &input));
+            FontShaperShapeCodepoint input;
+            CHECK(font_shaper_shape_get_shape_codepoint(shaper, glyph->user_id_or_codepoint_index, &input));
             result.glyphs[result.count++] = (Glyph){
-                .font = run.Font, .id = glyph->Id, .codepoint = (int)glyph->Codepoint,
-                .source = glyph->UserIdOrCodepointIndex, .user_id = input.UserId,
-                .advance_x = glyph->AdvanceX, .advance_y = glyph->AdvanceY,
-                .offset_x = glyph->OffsetX, .offset_y = glyph->OffsetY,
-                .direction = run.Direction, .paragraph_direction = run.ParagraphDirection,
+                .font = run.font, .id = glyph->id, .codepoint = (int)glyph->codepoint,
+                .source = glyph->user_id_or_codepoint_index, .user_id = input.user_id,
+                .advance_x = glyph->advance_x, .advance_y = glyph->advance_y,
+                .offset_x = glyph->offset_x, .offset_y = glyph->offset_y,
+                .direction = run.direction, .paragraph_direction = run.paragraph_direction,
             };
         }
     }
-    CHECK(fontshaper_ShapeError(shaper) == FONTSHAPER_SHAPE_ERROR_NONE);
+    CHECK(font_shaper_shape_error(shaper) == FONTSHAPER_SHAPE_ERROR_NONE);
     /* Destroy the just-used transient data and alternate backing buffers. Cached
      * keys/configs must not point at either paragraph scratch allocation. */
-    CHECK(shaper->PassMemory.Capacity == state->scratch_size);
-    CHECK(shaper->PassMemory.Used <= state->scratch_size);
-    memset(shaper->PassMemory.Data, 0xa5, (size_t)shaper->PassMemory.Used);
+    CHECK(shaper->pass_memory.capacity == state->scratch_size);
+    CHECK(shaper->pass_memory.used <= state->scratch_size);
+    memset(shaper->pass_memory.data, 0xa5, (size_t)shaper->pass_memory.used);
     return result;
 }
 
-static Result shape(TestState* state, const char* text, fontshaper_language language,
-                    fontshaper_feature_override* features, unsigned feature_count) {
-    fontshaper_state* shaper = state->shaper;
+static Result shape(TestState* state, const char* text, FontShaperLanguage language,
+                    FontShaperFeatureOverride* features, unsigned feature_count) {
+    FontShaperState* shaper = state->shaper;
     for (unsigned i = 0; i < feature_count; ++i)
-        fontshaper_ShapePushFeature(shaper, features[i].Tag, features[i].Value);
+        font_shaper_shape_push_feature(shaper, features[i].tag, features[i].value);
     resize_scratch(state, language);
-    fontshaper_ShapeBeginWithMemory(shaper, FONTSHAPER_DIRECTION_DONT_KNOW, language,
+    font_shaper_shape_begin_with_memory(shaper, FONTSHAPER_DIRECTION_DONT_KNOW, language,
                          state->destination, state->scratch[state->pass++ & 1], state->input_capacity, state->glyph_capacity);
-    fontshaper_ShapeUtf8(shaper, text, (int)strlen(text), FONTSHAPER_USER_ID_GENERATION_MODE_SOURCE_INDEX);
+    font_shaper_shape_utf8(shaper, text, (int)strlen(text), FONTSHAPER_USER_ID_GENERATION_MODE_SOURCE_INDEX);
     Result result = finish(state);
     for (unsigned i = feature_count; i > 0; --i)
-        CHECK(fontshaper_ShapePopFeature(shaper, features[i - 1].Tag));
+        CHECK(font_shaper_shape_pop_feature(shaper, features[i - 1].tag));
     return result;
 }
 
 static Result mixed_styles(TestState* state) {
-    fontshaper_state* shaper = state->shaper;
-    fontshaper_ShapeBeginWithMemory(shaper, FONTSHAPER_DIRECTION_LTR, 0, state->destination,
+    FontShaperState* shaper = state->shaper;
+    font_shaper_shape_begin_with_memory(shaper, FONTSHAPER_DIRECTION_LTR, 0, state->destination,
                          state->scratch[state->pass++ & 1], INPUT_CAPACITY, GLYPH_CAPACITY);
     for (unsigned span = 0; span < 4; ++span) {
-        fontshaper_ShapePushFeature(shaper, FONTSHAPER_FEATURE_TAG_liga, (int)(span & 1));
-        fontshaper_ShapeUtf8(shaper, "office fi AV ", 13, FONTSHAPER_USER_ID_GENERATION_MODE_CODEPOINT_INDEX);
-        CHECK(fontshaper_ShapePopFeature(shaper, FONTSHAPER_FEATURE_TAG_liga));
-        fontshaper_ShapeManualBreak(shaper);
+        font_shaper_shape_push_feature(shaper, FONTSHAPER_FEATURE_TAG_liga, (int)(span & 1));
+        font_shaper_shape_utf8(shaper, "office fi AV ", 13, FONTSHAPER_USER_ID_GENERATION_MODE_CODEPOINT_INDEX);
+        CHECK(font_shaper_shape_pop_feature(shaper, FONTSHAPER_FEATURE_TAG_liga));
+        font_shaper_shape_manual_break(shaper);
     }
     return finish(state);
 }
@@ -206,7 +206,7 @@ static void same_result(const Result* left, const Result* right) {
 }
 
 static void compare(TestState* cached, TestState* reference, const char* text,
-                    fontshaper_language language, fontshaper_feature_override* features, unsigned count) {
+                    FontShaperLanguage language, FontShaperFeatureOverride* features, unsigned count) {
     Result actual = shape(cached, text, language, features, count);
     Result expected = shape(reference, text, language, features, count);
     same_result(&actual, &expected);
@@ -215,26 +215,26 @@ static void compare(TestState* cached, TestState* reference, const char* text,
 static void configurations(TestFont* fonts) {
     TestState cached = make_test_state(fonts, 1, CACHE_BYTES);
     TestState reference = make_test_state(fonts, 1, 0);
-    fontshaper_feature_override off[] = {{FONTSHAPER_FEATURE_TAG_liga, 0}, {FONTSHAPER_FEATURE_TAG_kern, 1}};
-    fontshaper_feature_override reordered[] = {{FONTSHAPER_FEATURE_TAG_kern, 1}, {FONTSHAPER_FEATURE_TAG_liga, 0}};
-    fontshaper_feature_override on[] = {{FONTSHAPER_FEATURE_TAG_liga, 1}, {FONTSHAPER_FEATURE_TAG_kern, 0}};
-    fontshaper_feature_override last_wins[] = {{FONTSHAPER_FEATURE_TAG_liga, 1},
+    FontShaperFeatureOverride off[] = {{FONTSHAPER_FEATURE_TAG_liga, 0}, {FONTSHAPER_FEATURE_TAG_kern, 1}};
+    FontShaperFeatureOverride reordered[] = {{FONTSHAPER_FEATURE_TAG_kern, 1}, {FONTSHAPER_FEATURE_TAG_liga, 0}};
+    FontShaperFeatureOverride on[] = {{FONTSHAPER_FEATURE_TAG_liga, 1}, {FONTSHAPER_FEATURE_TAG_kern, 0}};
+    FontShaperFeatureOverride last_wins[] = {{FONTSHAPER_FEATURE_TAG_liga, 1},
         {FONTSHAPER_FEATURE_TAG_kern, 1}, {FONTSHAPER_FEATURE_TAG_liga, 0}};
-    fontshaper_feature_override nonbinary[] = {{FONTSHAPER_FEATURE_TAG_salt, 2}};
+    FontShaperFeatureOverride nonbinary[] = {{FONTSHAPER_FEATURE_TAG_salt, 2}};
     const char* text = "The efficient office staff finished fifty files. AV To fi ffi.";
     compare(&cached, &reference, text, 0, off, 2);
-    fontshaper_un used = cached.shaper->CacheMemory.Used;
-    fontshaper_shape_config* shape_config = cached.shaper->PreparedShapeConfig;
-    fontshaper_glyph_config* glyph_config = cached.shaper->PreparedGlyphConfig;
+    FontShaperUn used = cached.shaper->cache_memory.used;
+    FontShaperShapeConfig* shape_config = cached.shaper->prepared_shape_config;
+    FontShaperGlyphConfig* glyph_config = cached.shaper->prepared_glyph_config;
     CHECK(shape_config && glyph_config);
     compare(&cached, &reference, text, 0, reordered, 2);
-    CHECK(cached.shaper->CacheMemory.Used == used);
-    CHECK(cached.shaper->PreparedShapeConfig == shape_config);
-    CHECK(cached.shaper->PreparedGlyphConfig == glyph_config);
+    CHECK(cached.shaper->cache_memory.used == used);
+    CHECK(cached.shaper->prepared_shape_config == shape_config);
+    CHECK(cached.shaper->prepared_glyph_config == glyph_config);
     compare(&cached, &reference, text, 0, last_wins, 3);
-    CHECK(cached.shaper->CacheMemory.Used == used);
+    CHECK(cached.shaper->cache_memory.used == used);
     compare(&cached, &reference, text, 0, on, 2);
-    CHECK(cached.shaper->PreparedGlyphConfig != glyph_config);
+    CHECK(cached.shaper->prepared_glyph_config != glyph_config);
     compare(&cached, &reference, text, 0, nonbinary, 1);
     compare(&cached, &reference, text, FONTSHAPER_FOURCC('T', 'R', 'K', ' '), NULL, 0);
     compare(&cached, &reference, "Cafe\xcc\x81, na\xc3\xafve, AV fi.", 0, NULL, 0);
@@ -248,39 +248,39 @@ static void configurations(TestFont* fonts) {
     Result styled_reference = mixed_styles(&reference);
     same_result(&styled, &styled_reference);
     for (unsigned i = 0; i < 40; ++i) {
-        fontshaper_feature_override value = {FONTSHAPER_FEATURE_TAG_salt, (int)i + 10};
+        FontShaperFeatureOverride value = {FONTSHAPER_FEATURE_TAG_salt, (int)i + 10};
         compare(&cached, &reference, text, 0, &value, 1);
     }
-    used = cached.shaper->CacheMemory.Used;
+    used = cached.shaper->cache_memory.used;
     for (unsigned i = 0; i < 40; ++i) {
-        fontshaper_feature_override value = {FONTSHAPER_FEATURE_TAG_salt, (int)i + 10};
+        FontShaperFeatureOverride value = {FONTSHAPER_FEATURE_TAG_salt, (int)i + 10};
         compare(&cached, &reference, text, 0, &value, 1);
-        CHECK(cached.shaper->CacheMemory.Used == used);
+        CHECK(cached.shaper->cache_memory.used == used);
     }
     cached.input_capacity = 128;
     cached.glyph_capacity = 256;
     compare(&cached, &reference, text, 0, reordered, 2);
-    CHECK(cached.shaper->CachedCodepointCapacity == 128 && cached.shaper->CachedGlyphCapacity == 256);
-    CHECK(cached.shaper->CacheMemory.Used == used);
+    CHECK(cached.shaper->cached_codepoint_capacity == 128 && cached.shaper->cached_glyph_capacity == 256);
+    CHECK(cached.shaper->cache_memory.used == used);
     cached.input_capacity = INPUT_CAPACITY;
     cached.glyph_capacity = GLYPH_CAPACITY;
     for (unsigned i = 0; i < 100; ++i) {
         compare(&cached, &reference, text, 0, reordered, 2);
-        CHECK(cached.shaper->CacheMemory.Used == used);
+        CHECK(cached.shaper->cache_memory.used == used);
     }
-    fontshaper_un small = cached.scratch_size;
-    CHECK(fontshaper_SetStateCache(cached.shaper, NULL, 0));
-    CHECK(!cached.shaper->CachedScratchSize);
+    FontShaperUn small = cached.scratch_size;
+    CHECK(font_shaper_set_state_cache(cached.shaper, NULL, 0));
+    CHECK(!cached.shaper->cached_scratch_size);
     compare(&cached, &reference, text, 0, off, 2);
     CHECK(cached.scratch_size == reference.scratch_size && cached.scratch_size > small);
-    CHECK(fontshaper_SetStateCache(cached.shaper, cached.cache, CACHE_BYTES));
-    CHECK(!cached.shaper->CachedScratchSize);
+    CHECK(font_shaper_set_state_cache(cached.shaper, cached.cache, CACHE_BYTES));
+    CHECK(!cached.shaper->cached_scratch_size);
     compare(&cached, &reference, text, 0, off, 2);
     CHECK(cached.scratch_size == small);
-    CHECK(!fontshaper_SetStateCache(cached.shaper, NULL, 1));
-    CHECK(!fontshaper_SetStateCache(cached.shaper, cached.cache, 0));
-    CHECK(fontshaper_SetStateCache(cached.shaper, (char*)cached.cache + 1, CACHE_BYTES - 1));
-    CHECK(!cached.shaper->CachedScratchSize);
+    CHECK(!font_shaper_set_state_cache(cached.shaper, NULL, 1));
+    CHECK(!font_shaper_set_state_cache(cached.shaper, cached.cache, 0));
+    CHECK(font_shaper_set_state_cache(cached.shaper, (char*)cached.cache + 1, CACHE_BYTES - 1));
+    CHECK(!cached.shaper->cached_scratch_size);
     compare(&cached, &reference, text, 0, on, 2);
     CHECK(cached.scratch_size == small);
     free_test_state(&reference);
@@ -289,74 +289,74 @@ static void configurations(TestFont* fonts) {
 
 static void bounds_and_fonts(TestFont* fonts) {
     TestState state = make_test_state(fonts, 1, CACHE_BYTES);
-    fontshaper_state* shaper = state.shaper;
-    fontshaper_un original = shaper->CachedScratchSize;
+    FontShaperState* shaper = state.shaper;
+    FontShaperUn original = shaper->cached_scratch_size;
     CHECK(original == state.scratch_size);
-    CHECK(fontshaper_SizeOfStateScratch(shaper, 0, INPUT_CAPACITY, GLYPH_CAPACITY) == original);
-    CHECK(fontshaper_SizeOfStateScratch(shaper, 0, INPUT_CAPACITY + 1, GLYPH_CAPACITY));
-    CHECK(shaper->CachedCodepointCapacity == INPUT_CAPACITY + 1);
-    CHECK(fontshaper_SizeOfStateScratch(shaper, 0, INPUT_CAPACITY, GLYPH_CAPACITY + 1));
-    CHECK(shaper->CachedGlyphCapacity == GLYPH_CAPACITY + 1);
-    fontshaper_language language = FONTSHAPER_FOURCC('T', 'R', 'K', ' ');
-    CHECK(fontshaper_SizeOfStateScratch(shaper, language, INPUT_CAPACITY, GLYPH_CAPACITY));
-    CHECK(shaper->CachedScratchLanguage == language);
-    CHECK(!fontshaper_SizeOfStateScratch(shaper, 0, (fontshaper_un)1 << 27, GLYPH_CAPACITY));
-    CHECK(!fontshaper_SizeOfStateScratch(shaper, 0, INPUT_CAPACITY, (fontshaper_un)-1));
+    CHECK(font_shaper_size_of_state_scratch(shaper, 0, INPUT_CAPACITY, GLYPH_CAPACITY) == original);
+    CHECK(font_shaper_size_of_state_scratch(shaper, 0, INPUT_CAPACITY + 1, GLYPH_CAPACITY));
+    CHECK(shaper->cached_codepoint_capacity == INPUT_CAPACITY + 1);
+    CHECK(font_shaper_size_of_state_scratch(shaper, 0, INPUT_CAPACITY, GLYPH_CAPACITY + 1));
+    CHECK(shaper->cached_glyph_capacity == GLYPH_CAPACITY + 1);
+    FontShaperLanguage language = FONTSHAPER_FOURCC('T', 'R', 'K', ' ');
+    CHECK(font_shaper_size_of_state_scratch(shaper, language, INPUT_CAPACITY, GLYPH_CAPACITY));
+    CHECK(shaper->cached_scratch_language == language);
+    CHECK(!font_shaper_size_of_state_scratch(shaper, 0, (FontShaperUn)1 << 27, GLYPH_CAPACITY));
+    CHECK(!font_shaper_size_of_state_scratch(shaper, 0, INPUT_CAPACITY, (FontShaperUn)-1));
     Result before = shape(&state, "office AV", 0, NULL, 0);
-    CHECK(shaper->CacheMemory.Used);
-    CHECK(fontshaper_ShapePushFont(shaper, &fonts[0].font));
-    CHECK(!shaper->CachedScratchSize && shaper->ConfigCacheDirty);
-    CHECK(fontshaper_ShapePopFont(shaper) == &fonts[0].font);
-    CHECK(!shaper->CachedScratchSize);
+    CHECK(shaper->cache_memory.used);
+    CHECK(font_shaper_shape_push_font(shaper, &fonts[0].font));
+    CHECK(!shaper->cached_scratch_size && shaper->config_cache_dirty);
+    CHECK(font_shaper_shape_pop_font(shaper) == &fonts[0].font);
+    CHECK(!shaper->cached_scratch_size);
     Result after = shape(&state, "office AV", 0, NULL, 0);
     same_result(&before, &after);
-    CHECK(!shaper->ConfigCacheDirty);
-    CHECK(fontshaper_ShapePushFont(shaper, &fonts[1].font));
+    CHECK(!shaper->config_cache_dirty);
+    CHECK(font_shaper_shape_push_font(shaper, &fonts[1].font));
     Result arabic = shape(&state, "مرحبا بالعالم", 0, NULL, 0);
     CHECK(arabic.count);
     for (unsigned i = 0; i < arabic.count; ++i) CHECK(arabic.glyphs[i].font == &fonts[1].font);
-    CHECK(fontshaper_ShapePopFont(shaper) == &fonts[1].font);
+    CHECK(font_shaper_shape_pop_font(shaper) == &fonts[1].font);
     after = shape(&state, "office AV", 0, NULL, 0);
     same_result(&before, &after);
-    fontshaper_font invalid = {0};
-    CHECK(fontshaper_ShapePushFont(shaper, &invalid) == &invalid);
-    CHECK(!fontshaper_SizeOfStateScratch(shaper, 0, INPUT_CAPACITY, GLYPH_CAPACITY));
-    CHECK(fontshaper_ShapePopFont(shaper) == &invalid);
-    CHECK(fontshaper_SizeOfStateScratch(shaper, 0, INPUT_CAPACITY, GLYPH_CAPACITY) == original);
-    fontshaper_un exact_size = shaper->CacheMemory.Used;
+    FontShaperFont invalid = {0};
+    CHECK(font_shaper_shape_push_font(shaper, &invalid) == &invalid);
+    CHECK(!font_shaper_size_of_state_scratch(shaper, 0, INPUT_CAPACITY, GLYPH_CAPACITY));
+    CHECK(font_shaper_shape_pop_font(shaper) == &invalid);
+    CHECK(font_shaper_size_of_state_scratch(shaper, 0, INPUT_CAPACITY, GLYPH_CAPACITY) == original);
+    FontShaperUn exact_size = shaper->cache_memory.used;
     void* exact = allocate(exact_size);
-    CHECK(fontshaper_SetStateCache(shaper, exact, exact_size));
+    CHECK(font_shaper_set_state_cache(shaper, exact, exact_size));
     after = shape(&state, "office AV", 0, NULL, 0);
     same_result(&before, &after);
-    CHECK(shaper->CacheMemory.Used == exact_size);
-    fontshaper_ShapePushFeature(shaper, FONTSHAPER_FEATURE_TAG_liga, 0);
-    fontshaper_ShapeBeginWithMemory(shaper, FONTSHAPER_DIRECTION_LTR, 0, state.destination,
+    CHECK(shaper->cache_memory.used == exact_size);
+    font_shaper_shape_push_feature(shaper, FONTSHAPER_FEATURE_TAG_liga, 0);
+    font_shaper_shape_begin_with_memory(shaper, FONTSHAPER_DIRECTION_LTR, 0, state.destination,
                          state.scratch[0], INPUT_CAPACITY, GLYPH_CAPACITY);
-    fontshaper_ShapeUtf8(shaper, "office", 6, FONTSHAPER_USER_ID_GENERATION_MODE_SOURCE_INDEX);
-    fontshaper_ShapeEnd(shaper);
-    CHECK(fontshaper_ShapeError(shaper) == FONTSHAPER_SHAPE_ERROR_OUT_OF_MEMORY);
-    CHECK(shaper->CacheMemory.Used <= exact_size);
+    font_shaper_shape_utf8(shaper, "office", 6, FONTSHAPER_USER_ID_GENERATION_MODE_SOURCE_INDEX);
+    font_shaper_shape_end(shaper);
+    CHECK(font_shaper_shape_error(shaper) == FONTSHAPER_SHAPE_ERROR_OUT_OF_MEMORY);
+    CHECK(shaper->cache_memory.used <= exact_size);
     free(exact);
     free_test_state(&state);
 
     TestState tiny = make_test_state(fonts, 1, 1);
-    fontshaper_ShapeBeginWithMemory(tiny.shaper, FONTSHAPER_DIRECTION_LTR, 0, tiny.destination,
+    font_shaper_shape_begin_with_memory(tiny.shaper, FONTSHAPER_DIRECTION_LTR, 0, tiny.destination,
                          tiny.scratch[0], INPUT_CAPACITY, GLYPH_CAPACITY);
-    fontshaper_ShapeUtf8(tiny.shaper, "office", 6, FONTSHAPER_USER_ID_GENERATION_MODE_SOURCE_INDEX);
-    fontshaper_ShapeEnd(tiny.shaper);
-    CHECK(fontshaper_ShapeError(tiny.shaper) == FONTSHAPER_SHAPE_ERROR_OUT_OF_MEMORY);
-    fontshaper_run run;
-    CHECK(!fontshaper_ShapeRun(tiny.shaper, &run));
-    CHECK(!fontshaper_SetStateCache(tiny.shaper, NULL, 0));
+    font_shaper_shape_utf8(tiny.shaper, "office", 6, FONTSHAPER_USER_ID_GENERATION_MODE_SOURCE_INDEX);
+    font_shaper_shape_end(tiny.shaper);
+    CHECK(font_shaper_shape_error(tiny.shaper) == FONTSHAPER_SHAPE_ERROR_OUT_OF_MEMORY);
+    FontShaperRun run;
+    CHECK(!font_shaper_shape_run(tiny.shaper, &run));
+    CHECK(!font_shaper_set_state_cache(tiny.shaper, NULL, 0));
     free_test_state(&tiny);
 
     TestState limited = make_test_state(fonts, 1, CACHE_BYTES);
-    fontshaper_ShapeBeginWithMemory(limited.shaper, FONTSHAPER_DIRECTION_LTR, 0, limited.destination,
+    font_shaper_shape_begin_with_memory(limited.shaper, FONTSHAPER_DIRECTION_LTR, 0, limited.destination,
                          limited.scratch[0], INPUT_CAPACITY, 1);
-    fontshaper_ShapeUtf8(limited.shaper, "AV", 2, FONTSHAPER_USER_ID_GENERATION_MODE_SOURCE_INDEX);
-    fontshaper_ShapeEnd(limited.shaper);
-    while (fontshaper_ShapeRun(limited.shaper, &run)) {}
-    CHECK(fontshaper_ShapeError(limited.shaper) == FONTSHAPER_SHAPE_ERROR_OUT_OF_MEMORY);
+    font_shaper_shape_utf8(limited.shaper, "AV", 2, FONTSHAPER_USER_ID_GENERATION_MODE_SOURCE_INDEX);
+    font_shaper_shape_end(limited.shaper);
+    while (font_shaper_shape_run(limited.shaper, &run)) {}
+    CHECK(font_shaper_shape_error(limited.shaper) == FONTSHAPER_SHAPE_ERROR_OUT_OF_MEMORY);
     free_test_state(&limited);
 }
 
@@ -370,10 +370,10 @@ static void multilingual(TestFont* fonts) {
         "Latin ثم العربية ثم Latin. देवनागरी and office.",
     };
     for (unsigned i = 0; i < 4; ++i) compare(&cached, &reference, paragraphs[i], 0, NULL, 0);
-    fontshaper_un used = cached.shaper->CacheMemory.Used;
+    FontShaperUn used = cached.shaper->cache_memory.used;
     for (unsigned repeat = 0; repeat < 10; ++repeat) {
         for (unsigned i = 0; i < 4; ++i) compare(&cached, &reference, paragraphs[i], 0, NULL, 0);
-        CHECK(cached.shaper->CacheMemory.Used == used);
+        CHECK(cached.shaper->cache_memory.used == used);
     }
     free_test_state(&reference);
     free_test_state(&cached);

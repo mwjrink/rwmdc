@@ -38,11 +38,16 @@ typedef struct ListMarkerCache {
 } ListMarkerCache;
 
 typedef struct Editor {
-    Document    document;
-    DocumentWal wal;
-    MdState     md;
+    Document        document;
+    DocumentWal     wal;
+    MdState         md;
+    // TODO this type name is bad
+    FontShaperState fs_state;
 
     ListMarkerCache markers;
+
+    TTFont* fonts;
+    u32     font_count;
 
     Vec2 scroll;
 
@@ -62,33 +67,17 @@ typedef struct Editor {
 //     u32        dirty;
 // } EditorUiState;
 
-internal u32 font_shape_run(rop(rw TTFont) font,
-                            rop(ro i32) codepoints,
-                            u32 codepoint_count,
-                            rop(rw ShapedGlyph) glyphs) {
-    fontshaper_ResetGlyphStorage(&font->glyph_storage);
-    for (u32 index = 0; index < codepoint_count; index++)
-        fontshaper_PushGlyph(&font->glyph_storage, &font->shaper, codepoints[index], NULL, (int)index);
-
-    fontshaper_glyph_iterator iterator;
-    fontshaper_shape_error    shape_error =
-        fontshaper_ShapeDirect(font->shape_scratchpad, &font->glyph_storage, FONTSHAPER_DIRECTION_LTR, &iterator);
-    assert(SCOPE_EDITOR, shape_error == FONTSHAPER_SHAPE_ERROR_NONE);
-
-    u32 count = 0;
-
-    fontshaper_glyph* glyph;
-    while (fontshaper_GlyphIteratorNext(&iterator, &glyph)) {
-        ShapedGlyph* out = &glyphs[count++];
-
-        out->id       = glyph->Id;
-        out->advance  = (f32)glyph->AdvanceX;
-        out->offset_x = (f32)glyph->OffsetX;
-        out->offset_y = (f32)glyph->OffsetY;
-    }
-
-    return count;
-}
+// clang-format off
+#define glyph_draw_cmd(record, font, x, y, scale, palette_idx)                               \
+                (GlyphDrawCmd){                                                              \
+                    .x         = x + (f32)record->glyph.offset_x * scale,                    \
+                    .y         = y + (font->ascent + (f32)record->glyph.offset_y) * scale,   \
+                    .sx        = scale,                                                      \
+                    .sy        = -scale,                                                     \
+                    .glyph_idx = record->glyph.glyph_id,                                     \
+                    .color_idx = palette_idx,                                                \
+                }
+// clang-format on
 
 internal Editor editor_create(
     rop(rw Arena) arena, rop(rw ScratchArena) scratch, rop(rw TTFont) font, ro AppSettings settings, Str path) {
@@ -104,11 +93,30 @@ internal Editor editor_create(
     }
 
     editor.document = document_load(arena, settings, editor.path, 0);
+    // TODO ensure/enforce this as constant memory. this should be owned by editor
+    // TODO fallback fonts
+    editor.fonts    = font;
+
+    FontShaperFont*     fonts[]    = {&font->shaper};
+    FontShaperStateInfo shape_info = {
+        .fonts              = fonts,
+        .font_count         = 1,
+        .codepoint_capacity = 256 * 1024,
+        .glyph_capacity     = 256 * 1024,
+        .cache_size         = MB(8),
+    };
+    usize shape_buffer_size = font_shaper_size_of_state(&shape_info);
+    assert(SCOPE_EDITOR, shape_buffer_size > 0);
+    u8* shape_buffer = arena_alloc_aligned(arena, u8, shape_buffer_size);
+    editor.fs_state  = font_shaper_create_state(shape_buffer, shape_buffer_size, &shape_info);
+    assert(SCOPE_EDITOR, font_shaper_shape_error(&editor.fs_state) == FONTSHAPER_SHAPE_ERROR_NONE);
+
+    // TODO eagerly shape & cache the unchanging ui like the file path
 
     // Eagerly shape the fixed list markers once.
     {
         i32 bullet[1]               = {0x2022};
-        editor.markers.bullet_count = font_shape_run(font, bullet, 1, editor.markers.bullet_glyphs);
+        editor.markers.bullet_count = editor_font_shape(font, bullet, 1, editor.markers.bullet_glyphs);
 
         i32 task_unchecked[3] = {'[', ' ', ']'};
         editor.markers.task_unchecked_count =
@@ -116,6 +124,7 @@ internal Editor editor_create(
 
         i32 task_checked[3]               = {'[', 'x', ']'};
         editor.markers.task_checked_count = font_shape_run(font, task_checked, 3, editor.markers.task_checked_glyphs);
+        // TODO use something like nerdfont: ''
 
         i32         space[1] = {' '};
         ShapedGlyph space_glyph[1];
@@ -170,42 +179,6 @@ enum {
     STYLE_LINK   = 8,
 };
 
-internal force_inline(f32) output_glyphs_reverse(
-    rop(rw DrawLayer) layer, rop(ro ShapedGlyph) glyphs, u32 glyphs_count, f32 scale, f32 x, f32 y, u32 color_idx) {
-    for (u32 idx = glyphs_count; idx > 0; idx--) {
-        const ShapedGlyph* glyph = &glyphs[idx - 1];
-        x -= glyph->advance * scale;
-        layer->glyphs[layer->glyph_count] = (GlyphDrawCmd){
-            .x         = x + glyph->offset_x * scale,
-            .y         = y + glyph->offset_y * scale,
-            .sx        = scale,
-            .sy        = -scale,
-            .glyph_idx = glyph->id,
-            .color_idx = color_idx,
-        };
-        layer->glyph_count += 1;
-    }
-    return x;
-}
-
-internal force_inline(f32) output_glyphs(
-    rop(rw DrawLayer) layer, rop(ro ShapedGlyph) glyphs, u32 glyphs_count, f32 scale, f32 x, f32 y, u32 color_idx) {
-    for (u32 idx = 0; idx < glyphs_count; idx++) {
-        const ShapedGlyph* glyph = &glyphs[idx];
-        x += glyph->advance * scale;
-        layer->glyphs[layer->glyph_count] = (GlyphDrawCmd){
-            .x         = x + glyph->offset_x * scale,
-            .y         = y + glyph->offset_y * scale,
-            .sx        = scale,
-            .sy        = -scale,
-            .glyph_idx = glyph->id,
-            .color_idx = color_idx,
-        };
-        layer->glyph_count += 1;
-    }
-    return x;
-}
-
 // for rendering ui: status line ui at the bottom.
 DrawLayer editor_get_ui_layer(rop(rw Editor) editor,
                               rop(rw Arena) arena,
@@ -217,7 +190,7 @@ DrawLayer editor_get_ui_layer(rop(rw Editor) editor,
                               u32 height) {
     u64 editor_layer_profiling_time = time_start();
 
-    // 1. Anchor at the byte under scroll.y (linear estimate for now), then
+    // 1. anchor at the byte under scroll.y (linear estimate for now), then
     //    walk md blocks backward and forward until the viewport is covered.
     DocumentStats doc_stats = document_get_stats(&editor->document);
 
@@ -229,25 +202,58 @@ DrawLayer editor_get_ui_layer(rop(rw Editor) editor,
     layer.glyphs    = arena_alloc_aligned(arena, GlyphDrawCmd, max(doc_stats.length, 1));
     layer.rects     = arena_alloc_aligned(arena, GpuRect, max(10, 1)); // TODO real number not 10
 
-    f32 x = MARGIN;
-
-    u32 glyph_idx = 0;
-    u32 rect_idx  = 0;
-
-    layer.rects[rect_idx] = (GpuRect){
+    layer.rects[layer.rect_count] = (GpuRect){
         .x      = 0,
-        .y      = height,
-        .width  = width,
-        .height = font_height + 8,
+        .y      = (f32)height - (MARGIN * 2 + editor->fonts->line_height),
+        .width  = (f32)width,
+        .height = MARGIN * 2 + editor->fonts->line_height,
 
-        .color_idx = 0,
-        .flags     = 0,
+        .color_idx = theme_idx(ui_footer_bg),
+        .flags     = RECT_DRAW_CMD_FLAG_IGNORE_SCROLL,
     };
-    rect_idx += 1;
+    layer.rect_count += 1;
 
-    rop(rw ShapedGlyph) shaped_glyphs = scratch_alloc_aligned(scratch, ShapedGlyph, editor->path.len);
-    u32 glyph_count                   = font_shape_run(font, cp, cp_count, shaped_glyphs);
-    output_glyphs();
+    f32 x     = MARGIN;
+    f32 y     = (f32)height - MARGIN - editor->fonts->line_height;
+    f32 scale = base_scale;
+
+    u32 count = font_shaper_shape(&editor->fs_state, editor->path.data, editor->path.len, (FontShaperShapeOptions){0});
+    assert(SCOPE_EDITOR, font_shaper_shape_error(&editor->fs_state) == FONTSHAPER_SHAPE_ERROR_NONE);
+    assert(SCOPE_EDITOR, (u64)layer.glyph_count + count <= max(doc_stats.length, 1));
+
+    const FontShaperRecord* record    = font_shaper_next(&editor->fs_state);
+    u32                     color_idx = theme_idx(font_fg);
+    while (record != 0) {
+        switch (record->kind) {
+            case FONTSHAPER_RECORD_RUN:
+                // Select font, script, and run direction.
+                // TODO right now we just assume LTR english
+                break;
+            case FONTSHAPER_RECORD_HARD_BREAK:
+                break;
+            case FONTSHAPER_RECORD_GLYPH:
+                f32 advance = (f32)record->glyph.advance_x * scale;
+
+                if (x + advance > ((f32)width - MARGIN) / 3) {
+                    // cut it off here
+                    // TODO use ... elipse
+                    // TODO shape backwards so you see the file name which is more important
+                    goto after_path;
+                }
+
+                // TODO dedicated color for ui
+                layer.glyphs[layer.glyph_count] = glyph_draw_cmd(record, font, x, y, scale, color_idx);
+
+                layer.glyph_count += 1;
+                x += advance;
+
+                break;
+        }
+
+        record = font_shaper_next(&editor->fs_state);
+    }
+
+after_path:
 
     // UI Structure:
     // LEFT
@@ -258,85 +264,6 @@ DrawLayer editor_get_ui_layer(rop(rw Editor) editor,
     // Scroll as a percent
     // File size in bytes
     // RIGHT
-
-    // time_checkpoint(SCOPE_DEBUG, "editor_get_text_layer setup", editor_layer_profiling_time);
-    //
-    // // output one span of CONTENT (strip Markdown syntax):
-    // {
-    //     // u32 content_start = cur.start_idx + cur.content_offset;
-    //     u32 content_start = max(cur.start_idx + cur.content_offset, span_start);
-    //     u32 content_len   = min(cur.content_length, span_end - content_start);
-    //
-    //     u64 scratch_len_before = scratch->len;
-    //     u8* content_bytes      = scratch_alloc_aligned(scratch, u8, content_len);
-    //     u32 bytes_read         = document_read(&editor->document, content_start, content_len, content_bytes);
-    //
-    //     i32* codepoints = scratch_alloc_aligned(scratch, i32, bytes_read * 16);
-    //     i64  codepoint_count =
-    //         utf8proc_decompose(content_bytes, bytes_read, codepoints, bytes_read * 16, UTF8PROC_STABLE);
-    //
-    //     //   shape               codepoint[] -> glyphs (fontshaper, one run)
-    //     {
-    //
-    //         fontshaper_ResetGlyphStorage(&font->glyph_storage);
-    //         for (u32 codepoint_index = 0; codepoint_index < codepoint_count; codepoint_index++) {
-    //             fontshaper_glyph* glyph = fontshaper_PushGlyph(
-    //                 &font->glyph_storage, &font->shaper, codepoints[codepoint_index], NULL, (int)codepoint_index);
-    //             assert(SCOPE_EDITOR, glyph != NULL); // TODO proper scope + graceful failure
-    //         }
-    //
-    //         fontshaper_glyph_iterator iterator;
-    //         fontshaper_shape_error    shape_error = fontshaper_ShapeDirect(
-    //             font->shape_scratchpad, &font->glyph_storage, FONTSHAPER_DIRECTION_LTR, &iterator);
-    //         assert(SCOPE_EDITOR, shape_error == FONTSHAPER_SHAPE_ERROR_NONE);
-    //
-    //         fontshaper_glyph* glyph;
-    //
-    //         while (fontshaper_GlyphIteratorNext(&iterator, &glyph)) {
-    //             f32 advance = (f32)glyph->AdvanceX * scale;
-    //
-    //             // wrap at width on glyph boundaries (ligatures intact)
-    //             if (x + advance > (f32)width - MARGIN) {
-    //                 x = indent;
-    //                 y += font->line_height * scale;
-    //             }
-    //
-    //             // append GlyphDrawCmd
-    //             layer.glyphs[layer.glyph_count] = (GlyphDrawCmd){
-    //                 .x         = x + (f32)glyph->OffsetX * scale,
-    //                 .y         = y + (font->ascent + (f32)glyph->OffsetY) * scale,
-    //                 .sx        = scale,
-    //                 .sy        = -scale,
-    //                 .glyph_idx = glyph->Id,
-    //                 .color_idx = text_color_idx,
-    //             };
-    //
-    //             layer.glyph_count += 1;
-    //             x += advance;
-    //         }
-    //     }
-    //
-    //     //   Later: if the cursor is inside the span use span, if inside
-    //     //   content use content (for caret/caret-adjacent rendering).
-    //     //
-    //     // TODO decode + shape + wrap + append (single fontshaper run).
-    //
-    //     // TODO use checkpoints for this
-    //     memset(scratch->data + scratch_len_before, 0, scratch->len - scratch_len_before);
-    //     scratch->len = scratch_len_before;
-    // }
-    //
-    // layer.rects[layer.rect_count] = (GpuRect){
-    //     .x         = rect.x,
-    //     .y         = rect.start_y,
-    //     .width     = rect.width,
-    //     .height    = y - rect.start_y,
-    //     .color_idx = rect.color,
-    //     .flags     = 0,
-    // };
-    // layer.rect_count += 1;
-    //
-    // time_checkpoint(SCOPE_DEBUG, "editor_get_text_layer loop", editor_layer_profiling_time);
 
     // 5. caret + selection are rects too; add them here.
 
@@ -357,7 +284,7 @@ DrawLayer editor_get_text_layer(rop(rw Editor) editor,
                                 u32 height) {
     u64 editor_layer_profiling_time = time_start();
 
-    // 1. Anchor at the byte under scroll.y (linear estimate for now), then
+    // 1. anchor at the byte under scroll.y (linear estimate for now), then
     //    walk md blocks backward and forward until the viewport is covered.
     DocumentStats doc_stats = document_get_stats(&editor->document);
 
@@ -666,55 +593,62 @@ DrawLayer editor_get_text_layer(rop(rw Editor) editor,
                 u32 content_start = max(cur.start_idx + cur.content_offset, span_start);
                 u32 content_len   = min(cur.content_length, span_end - content_start);
 
-                u64 scratch_len_before = scratch->len;
-                u8* content_bytes      = scratch_alloc_aligned(scratch, u8, content_len);
-                u32 bytes_read         = document_read(&editor->document, content_start, content_len, content_bytes);
+                u8* content_bytes = scratch_alloc_aligned(scratch, u8, content_len);
+                u32 bytes_read    = document_read(&editor->document, content_start, content_len, content_bytes);
 
-                i32* codepoints = scratch_alloc_aligned(scratch, i32, bytes_read * 16);
-                i64  codepoint_count =
-                    utf8proc_decompose(content_bytes, bytes_read, codepoints, bytes_read * 16, UTF8PROC_STABLE);
-
-                //   shape               codepoint[] -> glyphs (fontshaper, one run)
                 {
+                    u32 count = font_shaper_shape(
+                        &editor->fs_state, (const char*)content_bytes, bytes_read, (FontShaperShapeOptions){0});
+                    assert(SCOPE_EDITOR, font_shaper_shape_error(&editor->fs_state) == FONTSHAPER_SHAPE_ERROR_NONE);
+                    assert(SCOPE_EDITOR, (u64)layer.glyph_count + count <= max(doc_stats.length, 1));
 
-                    fontshaper_ResetGlyphStorage(&font->glyph_storage);
-                    for (u32 codepoint_index = 0; codepoint_index < codepoint_count; codepoint_index++) {
-                        fontshaper_glyph* glyph = fontshaper_PushGlyph(&font->glyph_storage,
-                                                                       &font->shaper,
-                                                                       codepoints[codepoint_index],
-                                                                       NULL,
-                                                                       (int)codepoint_index);
-                        assert(SCOPE_EDITOR, glyph != NULL); // TODO proper scope + graceful failure
-                    }
+                    u32                     last_break_idx = 0;
+                    const FontShaperRecord* record         = font_shaper_next(&editor->fs_state);
+                    while (record != 0) {
+                        switch (record->kind) {
+                            case FONTSHAPER_RECORD_RUN:
+                                // Select font, script, and run direction.
+                                // TODO right now we just assume LTR english
+                                break;
+                            case FONTSHAPER_RECORD_HARD_BREAK:
+                                // Finish the line; update paragraph direction if applicable.
+                                // NOTE We are guaranteed to not have a hard break here because of markdown processing
+                                //      and the fact that we ignore everything except LF
+                                break;
+                            case FONTSHAPER_RECORD_GLYPH:
+                                // Wrap at permitted boundaries and draw.
+                                f32 advance = (f32)record->glyph.advance_x * scale;
 
-                    fontshaper_glyph_iterator iterator;
-                    fontshaper_shape_error    shape_error = fontshaper_ShapeDirect(
-                        font->shape_scratchpad, &font->glyph_storage, FONTSHAPER_DIRECTION_LTR, &iterator);
-                    assert(SCOPE_EDITOR, shape_error == FONTSHAPER_SHAPE_ERROR_NONE);
+                                // Guaranteed no line breaks
+                                if ((record->glyph.break_flags & FONTSHAPER_BREAK_FLAG_LINE_SOFT) != 0) {
+                                    last_break_idx = layer.glyph_count;
+                                }
 
-                    fontshaper_glyph* glyph;
+                                // wrap at width on glyph boundaries (ligatures intact)
+                                if (x + advance > (f32)width - MARGIN) {
+                                    f32 dx = layer.glyphs[last_break_idx].x - indent;
+                                    f32 dy = font->line_height * scale;
 
-                    while (fontshaper_GlyphIteratorNext(&iterator, &glyph)) {
-                        f32 advance = (f32)glyph->AdvanceX * scale;
+                                    for (u32 glyph_idx = last_break_idx; glyph_idx < layer.glyph_count; glyph_idx++) {
+                                        layer.glyphs[glyph_idx].x += dx;
+                                        layer.glyphs[glyph_idx].y += dy;
+                                    }
 
-                        // wrap at width on glyph boundaries (ligatures intact)
-                        if (x + advance > (f32)width - MARGIN) {
-                            x = indent;
-                            y += font->line_height * scale;
+                                    x -= dx;
+                                    y += dy;
+                                }
+
+                                // append GlyphDrawCmd
+                                layer.glyphs[layer.glyph_count] =
+                                    glyph_draw_cmd(record, font, x, y, scale, text_color_idx);
+
+                                layer.glyph_count += 1;
+                                x += advance;
+
+                                break;
                         }
 
-                        // append GlyphDrawCmd
-                        layer.glyphs[layer.glyph_count] = (GlyphDrawCmd){
-                            .x         = x + (f32)glyph->OffsetX * scale,
-                            .y         = y + (font->ascent + (f32)glyph->OffsetY) * scale,
-                            .sx        = scale,
-                            .sy        = -scale,
-                            .glyph_idx = glyph->Id,
-                            .color_idx = text_color_idx,
-                        };
-
-                        layer.glyph_count += 1;
-                        x += advance;
+                        record = font_shaper_next(&editor->fs_state);
                     }
                 }
 
@@ -723,9 +657,7 @@ DrawLayer editor_get_text_layer(rop(rw Editor) editor,
                 //
                 // TODO decode + shape + wrap + append (single fontshaper run).
 
-                // TODO use checkpoints for this
-                memset(scratch->data + scratch_len_before, 0, scratch->len - scratch_len_before);
-                scratch->len = scratch_len_before;
+                scratch_pop_to(scratch, content_bytes);
             }
 
         span_done:;

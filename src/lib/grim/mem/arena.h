@@ -1,6 +1,5 @@
 #pragma once
 
-#include <lib/grim/assert.h>
 #include <lib/grim/bp.h>
 #include <lib/grim/logger.h>
 #include <stdalign.h>
@@ -9,6 +8,8 @@
 
 // #include <unistd.h>
 #include <errno.h>
+
+#include <lib/grim/assert.h>
 
 // #define ARENA_VCAP TB(1)
 #define ARENA_VCAP GB(1)

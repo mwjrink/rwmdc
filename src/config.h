@@ -26,6 +26,7 @@ typedef enum ConfigFindBinding {
 typedef struct {
     // Structural
     Vec4 window_bg;
+    Vec4 ui_footer_bg;
     Vec4 selection_bg;
     Vec4 cursor;
 
@@ -76,7 +77,7 @@ typedef struct {
     Vec4 admonition_warning_fg;
     Vec4 admonition_caution_fg;
 } Theme;
-STATIC_ASSERT(sizeof(Theme) == 672);
+STATIC_ASSERT(sizeof(Theme) == 688);
 #define theme_idx(color) (offsetof(Theme, color) / sizeof(Vec4))
 
 typedef struct {
@@ -111,7 +112,7 @@ typedef struct {
     AppSettings settings;
     Str         font_path;
 } ConfigParseResult;
-STATIC_ASSERT(sizeof(ConfigParseResult) == 720);
+STATIC_ASSERT(sizeof(ConfigParseResult) == 736);
 
 typedef struct {
     char* data;
@@ -160,6 +161,7 @@ internal AppSettings config_settings_default() {
 internal Theme config_theme_default() {
     return (Theme){
         .window_bg    = bytes_to_vec4_color(24, 24, 37, 255),               // Custom #181825
+        .ui_footer_bg = bytes_to_vec4_color(49, 50, 68, 255),               // Surface 0
         .selection_bg = bytes_to_vec4_color(88, 91, 112, 128),              // Surface 2
         .cursor       = bytes_to_vec4_color(245, 224, 220, 255),            // Rosewater
 

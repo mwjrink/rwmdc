@@ -104,8 +104,7 @@ typedef struct {
     f32 line_gap;
     f32 line_height;
 
-    fontshaper_font shaper; // compiled shaping font, owned for the font's lifetime
-
+    FontShaperFont shaper; // compiled shaping font, owned for the font's lifetime
 } TTFont;
 
 internal u32 tt_read_u32(rop(rw TTCursor) file) {
@@ -564,10 +563,10 @@ TTFont font_load(rop(rw Arena) arena, rop(rw ScratchArena) scratch, const char* 
         // TODO checkpoints instead
         u64 scratch_len_before = scratch->len;
         {
-            fontshaper_load_font_state state         = {0};
-            i32                        scratch_bytes = 0, blob_bytes = 0;
+            FontShaperLoadFontState state         = {0};
+            i32                     scratch_bytes = 0, blob_bytes = 0;
 
-            fontshaper_load_font_error err = fontshaper_LoadFont(
+            FontShaperLoadFontError err = font_shaper_load_font(
                 &font.shaper, &state, (void*)loader.data, (int)loader.data_len, 0, &scratch_bytes, &blob_bytes);
             assert(SCOPE_FONT_LOAD,
                    err == FONTSHAPER_LOAD_FONT_ERROR_NEED_TO_CREATE_BLOB && scratch_bytes > 0 && blob_bytes > 0);
@@ -575,7 +574,7 @@ TTFont font_load(rop(rw Arena) arena, rop(rw ScratchArena) scratch, const char* 
             void* blob         = arena_alloc_aligned(arena, u8, blob_bytes);
             void* load_scratch = scratch_alloc_aligned(scratch, u8, scratch_bytes);
 
-            err = fontshaper_PlaceBlob(&font.shaper, &state, load_scratch, blob);
+            err = font_shaper_place_blob(&font.shaper, &state, load_scratch, blob);
             assert(SCOPE_FONT_LOAD, err == FONTSHAPER_LOAD_FONT_ERROR_NONE);
 
             // TODO checkpoints instead
@@ -584,21 +583,19 @@ TTFont font_load(rop(rw Arena) arena, rop(rw ScratchArena) scratch, const char* 
         }
 
         {
-            u64 compiled_bytes        = fontshaper_SizeOfCompiledFont(&font.shaper);
-            u64 compile_scratch_bytes = fontshaper_SizeOfFontCompileScratch(&font.shaper);
+            u64 compiled_bytes        = font_shaper_size_of_compiled_font(&font.shaper);
+            u64 compile_scratch_bytes = font_shaper_size_of_font_compile_scratch(&font.shaper);
 
             void* compiled        = arena_alloc_aligned(arena, u8, compiled_bytes);
             void* compile_scratch = scratch_alloc_aligned(scratch, u8, compile_scratch_bytes);
 
-            fontshaper_load_font_error err = fontshaper_CompileFont(&font.shaper, compiled, compile_scratch, NULL);
-            assert(SCOPE_FONT_LOAD, err == FONTSHAPER_LOAD_FONT_ERROR_NONE && fontshaper_FontIsValid(&font.shaper));
+            FontShaperLoadFontError err = font_shaper_compile_font(&font.shaper, compiled, compile_scratch, NULL);
+            assert(SCOPE_FONT_LOAD, err == FONTSHAPER_LOAD_FONT_ERROR_NONE && font_shaper_font_is_valid(&font.shaper));
 
             // TODO checkpoints instead
             memset(scratch->data + scratch_len_before, 0, scratch->len - scratch_len_before);
             scratch->len = scratch_len_before;
         }
-
-
     }
 
     tt_release_data(&loader);

@@ -298,6 +298,12 @@ typedef struct GlyphDrawCmd {
 } GlyphDrawCmd;
 STATIC_ASSERT(sizeof(GlyphDrawCmd) == 24);
 
+enum RectDrawCmdFlags {
+    RECT_DRAW_CMD_FLAG_NONE          = 0,
+    RECT_DRAW_CMD_FLAG_IGNORE_SCROLL = 1,
+};
+
+// TODO rename to RectDrawCmd
 typedef struct GpuRect {
     f32 x;
     f32 y;

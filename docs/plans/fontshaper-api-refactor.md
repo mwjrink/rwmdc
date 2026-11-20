@@ -15,32 +15,40 @@ already implemented in `fontshaper.h`.
 Related measurements: [font-shaping-optimizations.md](font-shaping-optimizations.md).
 The ASCII spike remains experimental; integrating it is not a prerequisite.
 
-## Current ownership: caller-supplied storage (API version 5)
+## Current ownership: concrete state and caller-supplied backing (API version 10)
 
 This supersedes the allocator-based ownership implemented during steps 2–3.
 There is only one normal creation path; the old allocator constructor/type and
 library destructor have been removed, not retained alongside it.
 
 ```c
-fontshaper_un bytes = fontshaper_SizeOfState(&info);
+FontShaperUn bytes = font_shaper_size_of_state(&info);
 void *memory = arena_alloc(arena, bytes); // Caller chooses allocation policy.
-fontshaper_state *state = fontshaper_CreateState(memory, bytes, &info);
-// Shape/reuse normally. Reclaim memory through the caller's arena/heap when done.
+FontShaperState state = font_shaper_create_state(memory, bytes, &info);
+FontShaperU32 count = font_shaper_shape(&state, text, length, options);
+// Embed state directly in its owner; reclaim backing through the caller's arena/heap.
 ```
 
 - The size query uses compiled font tables plus the descriptor's limits/cache
   budget. It is deterministic, but not a constant-expression `sizeof` macro.
-- The query includes padding for any base alignment. Creation aligns the state
-  and partitions all glyph/scratch/cache storage inside that one block.
+- The concrete state is returned by value, matching the repository's other
+  state/context APIs. The query excludes `sizeof(FontShaperState)` and includes
+  padding for any backing alignment; creation partitions glyph/scratch/cache
+  storage inside that block. No opaque state wrapper or second mutable object.
+- Constructor-local self-pointers are avoided: arena pointers and config-list
+  sentinels bind on Begin at the caller's final address. A newly created state
+  can be returned/copied before first use; keep its address stable after Begin.
+  Copies share backing, so they are not independent shaping states.
 - No public allocator callbacks, stored allocator, backing-release callback,
   ownership pointer/size or library destroy operation. Only the internal storage
   pointers/bounds needed to reuse the state are retained.
-- Query returns zero for invalid configuration/overflow. Creation returns NULL
-  for invalid configuration, NULL memory or insufficient size, without touching
-  the destination on failure. Descriptor/font list/font data must not overlap it.
+- Query returns zero for invalid configuration/overflow. Creation returns a
+  zeroed state with `Error = INVALID_ARGUMENT` for invalid configuration, NULL
+  memory or insufficient size, without touching backing on failure.
+  Descriptor/font list/state/font data must not overlap backing.
 - The caller owns backing lifetime. Keep it live and unmodified while state or
   results are used; individual free, arena reset, pooling and reinitialization
-  are caller policy. Font pointers are copied, compiled fonts remain borrowed.
+  are caller policy. font pointers are copied, compiled fonts remain borrowed.
 - Creation revalidates/recalculates the bound before writing. Thus benchmark
   setup now includes query + caller allocation + creation, rather than just the
   earlier one-allocation constructor. It is startup work, never shaping work.
@@ -52,7 +60,7 @@ every base alignment, guard bytes through shaping, copied font lists and reuse
 of the same block without destruction. Existing multilingual/options/failure/
 passive-reader checks are retained. `--managed`/`--batch` benchmark modes use
 caller-owned blocks; historical allocator support exists only in the benchmark's
-pre-v4 oracle branch. Output field `backing` replaces the old `owned` byte count.
+pre-v4 oracle branch. output field `backing` replaces the old `owned` byte count.
 
 Validation: caller-storage, retained-range and context regressions pass GCC and
 Clang ASan/UBSan. All 64 baseline fingerprints and the Unicode/manual-run replay
@@ -60,21 +68,49 @@ match; persistent-cache usage is stable in each timed batch. Full results:
 `/tmp/fontshaper-caller-storage-results.json`. No claim of new Unicode conformance
 or a performance improvement is made for this ownership change.
 
-The count-returning shape/flat whole-output traversal discussed subsequently is
-a separate consumer-interface change; this patch changes storage ownership only.
-Editor migration remains deferred at the user's request. The historical step
-measurements below describe their original APIs, not a second supported owner.
+Version 6 added count-returning Shape and passive flat NextGlyph traversal.
+Version 7 exposes concrete state and returns it by value; caller-storage tests
+also exercise embedded state, constructor returns and pre-use copies with poisoned
+local storage. Editor migration is proceeding separately in small reviewable edits.
+The historical measurements below describe their original APIs, not a second
+supported owner.
 
-### Naming (version 5)
+### Flat records (version 9)
 
-There is one mutable **state**, not a context/state pair. The opaque type is
-`fontshaper_state`, its creation descriptor is `fontshaper_state_info`, flags are
-`fontshaper_state_flags`/`FONTSHAPER_STATE_FLAG_*`, and API discovery uses
-`FONTSHAPER_STATE_API_VERSION`. Public arguments/iterator state pointers use
-`State`. Expert bookkeeping-only helpers are `SizeOfStateHeader`/
-`PlaceStateHeader`; scratch/cache helpers use `State` as well. No old context
-aliases remain in the production header. Historical-header aliases are confined
-to test-oracle support, and historical test filenames remain unchanged.
+`font_shaper_next(&state)` returns a `const FontShaperRecord *`, or NULL at end
+or after failure. RUN records select `font_idx`, `script` and run `direction`.
+The first RUN also supplies the initial `paragraph_direction`; later paragraph
+bases are carried by HARD_BREAK records. GLYPH records contain only glyph ID,
+source offset, positions and per-glyph break constraints. NO_BREAK is a flag,
+not a separate boolean. No hard-break or run-change flags are repeated on glyphs.
+
+The public glyph record aliases canonical engine storage; sentinels live in the
+existing run pool. Completion finalizes all records; traversal allocates/shapes/
+copies no records. Pointers remain valid until next Shape/Begin or backing
+reclamation. Shape/ShapeGlyphCount count drawable glyphs, excluding sentinels.
+Expert indexed run readers retain canonical separator glyphs for diagnostics.
+
+CRLF emits one hard-break record at CR's source position. Consecutive/trailing
+separators are preserved, including empty lines. U+2028 changes line, not paragraph
+base. Context/retained-range/storage tests pass GCC and Clang ASan/UBSan; all 64
+canonical fingerprints and Unicode/manual-run replay match. Record-stream tests
+separately check event order, source offsets, counts, fallback indices, mixed
+paragraph direction, reordered marks, pointer identity and passive storage usage.
+
+### Naming (version 10)
+
+There is one mutable **state**, not a context/state pair. Types/tags use
+`FontShaper...`, functions use `font_shaper_...`, and fields use snake_case.
+Private types/functions use `FontShaperInternal...`/`font_shaper_internal_...`
+to avoid collisions with public names. Macro/enum constants keep their uppercase
+`FONTSHAPER_...` names. API discovery uses `FONTSHAPER_STATE_API_VERSION`.
+The production header has no old-name aliases; the parked ASCII header and test
+callers use the same naming. Historical test filenames remain unchanged.
+
+Inventory and collision-checked rename map: `/tmp/fontshaper-rename-inventory.tsv`.
+Clang's struct/union declarations verify field bounds; regex replacements update
+identifiers/member accesses, including macro field arguments and inactive debug
+functions. Post-rename declaration audit: `/tmp/fontshaper-renamed-declarations.txt`.
 
 ## Agreed decisions
 
@@ -105,10 +141,10 @@ Names below are a design sketch, not a finalized ABI.
 
 ```c
 typedef struct ShapeOptions {
-    fontshaper_direction direction; // DONT_KNOW: infer paragraph direction.
-    fontshaper_language  language;  // DONT_KNOW: default language selection.
+    FontShaperDirection direction; // DONT_KNOW: infer paragraph direction.
+    FontShaperLanguage  language;  // DONT_KNOW: default language selection.
 
-    const fontshaper_feature_override *features; // NULL/0: standard features.
+    const FontShaperFeatureOverride *features; // NULL/0: standard features.
     u32 feature_count;
 } ShapeOptions;
 
@@ -117,8 +153,8 @@ ShapeResult result = shape(state, text, byte_length, (ShapeOptions){0});
 ```
 
 `text` is a byte range, not necessarily a null-terminated string. `{0}` selects
-inferred direction, default language selection and standard features. Language
-selection is not language detection. Fonts, allocation and capacity budgets
+inferred direction, default language selection and standard features. language
+selection is not language detection. fonts, allocation and capacity budgets
 belong to creation/configuration, not `ShapeOptions`.
 
 ### Responsibilities
@@ -145,7 +181,7 @@ belong to creation/configuration, not `ShapeOptions`.
   claim that every glyph corresponds to exactly one source character.
 - Run descriptors retain script, direction, paragraph direction and break flags.
   Boundary metadata remains accessible independently of glyph traversal.
-- Positions remain in font units. Width-dependent wrapping, pixel scaling and
+- Positions remain in font units. width-dependent wrapping, pixel scaling and
   final mixed-direction line layout are separate concerns in this refactor.
 - Traversal does not allocate, execute GSUB/GPOS, mutate shaping state or uncover
   deferred shaping failures. Shaping errors are reported at completion.
@@ -201,11 +237,11 @@ The original allocator policy was superseded by the ownership amendment above.
 
 ```c
 typedef struct ShapeCreateInfo {
-    fontshaper_font *const *fonts; // Existing stack order/fallback semantics.
+    FontShaperFont *const *fonts; // Existing stack order/fallback semantics.
     u32 font_count;
     u32 input_capacity;           // Decoded input codepoints, excluding sentinel.
     u32 glyph_capacity;           // Global simultaneous live slots; see below.
-    fontshaper_un cache_bytes;    // Bounded persistent config storage; 0 disables.
+    FontShaperUn cache_bytes;    // Bounded persistent config storage; 0 disables.
 } ShapeCreateInfo;
 ```
 
@@ -213,7 +249,7 @@ typedef struct ShapeCreateInfo {
   creation. Alignment slack is included. All internal partitions are initialized
   by the library; no allocator or ownership/release policy is retained.
 - The caller allocates/releases backing, including arena reset or individual
-  free. Storage must not be reclaimed while state/results remain in use.
+  free. storage must not be reclaimed while state/results remain in use.
 - Copy the ordered font-pointer list into state. The descriptor and pointer
   array need survive only creation; each font object, native blob and compiled
   backing remain borrowed, immutable and at stable addresses while state is used.
@@ -262,7 +298,7 @@ Important implementation consequences for step 2:
   A remaining-count check plus link advance stays thin and permits independent,
   repeated traversal without modifying the storage's active range.
 - Set run writable bounds directly. Do not wrap a run with
-  `fontshaper__PushGlyphRange`: it asserts no range is active, and Indic shaping
+  `font_shaper_internal_push_glyph_range`: it asserts no range is active, and Indic shaping
   already uses that non-nestable mechanism for internal clusters/syllables.
 - Publish first/count after shaping, since insertion, deletion and reordering
   can change the first glyph. Zero-glyph/terminal runs get count zero.
@@ -289,8 +325,8 @@ budget for the whole operation, not copy existing per-run limits blindly.
 
 The backing size must include, with checked arithmetic/alignment:
 
-1. State bookkeeping and copied font references.
-2. Input records plus sentinel and per-operation feature snapshots.
+1. state bookkeeping and copied font references.
+2. input records plus sentinel and per-operation feature snapshots.
 3. Up to `N + 1` run descriptors, including empty terminal runs, and boundaries.
 4. `G` canonical glyph records, links, free-slot indices and public source metadata.
 5. Exactly the configured persistent cache budget.
@@ -384,7 +420,7 @@ and the first cold paragraph. Those are individual cold observations, not warm
 medians or a prediction of the new constructor's cost. Setup currently allocates
 and resizes two scratch buffers for the legacy lifetime fixture; only one is
 used by each timed paragraph. Recorded scratch/storage sizes are allocation
-bounds, not RSS or total font memory. At capacity 8,192, current scratch bounds
+bounds, not RSS or total font memory. at capacity 8,192, current scratch bounds
 are 7.19/4.08/4.75/5.04 MiB (Sans/Inter/Serif/Mono); glyph storage is about
 0.94 MiB separately, plus the 8 MiB cache budget.
 
@@ -429,22 +465,22 @@ above).** Implemented in `src/lib/fontshaper/fontshaper.h`:
   partitions one aligned allocation; `fontshaper_DestroyShapeContext` releases
   it. The font list is copied, not its borrowed compiled fonts. No allocation
   callbacks during shaping or traversal.
-- `fontshaper_ShapeBegin(context, direction, language)` is now the three-argument
+- `font_shaper_shape_begin(context, direction, language)` is now the three-argument
   owned-state operation. The old buffer-taking operation is explicitly named
-  `fontshaper_ShapeBeginWithMemory` for expert/test callers; it shares the same
+  `font_shaper_shape_begin_with_memory` for expert/test callers; it shares the same
   underlying reset/execution machinery, not a second shaping engine.
 - Constructor bounds enumerate each Unicode script's selected native GSUB/GPOS
-  language-tag union plus the default language systems. Script/Indic3/DFLT
+  language-tag union plus the default language systems. script/Indic3/DFLT
   selection is shared with config construction. Unknown tags are covered by the
   default case; no sizing query or backing growth occurs in the hot path.
-- `fontshaper_ShapeEnd` returns status after executing every run into retained
+- `font_shaper_shape_end` returns status after executing every run into retained
   slot ranges. `ShapeRun` is only a read cursor; `ShapeGetRun` supports indexed,
   repeatable reads. `ShapeRunCount`/`ShapeGlyphCount` describe successful completed
   output and return zero while building or after failure.
 - Glyph iterators now contain storage, current slot and remaining count only;
   unused KB position-accumulator fields were removed. Earlier run iterators do
   not spill into later runs, including when slots were reused or reordered.
-- `glyph->SourceIndex` exposes the resolved input source ID without a codepoint
+- `glyph->source_index` exposes the resolved input source ID without a codepoint
   lookup. It reuses the normalization-only `Decomposition` storage after shaping,
   so canonical glyph size/slot stride did not grow. It must not be read as an
   output source ID during shaping or through the standalone direct engine.
@@ -452,7 +488,7 @@ above).** Implemented in `src/lib/fontshaper/fontshaper.h`:
   skipped-invalid-byte offset correction remains explicitly deferred to step 3.
 - Owned states report distinct input/glyph/cache capacity failures, hide partial
   results and recover at the next Begin. Failed cache construction resets the
-  cache before reuse; successful configs remain warm. Feature stacks reset for
+  cache before reuse; successful configs remain warm. feature stacks reset for
   owned calls, while expert placement retains its legacy between-pass behavior.
 - Cache rebinding is rejected during input and invalidates completed expert
   results. Owned-state fonts/budgets cannot be rebound through expert setters.
@@ -468,7 +504,7 @@ python tests/fontshaper_api_baseline.py --managed \
 ```
 
 Owned-context, retained-range and existing context regression tests pass with
-GCC and Clang ASan/UBSan. Coverage includes single-allocation/free accounting,
+GCC and Clang ASan/UBSan. coverage includes single-allocation/free accounting,
 misalignment and allocation/size failures, cached/noncached configs, Arabic/
 Devanagari/mixed text, changing languages/features, indexed forward/reverse
 rereads without state mutation, and input/glyph/cache error recovery. All 64
@@ -519,7 +555,7 @@ clang -O3 -march=native -ffunction-sections -fdata-sections -DBENCH_CAPACITY=819
 ```
 
 At capacities 8,192 and an 8 MiB cache, one owned backing allocation bounds about
-16.20/13.08/13.76/14.04 MiB for Sans/Inter/Serif/Mono, excluding font data. Glyph
+16.20/13.08/13.76/14.04 MiB for Sans/Inter/Serif/Mono, excluding font data. glyph
 storage remains the baseline 983,053-byte bound; scratch increases for retained
 run descriptors/all-language coverage. These are allocation bounds, not RSS.
 Individual constructor observations were roughly 0.10–0.13 ms, separate from
@@ -563,19 +599,19 @@ hidden post-call execution. Compare whole-buffer and incremental output.
 **Status: complete.** Public API version 3 adds the normal operation:
 
 ```c
-fontshaper_shape_options options = {0};
-fontshaper_shape_error error = fontshaper_Shape(context, text, byte_length, options);
+FontShaperShapeOptions options = {0};
+FontShaperShapeError error = font_shaper_shape(context, text, byte_length, options);
 // On success, ShapeRunCount/ShapeGetRun and glyph iterators read completed output.
 ```
 
 The existing state plus returned status is the result; there is no second result
-allocation or mandatory flattened glyph copy. `byte_length` is `fontshaper_u32`;
+allocation or mandatory flattened glyph copy. `byte_length` is `FontShaperU32`;
 NULL/0 is empty, NULL/nonzero is invalid, and embedded NUL is an input codepoint.
 Every call invalidates the previous result, including argument/capacity failures.
 Default options infer paragraph direction, select default language systems (not
 language detection), and use standard features.
 
-`fontshaper_Shape` reserves geometric input blocks once, including the sentinel,
+`font_shaper_shape` reserves geometric input blocks once, including the sentinel,
 using `min(byte_length, input_capacity)` as a conservative codepoint upper bound.
 It then decodes once directly into those blocks through a block cursor. It does
 not count/decode twice, call public per-character append functions, copy through

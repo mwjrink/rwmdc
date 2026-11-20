@@ -30,8 +30,8 @@ were warm, repeated paragraph-sized samples, not million-character stress tests.
 
 Times below include input conversion, shaping, copying glyphs into a flat output
 array, and the same simple English word-wrapper at 640 px with 18 px text. Direct
-paths include the editor's `utf8proc_decompose` step. Context paths include
-segmentation. Values are medians of five timed batches, in microseconds.
+paths include the editor's `utf8proc_decompose` step. context paths include
+segmentation. values are medians of five timed batches, in microseconds.
 
 | Font / input | Codepoints | Astra direct | KB direct | KB context | Astra context |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -52,7 +52,7 @@ Key findings:
 - Astra's `ShapeBegin` calls `SizeOfContextScratch`, which evaluates configuration
   bounds across every script for the font stack. Per-pass configuration caches
   are also reset. A Noto Sans context profile attributed about 92% of sampled
-  cycles to `fontshaper__PlaceShapeConfig`, plus 3.7% to feature-tag conversion.
+  cycles to `font_shaper_internal_place_shape_config`, plus 3.7% to feature-tag conversion.
   This is evidence for targeting setup first, not a predicted 92% speedup.
 - External utf8proc processing accounted for about 2.4% of the sampled Astra
   direct path. Removing Unicode decoding is not the obvious first optimization.
@@ -65,7 +65,7 @@ Key findings:
   during the run. An 8 MB fixed-memory context eventually exhausted its memory
   and crashed at a null destination in `kbts_PlaceShapeScratchpad`. Do not assume
   the untouched KB context satisfies the bounded-scratch requirement.
-- Astra's memory bounds can be conservative. At a 2,048-glyph capacity, the Noto
+- Astra's memory bounds can be conservative. at a 2,048-glyph capacity, the Noto
   Sans setup queried about 240 KiB for direct glyph storage, 921 KiB for direct
   execution scratch, and 102 MiB for context scratch. These are buffer bounds,
   not resident-memory measurements.
@@ -155,9 +155,9 @@ scripts, bringing context overhead closer to the direct path.
 new scripts/languages get distinct configurations; resetting paragraph scratch
 does not invalidate retained data; changing fonts cannot return stale configs.
 
-**Results:** opt in with `fontshaper_SetContextCache(context, memory, bytes)`.
+**Results:** opt in with `font_shaper_set_context_cache(context, memory, bytes)`.
 Existing callers retain per-pass configs; the new buffer explicitly owns cached
-blocks and packed configs. Construction workspaces remain transient. Font-stack
+blocks and packed configs. Construction workspaces remain transient. font-stack
 changes clear both config caches at the next Begin. The cache is append-only and
 bounded: exhaustion reports sticky `OUT_OF_MEMORY`; no allocation or eviction.
 Rebind between passes to clear it before it fills. NULL/0 disables persistence.
@@ -199,7 +199,7 @@ paragraphs; its config reuse and bounded memory behavior are regression-tested.
 
 Fresh before/after runs: Clang 23 `-O3 -march=native`, CPU 5, warmed paragraphs,
 five batches; UTF-8 context input plus the original flat-copy/English-wrapper
-harness at 640 px / 18 px. Font loading and cold config construction are excluded.
+harness at 640 px / 18 px. font loading and cold config construction are excluded.
 Each entry is the median batch time in microseconds, not a universal speedup.
 
 | Font / input | Codepoints | Before | Step 1 | Steps 1–2 | Steps 1–3 |
@@ -215,7 +215,7 @@ All 192 stage/font/input/feature runs agreed on glyph/source/position checksums,
 glyph counts and missing-glyph counts. These cover four fonts, six inputs, default
 features and explicit `liga=0, kern=1`, and four implementation stages. Cached
 runs used an 8 MiB caller-owned cache; this is a benchmark budget, not a required
-size or a bound covering arbitrary script/language/style combinations. Scratch
+size or a bound covering arbitrary script/language/style combinations. scratch
 queries remain conservative and essentially unchanged; tightening them is step 4.
 Cold sizing and first use of each configuration still incur construction costs.
 
@@ -287,7 +287,7 @@ These are allocation bounds, not a claim of reduced resident usage. Warm latency
 is essentially unchanged: median after/before ratio across 48 cases was 0.990;
 do not interpret that small difference as a demonstrated speedup. All 96 timed
 before/after runs agreed on output checksums/counts, across four fonts, six
-inputs and two feature settings. Scratch allocations used the new query after
+inputs and two feature settings. scratch allocations used the new query after
 cache setup, not the old oversized buffers.
 
 The regression test now queries/reallocates exactly sized scratch on language,
@@ -394,9 +394,9 @@ not fast-path misses. The next Begin resets eligibility.
 
 **Scope:** fallback is conservatively paragraph-wide, with no fast re-entry in a
 mixed paragraph yet. General processing determines its script/direction/font
-run boundaries. Language in this API is a Begin parameter, not a per-run switch;
+run boundaries. language in this API is a Begin parameter, not a per-run switch;
 no English-only language-tag restriction is imposed. Successful fast passes
-still omit public break metadata and are not production-ready. Phase 2 must
+still omit public break metadata and are not production-ready. phase 2 must
 restore that metadata before integration; production `fontshaper.h` is untouched.
 
 Fresh paired timings, same compiler/CPU/harness and five warm batches:
@@ -436,7 +436,7 @@ Run flags come from the real first-codepoint break flags, not synthetic zeros.
 
 Because break state stays current, a miss now only disables the optimization;
 it does NOT need to reset or replay the prefix. General processing continues
-from the existing state. No extra input buffer or decoding is needed. Feature
+from the existing state. No extra input buffer or decoding is needed. feature
 snapshots, source IDs, word/grapheme/line flags, script and direction metadata
 are preserved. The diagnostic is now `AsciiMissCount`, not a replay count.
 The optimization still does not re-enter within a mixed paragraph; eligibility

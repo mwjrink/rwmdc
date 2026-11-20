@@ -21,6 +21,12 @@ void test(void* x) {
 typedef __m128i simdv_i128;
 typedef __m256i simdv_i256;
 
+// TODO these:
+// typedef union {
+//     __m128i vec;
+//     i32     elements[4];
+// } vi128 i32x4;
+
 typedef struct SimdByteScanMany {
     simdv_i128 low[2];
     simdv_i128 high[2];
