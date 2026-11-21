@@ -6,23 +6,26 @@ from compare import ROOT, run
 
 source = (ROOT / "src/lib/md/md_parser_scratch.h").read_text()
 start = source.index("MdResult md_get(")
-setup = source[source.index("    u32 extra_idx", start):source.index("    // Loop 1:", start)]
+setup_start = source.rindex("\n", start, source.index("fence_marker_byte", start)) + 1
+setup = source[setup_start:source.index("    // Loop 1:", start)]
 a = source.index("    while (chunk_start < state->l0_count)", source.index("    // Loop 1:", start))
 loop = source[a:source.index("    // AT THIS POINT:", a)]
+fence_loop = loop.replace("state_accumulate_loop_end", "fence_test_loop_end").replace(
+    "rewind_context", "fence_test_rewind")
 qstart = source.index("        if (chunk_idx == buffer_size)", source.index("    // Loop 2:", start))
 qend = source.index("\n        }", qstart) + len("\n        }")
 query_refill = source[qstart:qend]
 # Observe the cursor and metadata association before clearing the selected hit.
-loop = loop.replace("        u32 l0_idx = chunk_start + chunk_idx;",
-                    "        candidates += 1;\n        u32 l0_idx = chunk_start + chunk_idx;")
-loop = loop.replace("        if (l0_end > begin) {", "        if (l0_end > begin) {\n            rewinds += 1;")
-loop = loop.replace("                chunk_idx -= 1;", "                rewind_steps += 1;\n                chunk_idx -= 1;")
+loop = loop.replace("        if (active_hit_mask == 0) {",
+                    "        candidates += 1;\n        if (active_hit_mask == 0) {")
+loop = loop.replace("    if (chunk_idx < buffer_size) {",
+                    "    if (chunk_idx < buffer_size) {\n        rewinds += 1;")
+loop = loop.replace("            chunk_idx -= 1;", "            rewind_steps += 1;\n            chunk_idx -= 1;")
 marker = "        active_hit_mask &= active_hit_mask - 1;"
 assert marker in loop
 loop = loop.replace(marker, r'''
         CHECK(l0_idx < expected);
-        CHECK(extra_idx == extra_prefix[l0_idx] +
-              (l0_tag == MD_L0_BLOCK_QUOTE || l0_tag == MD_L0_UNORDERED_LIST));
+        CHECK(extra_idx == extra_prefix[l0_idx]);
         if (active_hit_mask != 0) {
             if (l0_tag == MD_L0_BLOCK_QUOTE || l0_tag == MD_L0_UNORDERED_LIST)
                 CHECK(state->l0_extra[extra_prefix[l0_idx]].post_indent == l0_idx);
@@ -48,12 +51,15 @@ out = Path(tempfile.mkdtemp(prefix="md-check-context-"))
 #include "parser.h"
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "line %d: %s\n", __LINE__, #c); abort(); } } while (0)
 int main(void) {
-    const u8 context_tags[] = {MD_L0_FENCED_CODE_BLOCK, MD_L0_BLOCK_QUOTE,
-                              MD_L0_THEMATIC_BREAK, MD_L0_UNORDERED_LIST};
+    const u8 context_tags[] = {MD_L0_FENCED_CODE_BLOCK, MD_L0_FENCE_NO_TRAILING_TEXT,
+                              MD_L0_BLOCK_QUOTE, MD_L0_THEMATIC_BREAK, MD_L0_UNORDERED_LIST};
     SimdByteScanMany context_table = simd_byte_scan_many_init(context_tags, sizeof(context_tags));
     ScratchArena storage = scratch_create(); ScratchArena* scratch = &storage;
     usize page = sysconf(_SC_PAGESIZE);
     const u32 sizes[] = {1, 2, 63, 64, 65, 129, 4095, 4096, 4097, 8193};
+    const u8 sample_tags[] = {MD_L0_BLANK, MD_L0_PARAGRAPH, MD_L0_THEMATIC_BREAK,
+                             MD_L0_UNORDERED_LIST, MD_L0_ATX_HEADING, MD_L0_SETEXT_HEADING,
+                             MD_L0_BLOCK_QUOTE, MD_L0_FENCED_CODE_BLOCK, MD_L0_FENCE_NO_TRAILING_TEXT};
     for (u32 pattern = 0; pattern < 6; ++pattern) {
         for (u32 k = 0; k < sizeof(sizes) / sizeof(*sizes); ++k) {
             u32 n = sizes[k]; usize readable = ((n + page - 1) / page) * page;
@@ -66,7 +72,7 @@ int main(void) {
             CHECK(offsets && extra_prefix && extras);
             u32 extra_count = 0;
             for (u32 i = 0; i < n; ++i) {
-                tags[i] = MD_L0_PARAGRAPH + (i % 8);
+                tags[i] = sample_tags[i % sizeof(sample_tags)];
                 if (pattern == 1) tags[i] = MD_L0_PARAGRAPH;
                 if (pattern == 2) tags[i] = MD_L0_BLANK;
                 if (pattern == 3) tags[i] = MD_L0_UNORDERED_LIST;
@@ -83,7 +89,12 @@ int main(void) {
                     extra_count += 1;
                 }
             }
-            MdState data = {.l0_tags = tags, .l0_offsets = offsets, .l0_extra = extras, .l0_count = n};
+            // Synthetic tags have no L1 markers; reject them on indentation.
+            MdL0Common* common = calloc(n, sizeof(*common));
+            CHECK(common);
+            for (u32 i = 0; i < n; i += 1) common[i].pre_indent = 4;
+            MdState data = {.l0_tags = tags, .l0_offsets = offsets, .l0_common = common,
+                            .l0_extra = extras, .l0_count = n};
             MdState* state = &data;
             u32 rng = 0x12345678;
             for (u32 query = 0; query < 200; ++query) {
@@ -131,12 +142,42 @@ checked:
                     }
                 }
             }
-            free(offsets); free(extra_prefix); free(extras);
+            free(offsets); free(extra_prefix); free(extras); free(common);
             CHECK(munmap(region, readable + page) == 0);
         }
     }
+    u8 fence_doc[] = "``` info`bad\n   ``` ok\n> quote\n- item\n``\n~~~\n```` text\n    ````\n ````\t\n"
+                     "~~~~ info`ok\n~~~\n~~~~~\n+no-space\n++ repeated\n-   item\n"
+                     "    + child\n      - grandchild\n     - sibling\n- top\n"
+                     "\n  ```\n  literal\n# heading\ntext\n```\ntext\n";
+    const u32 lengths[] = {0, 0, 3, 3, 3, 3, 3, 3, 3, 0, 4, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 3, 0, 0, 3};
+    const u8 markers[] = {0, 0, '`', '`', '`', '`', '`', '`', '`', 0, '~', '~', 0, 0, 0, 0, 0, 0, 0, 0, 0, '`', '`', 0, 0, '`'};
+    const u16 list_tops[] = {4, 6, 8, 7, 2, 2, 2, 2, 0, 0, 0};
+    const u32 list_depths[] = {1, 2, 3, 2, 1, 1, 1, 1, 0, 0, 0};
+    DocPiece piece = {.bytes = fence_doc, .length = sizeof(fence_doc) - 1};
+    DocView view = {.pieces = &piece, .count = 1, .total_length = piece.length};
+    Arena arena = arena_create();
+    MdState data = md_create(&view, &arena, scratch);
+    MdState* state = &data;
+    CHECK(state->l0_count == sizeof(lengths) / sizeof(*lengths) + 1);
+    for (u32 i = 0; i < sizeof(lengths) / sizeof(*lengths); i += 1) {
+        u32 begin = state->l0_offsets[i];
+        scratch->len = 0;
+''' + setup + fence_loop + r'''
+        CHECK(chunk_start + chunk_idx == i && fence_marker_length == lengths[i]);
+        CHECK(extra_idx == (u32)(i > 2) + (u32)(i > 3) + (u32)(i > 12) + (u32)(i > 13) +
+                           (u32)(i > 14) + (u32)(i > 15) + (u32)(i > 16) + (u32)(i > 17) + (u32)(i > 18));
+        if (fence_marker_length != 0) CHECK(fence_marker_byte == markers[i]);
+        if (i <= 14) CHECK(list_stack_count == 0 && list_columns[0] == 0);
+        else {
+            CHECK(list_stack_count == list_depths[i - 15]);
+            CHECK(list_columns[list_stack_count] == list_tops[i - 15]);
+            if (list_stack_count > 1) CHECK(list_columns[1] == 4);
+        }
+    }
+    arena_destroy(&arena);
     scratch_destroy(scratch);
-    puts("PASS: live context loop; quote/list-only Extra cursor, guarded tails, mask/refill boundaries, rewind and EOF");
+    puts("PASS: live context loop; Extra cursor, masked windows, rewind, EOF, fences and list nesting");
 }
 ''')
 common = ["-g", "-march=x86-64-v3", "-I" + str(out), "-I" + str(ROOT / "src"),

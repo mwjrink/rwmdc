@@ -213,7 +213,7 @@ static void self_check(void) {
         {"- item", MD_L0_UNORDERED_LIST}, {"+ item", MD_L0_UNORDERED_LIST},
         {"***", MD_L0_THEMATIC_BREAK}, {"---", MD_L0_THEMATIC_BREAK},
         {"___", MD_L0_THEMATIC_BREAK}, {"__", MD_L0_PARAGRAPH},
-        {"```", MD_L0_FENCED_CODE_BLOCK}, {"~~", MD_L0_PARAGRAPH},
+        {"``` lang", MD_L0_FENCED_CODE_BLOCK}, {"~~", MD_L0_PARAGRAPH},
         {"> quote", MD_L0_BLOCK_QUOTE}, {"= text", MD_L0_SETEXT_HEADING},
     };
     for (u32 i = 0; i < sizeof(markers) / sizeof(*markers); ++i) {

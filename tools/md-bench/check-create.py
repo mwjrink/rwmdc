@@ -83,16 +83,20 @@ static u64 validate(const MdState* s, const u8* bytes, u32 length) {
             case '_': if (n >= 3) expected = MD_L0_THEMATIC_BREAK; break;
             case '`': case '~': if (n >= 3) expected = MD_L0_FENCED_CODE_BLOCK; break;
         }
-        CHECK(tag == expected);
-        if (tag != MD_L0_PARAGRAPH) {
-            col += n;
+        if (expected != MD_L0_PARAGRAPH) {
+            u32 marker_end_column = col + n;
             pos = marker_end;
-            col = whitespace(bytes, end, &pos, col);
-            if (tag == MD_L0_BLOCK_QUOTE || tag == MD_L0_UNORDERED_LIST) {
-                CHECK(s->l0_extra[extra].post_indent == col);
-                HASH(col); extra += 1;
+            col = whitespace(bytes, end, &pos, marker_end_column);
+            if (expected == MD_L0_FENCED_CODE_BLOCK && (pos == end || bytes[pos] == '\n'))
+                expected = MD_L0_FENCE_NO_TRAILING_TEXT;
+            if (expected == MD_L0_BLOCK_QUOTE || expected == MD_L0_UNORDERED_LIST) {
+                CHECK(tag == expected);
+                u32 padding = col - marker_end_column;
+                CHECK(s->l0_extra[extra].post_indent == padding);
+                HASH(padding); extra += 1;
             }
         }
+        CHECK(tag == expected);
         CHECK(common.content_start == pos - start);
     }
     u32 tail = length;
@@ -189,7 +193,8 @@ int main(int argc, char** argv) {
     Arena arena = arena_create(); ScratchArena scratch = scratch_create();
     const char* cases[] = {"", " \t", "\n\n", "p\n\n  ", "p\n \n\n\t", "a b \t\n",
         "\ttext\n# heading\nparagraph\n- item\n\n> quote\n", "####### text\n__\n~~\n",
-        "    - x\n    -\tx\n", " \t###\ttext\n", "***\n___\n+ x\n= x\n~~~\n"};
+        "    - x\n    -\tx\n", " \t###\ttext\n", "***\n___\n+ x\n= x\n~~~\n",
+        "``` \t\n``` x\n~~~ #\n~~~\t", "``` x", "``` \n"};
     for (u32 i = 0; i < sizeof(cases) / sizeof(*cases); ++i)
         check((const u8*)cases[i], strlen(cases[i]), &arena, &scratch);
     CHECK(sizeof(MdL0Common) == 4 && sizeof(MdL0Extra) == 2);

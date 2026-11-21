@@ -467,6 +467,8 @@ static void batch_failures(TestFont* fonts) {
     CHECK(shaper->input_codepoint_count == 2);
     CHECK(shape_status(shaper, "\xff\xff\xff", 3, defaults) == 0);
     CHECK(shaper->input_codepoint_count == 0);
+    CHECK(shape_status(shaper, "\xc0\x80", 2, defaults) == FONTSHAPER_SHAPE_ERROR_INVALID_ARGUMENT);
+    CHECK(font_shaper_next(shaper) == NULL);
     CHECK(shape_status(shaper, "\xed\xa0\x80", 3, defaults) == FONTSHAPER_SHAPE_ERROR_INVALID_ARGUMENT);
     CHECK(shape_status(shaper, "\xf4\x90\x80\x80", 4, defaults) == FONTSHAPER_SHAPE_ERROR_INVALID_ARGUMENT);
     FontShaperShapeOptions invalid = {.direction = 999};

@@ -2,6 +2,7 @@ rwmd
 omp*
 examples/*
 tests/*
+!tests/fontshaper_utf8_test.c
 bench/*
 docs/*
 assets/**/*.spv

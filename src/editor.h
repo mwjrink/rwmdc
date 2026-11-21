@@ -115,21 +115,101 @@ internal Editor editor_create(
 
     // Eagerly shape the fixed list markers once.
     {
-        i32 bullet[1]               = {0x2022};
-        editor.markers.bullet_count = editor_font_shape(font, bullet, 1, editor.markers.bullet_glyphs);
+        {
+            const char bullet[] = u8"\u2022";
+            editor.markers.bullet_count =
+                font_shaper_shape(&editor.fs_state, bullet, sizeof(bullet) - 1, (FontShaperShapeOptions){0});
+            assert(SCOPE_EDITOR, font_shaper_shape_error(&editor.fs_state) == FONTSHAPER_SHAPE_ERROR_NONE);
 
-        i32 task_unchecked[3] = {'[', ' ', ']'};
-        editor.markers.task_unchecked_count =
-            font_shape_run(font, task_unchecked, 3, editor.markers.task_unchecked_glyphs);
+            u32                     glyph_idx = 0;
+            const FontShaperRecord* record    = font_shaper_next(&editor.fs_state);
+            while (record != 0) {
+                if (record->kind == FONTSHAPER_RECORD_GLYPH) {
+                    editor.markers.bullet_glyphs[glyph_idx] = (ShapedGlyph){
+                        .id       = record->glyph.glyph_id,
+                        .advance  = (f32)record->glyph.advance_x,
+                        .offset_x = (f32)record->glyph.offset_x,
+                        .offset_y = (f32)record->glyph.offset_y,
+                    };
 
-        i32 task_checked[3]               = {'[', 'x', ']'};
-        editor.markers.task_checked_count = font_shape_run(font, task_checked, 3, editor.markers.task_checked_glyphs);
-        // TODO use something like nerdfont: ''
+                    glyph_idx += 1;
+                    break;
+                }
 
-        i32         space[1] = {' '};
-        ShapedGlyph space_glyph[1];
-        font_shape_run(font, space, 1, space_glyph);
-        editor.space_advance = space_glyph[0].advance;
+                record = font_shaper_next(&editor.fs_state);
+            }
+        }
+
+        {
+            const char task_unchecked[]         = u8"[ ]";
+            editor.markers.task_unchecked_count = font_shaper_shape(
+                &editor.fs_state, task_unchecked, sizeof(task_unchecked) - 1, (FontShaperShapeOptions){0});
+            assert(SCOPE_EDITOR, font_shaper_shape_error(&editor.fs_state) == FONTSHAPER_SHAPE_ERROR_NONE);
+
+            u32                     glyph_idx = 0;
+            const FontShaperRecord* record    = font_shaper_next(&editor.fs_state);
+            while (record != 0) {
+                if (record->kind == FONTSHAPER_RECORD_GLYPH) {
+                    editor.markers.task_unchecked_glyphs[glyph_idx] = (ShapedGlyph){
+                        .id       = record->glyph.glyph_id,
+                        .advance  = (f32)record->glyph.advance_x,
+                        .offset_x = (f32)record->glyph.offset_x,
+                        .offset_y = (f32)record->glyph.offset_y,
+                    };
+
+                    glyph_idx += 1;
+                    break;
+                }
+
+                record = font_shaper_next(&editor.fs_state);
+            }
+        }
+
+        {
+            // TODO use something like nerdfont: ''
+            const char task_checked[]         = u8"[x]";
+            editor.markers.task_checked_count = font_shaper_shape(
+                &editor.fs_state, task_checked, sizeof(task_checked) - 1, (FontShaperShapeOptions){0});
+            assert(SCOPE_EDITOR, font_shaper_shape_error(&editor.fs_state) == FONTSHAPER_SHAPE_ERROR_NONE);
+
+            u32                     glyph_idx = 0;
+            const FontShaperRecord* record    = font_shaper_next(&editor.fs_state);
+            while (record != 0) {
+                if (record->kind == FONTSHAPER_RECORD_GLYPH) {
+                    editor.markers.task_checked_glyphs[glyph_idx] = (ShapedGlyph){
+                        .id       = record->glyph.glyph_id,
+                        .advance  = (f32)record->glyph.advance_x,
+                        .offset_x = (f32)record->glyph.offset_x,
+                        .offset_y = (f32)record->glyph.offset_y,
+                    };
+
+                    glyph_idx += 1;
+                    break;
+                }
+
+                record = font_shaper_next(&editor.fs_state);
+            }
+        }
+
+        {
+            const char space[] = u8" ";
+            u32        space_count =
+                font_shaper_shape(&editor.fs_state, space, sizeof(space) - 1, (FontShaperShapeOptions){0});
+            assert(SCOPE_EDITOR, font_shaper_shape_error(&editor.fs_state) == FONTSHAPER_SHAPE_ERROR_NONE);
+            assert(SCOPE_EDITOR, space_count == 1);
+
+            const FontShaperRecord* record = font_shaper_next(&editor.fs_state);
+            while (record != 0) {
+                if (record->kind == FONTSHAPER_RECORD_GLYPH) {
+                    editor.space_advance = (f32)record->glyph.advance_x;
+                    // TODO asserts to make sure this doesn't output weird shit like multiple glyphs
+                    // EXPECT: RUN -> GLYPH -> 0
+                    break;
+                }
+
+                record = font_shaper_next(&editor.fs_state);
+            }
+        }
     }
 
     DocPiece pieces[3];
@@ -404,9 +484,13 @@ DrawLayer editor_get_text_layer(rop(rw Editor) editor,
                 case MD_NODE_LIST_ITEM: {
                     indent = MARGIN + (f32)cur.data.item.depth * 24.0f;
 
+                    ShapedGlyph glyph_buff[16];
+
+                    u32          glyphs_count = 0;
+                    ShapedGlyph* glyphs;
+                    f32          marker_x;
+
                     if (cur.data.item.task) {
-                        u32          glyphs_count = 0;
-                        ShapedGlyph* glyphs;
                         if (cur.data.item.checked) {
                             glyphs       = editor->markers.task_checked_glyphs;
                             glyphs_count = editor->markers.task_checked_count;
@@ -415,54 +499,74 @@ DrawLayer editor_get_text_layer(rop(rw Editor) editor,
                             glyphs_count = editor->markers.task_unchecked_count;
                         }
 
-                        f32 marker_x = indent - 6.0f;
-                        output_glyphs_reverse(&layer,
-                                              glyphs,
-                                              glyphs_count,
-                                              scale,
-                                              marker_x,
-                                              y + font->ascent * scale,
-                                              theme_idx(list_marker_fg));
-                    } else if (!cur.data.item.ordered) {
-                        u32          glyphs_count = editor->markers.bullet_count;
-                        ShapedGlyph* glyphs       = editor->markers.bullet_glyphs;
+                        marker_x = indent - 6.0f;
 
-                        f32 marker_x = indent - 6.0f;
-                        output_glyphs_reverse(&layer,
-                                              glyphs,
-                                              glyphs_count,
-                                              scale,
-                                              marker_x,
-                                              y + font->ascent * scale,
-                                              theme_idx(list_marker_fg));
+                    } else if (!cur.data.item.ordered) {
+                        glyphs_count = editor->markers.bullet_count;
+                        glyphs       = editor->markers.bullet_glyphs;
+
+                        marker_x = indent - 6.0f;
                     } else {
                         // Ordered "N." number varies; shape fresh.
-                        i32 marker_codepoints[16];
-                        u32 marker_codepoint_count = 0;
+                        char marker_chars[16]  = {0};
+                        u32  marker_char_count = 0;
                         {
-                            u32  number = cur.data.item.number;
-                            char digits[8];
-                            u32  digit_count = 0;
+                            u32 number = cur.data.item.number;
                             do {
-                                digits[digit_count++] = (char)('0' + number % 10);
+                                marker_chars[marker_char_count] = (char)('0' + number % 10);
+                                marker_char_count += 1;
                                 number /= 10;
-                            } while (number && digit_count < 7);
-                            while (digit_count)
-                                marker_codepoints[marker_codepoint_count++] = digits[--digit_count];
-                            marker_codepoints[marker_codepoint_count++] = '.';
+                            } while (number && marker_char_count < 9);
+                            marker_chars[marker_char_count++] = '.';
                         }
 
-                        ShapedGlyph glyphs[16];
-                        u32 glyphs_count = font_shape_run(font, marker_codepoints, marker_codepoint_count, glyphs);
+                        glyphs             = glyph_buff;
+                        u32 glyph_buff_idx = 0;
+                        {
+                            glyphs_count = font_shaper_shape(
+                                &editor->fs_state, marker_chars, marker_char_count, (FontShaperShapeOptions){0});
+                            assert(SCOPE_EDITOR,
+                                   font_shaper_shape_error(&editor->fs_state) == FONTSHAPER_SHAPE_ERROR_NONE);
 
-                        f32 marker_x = indent - 6.0f;
-                        output_glyphs_reverse(&layer,
-                                              glyphs,
-                                              glyphs_count,
-                                              scale,
-                                              marker_x,
-                                              y + font->ascent * scale,
-                                              theme_idx(list_marker_fg));
+                            const FontShaperRecord* record = font_shaper_next(&editor->fs_state);
+                            while (record != 0) {
+                                if (record->kind == FONTSHAPER_RECORD_GLYPH) {
+                                    glyph_buff[glyph_buff_idx] = (ShapedGlyph){
+                                        .id       = record->glyph.glyph_id,
+                                        .advance  = (f32)record->glyph.advance_x,
+                                        .offset_x = (f32)record->glyph.offset_x,
+                                        .offset_y = (f32)record->glyph.offset_y,
+                                    };
+
+                                    glyph_buff_idx += 1;
+                                    break;
+                                }
+
+                                record = font_shaper_next(&editor->fs_state);
+                            }
+                        }
+
+                        // marker_chars, marker_char_count, glyphs
+
+                        marker_x = indent - 6.0f;
+                    }
+
+                    for (u32 glyph_idx = 0; glyph_idx < glyphs_count; glyph_idx++) {
+                        ShapedGlyph glyph   = glyphs[glyph_idx];
+                        f32         advance = (f32)glyph.advance * scale;
+
+                        layer.glyphs[layer.glyph_count] = (GlyphDrawCmd){
+                            .x  = marker_x + glyph.offset_x * scale,
+                            .y  = y + (font->ascent + glyph.offset_y) * scale,
+                            .sx = scale,
+                            .sy = -scale,
+
+                            .glyph_idx = glyph.id,
+                            .color_idx = theme_idx(list_marker_fg),
+                        };
+
+                        layer.glyph_count += 1;
+                        marker_x += advance;
                     }
 
                     break;
@@ -504,21 +608,56 @@ DrawLayer editor_get_text_layer(rop(rw Editor) editor,
                     break;
                 case MD_NODE_REPLACEMENT: {
                     // Emit data.replacement.text[] (UTF-8) `repeat` times inline.
-                    i32 replacement_codepoints[6];
-                    i64 replacement_codepoint_count = utf8proc_decompose(cur.data.replacement.text,
-                                                                         cur.data.replacement.length,
-                                                                         replacement_codepoints,
-                                                                         6,
-                                                                         UTF8PROC_STABLE);
 
                     ShapedGlyph glyphs[6];
-                    u32         glyphs_count =
-                        font_shape_run(font, replacement_codepoints, (u32)replacement_codepoint_count, glyphs);
+                    u32         glyphs_count;
+                    u32         glyph_buff_idx = 0;
 
-                    for (u32 repeat_index = 0; repeat_index < cur.data.replacement.repeat; repeat_index++) {
-                        x += output_glyphs(
-                            &layer, glyphs, glyphs_count, scale, x, y + font->ascent * scale, text_color_idx);
+                    {
+                        glyphs_count = font_shaper_shape(&editor->fs_state,
+                                                         cur.data.replacement.text,
+                                                         cur.data.replacement.length,
+                                                         (FontShaperShapeOptions){0});
+                        assert(SCOPE_EDITOR, font_shaper_shape_error(&editor->fs_state) == FONTSHAPER_SHAPE_ERROR_NONE);
+
+                        const FontShaperRecord* record = font_shaper_next(&editor->fs_state);
+                        while (record != 0) {
+                            if (record->kind == FONTSHAPER_RECORD_GLYPH) {
+                                glyphs[glyph_buff_idx] = (ShapedGlyph){
+                                    .id       = record->glyph.glyph_id,
+                                    .advance  = (f32)record->glyph.advance_x,
+                                    .offset_x = (f32)record->glyph.offset_x,
+                                    .offset_y = (f32)record->glyph.offset_y,
+                                };
+
+                                glyph_buff_idx += 1;
+                                break;
+                            }
+
+                            record = font_shaper_next(&editor->fs_state);
+                        }
+
+                        for (u32 repeat_index = 0; repeat_index < cur.data.replacement.repeat; repeat_index++) {
+                            for (u32 glyph_idx = 0; glyph_idx < glyphs_count; glyph_idx++) {
+                                ShapedGlyph glyph   = glyphs[glyph_idx];
+                                f32         advance = (f32)glyph.advance * scale;
+
+                                layer.glyphs[layer.glyph_count] = (GlyphDrawCmd){
+                                    .x  = x + glyph.offset_x * scale,
+                                    .y  = y + (font->ascent + glyph.offset_y) * scale,
+                                    .sx = scale,
+                                    .sy = -scale,
+
+                                    .glyph_idx = glyph.id,
+                                    .color_idx = text_color_idx,
+                                };
+
+                                layer.glyph_count += 1;
+                                x += advance;
+                            }
+                        }
                     }
+
                     goto span_done;
                 }
                 case MD_NODE_EMPHASIS:
@@ -651,7 +790,6 @@ DrawLayer editor_get_text_layer(rop(rw Editor) editor,
                         record = font_shaper_next(&editor->fs_state);
                     }
                 }
-
                 //   Later: if the cursor is inside the span use span, if inside
                 //   content use content (for caret/caret-adjacent rendering).
                 //

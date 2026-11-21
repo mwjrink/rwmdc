@@ -162,10 +162,10 @@ typedef struct MdNode {
         // Render text[0..length) repeat times. UTF-8, not NUL-terminated.
         // Covers entities, normalized whitespace and U+FFFD substitution.
         struct {
-            u8  text[6];
-            u8  _padding[2];
-            u32 length; // 1 through 6 bytes.
-            u32 repeat; // At least 1; repetition does not expand the payload.
+            char text[6];
+            u8   _padding[2];
+            u32  length; // 1 through 6 bytes.
+            u32  repeat; // At least 1; repetition does not expand the payload.
         } replacement;
     } data;
 } MdNode;
@@ -179,15 +179,20 @@ typedef struct MdResult {
 // Semantic tags stored as u8; source delimiter bytes and lengths live in L1.
 typedef enum MdL0Tag {
     MD_L0_NONE = 0,
+    MD_L0_EOF,
+    MD_L0_BLANK,
     MD_L0_PARAGRAPH,
-    MD_L0_FENCED_CODE_BLOCK,
     MD_L0_THEMATIC_BREAK,
     MD_L0_UNORDERED_LIST,
+    // TODO MD_L0_ORDERED_LIST,
+    // TODO MD_L0_HTML,
+    // TODO MD_L0_LINK_REF,
+    // TODO MD_L0_TABLE, // NOT IN COMMONMARK SPEC
     MD_L0_ATX_HEADING,
     MD_L0_SETEXT_HEADING,
     MD_L0_BLOCK_QUOTE,
-    MD_L0_BLANK,
-    MD_L0_EOF,
+    MD_L0_FENCED_CODE_BLOCK,
+    MD_L0_FENCE_NO_TRAILING_TEXT,
 } MdL0Tag;
 
 typedef union MdL0Common {
@@ -201,7 +206,7 @@ STATIC_ASSERT(sizeof(MdL0Common) == 4);
 
 // One entry per quote/list candidate, in L0 order.
 typedef struct MdL0Extra {
-    u16 post_indent; // Column after marker and following whitespace.
+    u16 post_indent; // Width in columns of the whitespace after the marker.
 } MdL0Extra;
 STATIC_ASSERT(sizeof(MdL0Extra) == 2);
 
@@ -315,8 +320,8 @@ MdState md_create(rop(ro DocView) source, rop(rw Arena) arena, rop(rw ScratchAre
         ['=']  = MD_L0_SETEXT_HEADING,
         ['>']  = MD_L0_BLOCK_QUOTE,
         ['_']  = MD_L0_THEMATIC_BREAK,
-        ['`']  = MD_L0_FENCED_CODE_BLOCK,
-        ['~']  = MD_L0_FENCED_CODE_BLOCK,
+        ['`']  = MD_L0_FENCE_NO_TRAILING_TEXT,
+        ['~']  = MD_L0_FENCE_NO_TRAILING_TEXT,
     };
 
     const u32 buffer_capacity    = 4096;
@@ -387,7 +392,7 @@ MdState md_create(rop(ro DocView) source, rop(rw Arena) arena, rop(rw ScratchAre
             run_end = source->total_length;
 
         if (run_tag == 0 && !at_line_start) {
-            goto next_run;
+            goto consume_body;
         }
 
         u32 run_length = run_end - run_offset;
@@ -448,6 +453,9 @@ MdState md_create(rop(ro DocView) source, rop(rw Arena) arena, rop(rw ScratchAre
         }
 
         if (!at_line_start) {
+        consume_body:
+            line_tag -=
+                (MD_L0_FENCE_NO_TRAILING_TEXT - MD_L0_FENCED_CODE_BLOCK) * (line_tag == MD_L0_FENCE_NO_TRAILING_TEXT);
             goto next_run;
         }
 
@@ -456,7 +464,7 @@ MdState md_create(rop(ro DocView) source, rop(rw Arena) arena, rop(rw ScratchAre
 
             switch (l0_tag_lookup) {
                 case MD_L0_THEMATIC_BREAK:
-                case MD_L0_FENCED_CODE_BLOCK: {
+                case MD_L0_FENCE_NO_TRAILING_TEXT: {
                     if (run_length < 3) {
                         l0_tag_lookup = MD_L0_NONE;
                     }
@@ -488,13 +496,14 @@ MdState md_create(rop(ro DocView) source, rop(rw Arena) arena, rop(rw ScratchAre
         }
 
         line_tag               = l0_tag;
-        line_common.pre_indent = line_indent;
+        line_common.pre_indent = (u16)line_indent;
         if (l0_tag == MD_L0_PARAGRAPH) {
-            line_common.content_start = run_offset - line_offset;
+            line_common.content_start = (u16)(run_offset - line_offset);
             at_line_start             = false;
             goto next_run;
         }
-        indent = line_indent + run_length;
+        line_indent += run_length;
+        indent = line_indent;
 
         run_offset = run_end;
         if (run_index < run_count) {
@@ -531,13 +540,13 @@ MdState md_create(rop(ro DocView) source, rop(rw Arena) arena, rop(rw ScratchAre
         }
 
         assert(SCOPE_MARKDOWN, indent <= UINT16_MAX);
-        line_indent   = indent;
-        at_line_start = l0_tag == MD_L0_BLANK;
+        at_line_start = (l0_tag == MD_L0_BLANK);
         if (!at_line_start) {
             assert(SCOPE_MARKDOWN, run_offset - line_offset <= UINT16_MAX);
-            line_common.content_start = run_offset - line_offset;
-            line_extra                = (MdL0Extra){.post_indent = indent};
+            line_common.content_start = (u16)(run_offset - line_offset);
+            line_extra                = (MdL0Extra){.post_indent = (u16)(indent - line_indent)};
         }
+        line_indent = indent;
         continue;
 
     next_run:
@@ -620,21 +629,26 @@ MdResult md_get(rop(rw MdState) state, rop(rw Arena) arena, rop(rw ScratchArena)
     assert(SCOPE_MARKDOWN, end > begin);
 
     // Setup: allocations, tables and state shared by both passes.
-    static const u8 context_tags[] = {
-        MD_L0_FENCED_CODE_BLOCK, MD_L0_BLOCK_QUOTE, MD_L0_THEMATIC_BREAK, MD_L0_UNORDERED_LIST};
-    SimdByteScanMany context_table = simd_byte_scan_many_init(context_tags, sizeof(context_tags));
-
-    simdv_i128 fence_tag = splat(MD_L0_FENCED_CODE_BLOCK);
+    static const u8  context_tags[] = {MD_L0_FENCED_CODE_BLOCK,
+                                       MD_L0_FENCE_NO_TRAILING_TEXT,
+                                       MD_L0_BLOCK_QUOTE,
+                                       MD_L0_THEMATIC_BREAK,
+                                       MD_L0_UNORDERED_LIST};
+    SimdByteScanMany context_table  = simd_byte_scan_many_init(context_tags, sizeof(context_tags));
 
     // Include L1 output capacity when inline resolution is implemented.
     usize   capacity    = (usize)state->l0_count + state->mappings_count;
     MdNode* nodes       = scratch_alloc_aligned(scratch, MdNode, capacity);
     u32     nodes_count = 0;
 
-    u32 fence_open          = false;
-    u8  fence_marker_byte   = 0;
-    u32 fence_marker_length = 0;
+    u8   fence_marker_byte   = 0;
+    u32  fence_marker_length = 0; // Zero means no fence is open.
+    u16* list_columns        = scratch_alloc_aligned(scratch, u16, state->l0_count);
+    u32  list_stack_count    = 0;
 
+    list_columns[list_stack_count] = 0; // Top-level content column.
+
+    // TODO Revisit L1 seeks once all lookup sites are known; compare lower-bound search with a sparse L0-to-L1 index.
     u32 extra_idx   = 0;
     u32 l1_idx      = 0;
     u32 mapping_idx = 0;
@@ -686,32 +700,172 @@ MdResult md_get(rop(rw MdState) state, rop(rw Arena) arena, rop(rw ScratchArena)
             active_hit_mask = hit_masks[hit_mask_idx];
         }
 
-        // Select the next hit, or the window's last entry if no hits remain.
-        chunk_idx = buffer_size - 1;
+        u32 next_idx = buffer_size;
         if (active_hit_mask != 0)
-            chunk_idx = hit_mask_idx * 64 + (u32)__tzcnt_u64(active_hit_mask);
+            next_idx = hit_mask_idx * 64 + (u32)__tzcnt_u64(active_hit_mask);
 
-        u32 l0_idx = chunk_start + chunk_idx;
-        u8  l0_tag = buffer_ptr[chunk_idx];
-        u32 l0_end;
+        u32 parent_idx = list_stack_count;
+        if (list_stack_count > 0) {
+            // Check continuation through the next hit, or through the end of the window.
+            u32 check_end = min(next_idx + (active_hit_mask != 0), state->l0_count - 1 - chunk_start);
+            while (chunk_idx < check_end && list_stack_count > 0) {
+                u32 line_idx = chunk_start + chunk_idx;
+                if (state->l0_offsets[line_idx + 1] > begin)
+                    goto rewind_context;
 
-        // EOF is a 0 len sentinel, use it's offset for end. otherwise, use l0_idx + 1
-        l0_end = state->l0_offsets[l0_idx + (1 * l0_tag != MD_L0_EOF)];
+                u8 tag = buffer_ptr[chunk_idx];
+                if (tag != MD_L0_BLANK) {
+                    // TODO Allow lazy continuation of an open paragraph.
+                    u32 pre_indent = state->l0_common[line_idx].pre_indent;
+                    while (pre_indent < list_columns[parent_idx])
+                        parent_idx -= 1;
 
-        if (l0_end > begin) {
-            // Rewind only the skipped entries in this boundary window.
-            while (chunk_idx > 0 && state->l0_offsets[chunk_start + chunk_idx] > begin) {
-                chunk_idx -= 1;
+                    // Outside a fence, commit bullet dedent only after validating the marker.
+                    if (parent_idx < list_stack_count && (fence_marker_length != 0 || tag != MD_L0_UNORDERED_LIST)) {
+                        list_stack_count    = parent_idx;
+                        fence_marker_length = 0;
+                    }
+                }
+
+                if (chunk_idx == next_idx)
+                    break;
+
+                chunk_idx += 1;
             }
-            break;
         }
 
-        extra_idx += (l0_tag == MD_L0_BLOCK_QUOTE || l0_tag == MD_L0_UNORDERED_LIST);
-        chunk_idx += 1;
+        if (active_hit_mask == 0) { // on the last mask AND no hits
+            // Clamp the offset lookup to the last valid index.
+            u32 window_end_idx = min(chunk_start + buffer_size, state->l0_count - 1);
+            if (state->l0_offsets[window_end_idx] > begin) {
+                chunk_idx = buffer_size - 1;
+                break;
+            }
+            chunk_idx = buffer_size;
+            continue;
+        }
 
+        chunk_idx  = next_idx;
+        u32 l0_idx = chunk_start + chunk_idx;
+        u32 l0_end = state->l0_offsets[l0_idx + 1];
+        if (l0_end > begin)
+            break;
+
+        u8 l0_tag = buffer_ptr[chunk_idx];
+        chunk_idx += 1;
         active_hit_mask &= active_hit_mask - 1;
 
-        // update state (fence, indent, blocks); l0_extra_idx applies only to quote/list candidates
+        if (fence_marker_length != 0) {
+            if (l0_tag == MD_L0_FENCE_NO_TRAILING_TEXT &&
+                state->l0_common[l0_idx].pre_indent < (u32)list_columns[list_stack_count] + 4) {
+                u32 l0_start = state->l0_offsets[l0_idx];
+
+                // find l1
+                while (state->l1_offsets[l1_idx] < l0_start)
+                    l1_idx += 1;
+
+                // close the fence if the lengths are appropriate
+                if (state->l1_tags[l1_idx] == fence_marker_byte && state->l1_lengths[l1_idx] >= fence_marker_length)
+                    fence_marker_length = 0;
+            }
+
+            goto state_accumulate_loop_end;
+        }
+
+        // clang-format off
+        switch (l0_tag) {
+            case MD_L0_UNORDERED_LIST: {
+                // clang-format on
+
+                u32 pre_indent = state->l0_common[l0_idx].pre_indent;
+
+                // cheapest early exit
+                if (pre_indent >= ((u32)list_columns[parent_idx] + 4))
+                    break;
+
+                // second cheapest early exit
+                u32 post_indent = state->l0_extra[extra_idx].post_indent;
+                if (post_indent == 0)
+                    break;
+
+                // most expensive early exit/validation
+                u32 l0_start = state->l0_offsets[l0_idx];
+                while (state->l1_offsets[l1_idx] < l0_start)
+                    l1_idx += 1;
+                if (state->l1_lengths[l1_idx] != 1)
+                    break;
+
+                // at this point, this is a valid list continuation
+
+                if (post_indent > 4)
+                    post_indent = 1;
+
+                list_stack_count               = parent_idx + 1;
+                list_columns[list_stack_count] = (u16)(pre_indent + 1 + post_indent);
+                break;
+
+                // clang-format off
+            }
+            case MD_L0_THEMATIC_BREAK: break;
+            case MD_L0_BLOCK_QUOTE: break;
+            case MD_L0_FENCED_CODE_BLOCK:
+            case MD_L0_FENCE_NO_TRAILING_TEXT: {
+                // clang-format on
+
+                if (state->l0_common[l0_idx].pre_indent >= (u32)list_columns[list_stack_count] + 4)
+                    break;
+
+                // A fence candidate's leading marker is its first L1 run.
+                u32 l0_start = state->l0_offsets[l0_idx];
+                while (state->l1_offsets[l1_idx] < l0_start)
+                    l1_idx += 1;
+
+                u8  marker = state->l1_tags[l1_idx];
+                u32 length = state->l1_lengths[l1_idx];
+
+                if (marker == '`' && l0_tag == MD_L0_FENCED_CODE_BLOCK) {
+                    // Backticks are not allowed in a backtick fence's info string.
+                    u32 info_idx = l1_idx + 1;
+                    while (unlikely(info_idx < state->l1_count) && state->l1_offsets[info_idx] < l0_end) {
+                        if (state->l1_tags[info_idx] == '`') {
+                            goto state_accumulate_loop_end;
+                        }
+
+                        info_idx += 1;
+                    }
+                }
+
+                fence_marker_byte   = marker;
+                fence_marker_length = length;
+
+                break;
+                // clang-format off
+            }
+
+            // ---
+
+            case MD_L0_BLANK: 
+            case MD_L0_PARAGRAPH: 
+            // TODO MD_L0_ORDERED_LIST,
+            // TODO MD_L0_HTML,
+            // TODO MD_L0_LINK_REF,
+            // TODO MD_L0_TABLE, // NOT IN COMMONMARK SPEC
+            case MD_L0_ATX_HEADING:
+            case MD_L0_SETEXT_HEADING: 
+            case MD_L0_EOF: 
+            case MD_L0_NONE: // TODO should this go to the end of the enum for perf?
+            default: unreachable(); break;
+        }
+        // clang-format on
+
+    state_accumulate_loop_end:
+        extra_idx += (l0_tag == MD_L0_BLOCK_QUOTE || l0_tag == MD_L0_UNORDERED_LIST);
+    }
+
+rewind_context:
+    // Rewind only the skipped entries in this boundary window.
+    while (state->l0_offsets[chunk_start + chunk_idx] > begin && chunk_idx > 0) {
+        chunk_idx -= 1;
     }
 
     // AT THIS POINT: the current block is set, simd buffer_ptr is filled, cursor is set

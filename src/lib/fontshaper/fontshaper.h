@@ -2711,14 +2711,6 @@ typedef struct FontShaperBreakState
   FontShaperU8 last_word_break_class_including_ignored;
 } FontShaperBreakState;
 
-typedef struct FontShaperDecode
-{
-  int codepoint;
-
-  int source_characters_consumed;
-  int valid;
-} FontShaperDecode;
-
 typedef struct FontShaperEncodeUtf8
 {
     char encoded[4];
@@ -2957,7 +2949,7 @@ typedef struct FontShaperRun
 // State API. Compiled fonts are borrowed and must stay at stable addresses.
 // State is returned by value; variable-sized storage uses one caller-owned block.
 // No allocator is retained.
-#define FONTSHAPER_STATE_API_VERSION 10
+#define FONTSHAPER_STATE_API_VERSION 11
 
 typedef struct FontShaperStateInfo
 {
@@ -3087,8 +3079,9 @@ struct FontShaperState
 
 // Complete UTF-8 byte range; NULL/0 is empty, embedded NUL is a codepoint.
 // Options/input are borrowed only for this call. source_index is an original byte
-// offset, including skipped malformed bytes. Results live in State until its
-// next Shape/Begin (even if it fails) or backing reclamation. Returns drawable
+// offset, including skipped malformed bytes. Structurally malformed sequences
+// use legacy skip lengths; overlong encodings and invalid scalar values fail.
+// Results live in State until its next Shape/Begin (even if it fails) or backing reclamation. Returns drawable
 // glyph count, excluding RUN/HARD_BREAK sentinels. Zero may still have break
 // records (e.g. "\n"); ShapeError is available for optional failure diagnostics.
 FONTSHAPER_EXPORT FontShaperU32 font_shaper_shape(FontShaperState *State,
@@ -3255,7 +3248,6 @@ FONTSHAPER_EXPORT void font_shaper_font_coverage_test_begin(FontShaperFontCovera
 FONTSHAPER_EXPORT void font_shaper_font_coverage_test_codepoint(FontShaperFontCoverageTest *Test, int Codepoint);
 FONTSHAPER_EXPORT int  font_shaper_font_coverage_test_end(FontShaperFontCoverageTest *Test);
 
-FONTSHAPER_EXPORT FontShaperDecode font_shaper_decode_utf8(const char *Utf8, FontShaperUn Length);
 FONTSHAPER_EXPORT FontShaperEncodeUtf8 font_shaper_encode_utf8(int Codepoint);
 FONTSHAPER_EXPORT FontShaperDirection font_shaper_script_direction(FontShaperScript Script);
 FONTSHAPER_EXPORT int font_shaper_script_is_complex(FontShaperScript Script);
@@ -3264,6 +3256,7 @@ FONTSHAPER_EXPORT FontShaperScript font_shaper_script_tag_to_script(FontShaperSc
 #endif
 
 #ifdef FONTSHAPER_IMPLEMENTATION
+#include "fontshaper_utf8.h"
 #ifdef _MSC_VER
 #define FONTSHAPER__UNUSED(X) (void)sizeof((X))
 #define FONTSHAPER__RESTRICT __restrict
@@ -25189,38 +25182,42 @@ FONTSHAPER_EXPORT FontShaperU32 font_shaper_shape(FontShaperState *Context,
     First += font_shaper_internal_input_codepoint_index(First).block_codepoint_count;
   }
   FontShaperU32 Block = 0, At = 0, BlockCount = 1u << (FONTSHAPER__INPUT_CODEPOINT_FIRST_BLOCK_MSB + 1);
-  for(FontShaperU32 Offset = 0; Offset < ByteLength && !Context->error;)
+  for(FontShaperU32 Offset = 0; Offset < ByteLength && Context->error == 0;)
   {
-    FontShaperDecode Decode = font_shaper_decode_utf8(Text + Offset, (FontShaperUn)ByteLength - Offset);
-    if(Decode.valid)
+    uint32_t Codepoints[64], Offsets[64];
+    FontShaperUtf8Result Decoded = font_shaper_decode_utf8_buffer(Text + Offset, ByteLength - Offset,
+        Codepoints, Offsets, FONTSHAPER__ARRAY_LENGTH(Codepoints));
+    for(uint32_t I = 0; I < Decoded.count && Context->error == 0; I += 1)
     {
-      if(Decode.codepoint < 0 || Decode.codepoint > 0x10ffff ||
-         (Decode.codepoint >= 0xd800 && Decode.codepoint <= 0xdfff))
-      { Context->error = FONTSHAPER_SHAPE_ERROR_INVALID_ARGUMENT; break; }
       if(Context->input_codepoint_count == Context->codepoint_capacity)
-      { Context->error = FONTSHAPER_SHAPE_ERROR_INPUT_CAPACITY; break; }
+      { Context->error = FONTSHAPER_SHAPE_ERROR_INPUT_CAPACITY; goto Complete; }
       if(At == BlockCount)
       {
-        ++Block;
+        Block += 1;
         At = 0;
         BlockCount = 1u << (Block + FONTSHAPER__INPUT_CODEPOINT_FIRST_BLOCK_MSB);
       }
-      FontShaperShapeCodepoint *Input = &Context->input_blocks[Block][At++];
+      FontShaperShapeCodepoint *Input = &Context->input_blocks[Block][At];
+      At += 1;
       *Input = FONTSHAPER__ZERO_TYPE(FontShaperShapeCodepoint);
-      Input->codepoint = Decode.codepoint;
-      Input->user_id = (int)Offset; // SourceIndex preserves all unsigned offset bits.
+      Input->codepoint = (int)Codepoints[I];
+      Input->user_id = (int)(Offset + Offsets[I]); // SourceIndex preserves all unsigned offset bits.
       Input->feature_overrides = Context->current_feature_overrides;
       Input->feature_override_count = Context->current_feature_override_count;
       if(Context->input_codepoint_count && Context->input_codepoint_count == Context->last_line_break_index)
         Input->break_flags = FONTSHAPER_BREAK_FLAG_LINE;
-      if(!Context->last_grapheme_break) Context->last_grapheme_break = Input;
-      ++Context->input_codepoint_count;
+      if(Context->last_grapheme_break == 0) Context->last_grapheme_break = Input;
+      Context->input_codepoint_count += 1;
       // The normal breaker and normalization-aware fallback selection remain
       // shared with incremental input; no ASCII-only or manual-run shortcut.
-      font_shaper_break_add_codepoint(&Context->break_state, Decode.codepoint, 1, 0);
+      font_shaper_break_add_codepoint(&Context->break_state, Input->codepoint, 1, 0);
       font_shaper_internal_update_breaks(Context);
     }
-    Offset += Decode.source_characters_consumed;
+    if(Context->error != 0) goto Complete;
+    if(Decoded.error == FONTSHAPER_UTF8_INVALID_SCALAR)
+    { Context->error = FONTSHAPER_SHAPE_ERROR_INVALID_ARGUMENT; goto Complete; }
+    Offset += Decoded.bytes_read;
+    Offset += Decoded.skip_bytes;
   }
   Complete:
   font_shaper_shape_end(Context);
@@ -25352,22 +25349,20 @@ FONTSHAPER_EXPORT void font_shaper_shape_utf8_with_user_id(FontShaperState *Cont
     const char *End = Utf8 + Length;
     int UserId = BaseUserId;
 
-    int CodepointIncrement = (UserIdGenerationMode == FONTSHAPER_USER_ID_GENERATION_MODE_CODEPOINT_INDEX) ? 1 : 0;
-    int SourceCharacterMask = (UserIdGenerationMode == FONTSHAPER_USER_ID_GENERATION_MODE_SOURCE_INDEX) ? ~0 : 0;
-
-    while(At < End)
+    while(At < End && Context->error == 0)
     {
-      FontShaperDecode Decode = font_shaper_decode_utf8(At, (FontShaperUn)(End - At));
-
-      if(Decode.valid)
+      uint32_t Codepoint, Offset;
+      FontShaperUtf8Result Decoded = font_shaper_decode_utf8_buffer(At, (uint32_t)(End - At), &Codepoint, &Offset, 1);
+      if(Decoded.error == FONTSHAPER_UTF8_INVALID_SCALAR)
+      { Context->error = FONTSHAPER_SHAPE_ERROR_INVALID_ARGUMENT; break; }
+      if(Decoded.count != 0)
       {
-        font_shaper_shape_codepoint_with_user_id(Context, Decode.codepoint, UserId);
-
-        UserId += CodepointIncrement;
+        font_shaper_shape_codepoint_with_user_id(Context, (int)Codepoint, UserId);
+        if(UserIdGenerationMode == FONTSHAPER_USER_ID_GENERATION_MODE_CODEPOINT_INDEX) UserId += 1;
       }
-
-      At += Decode.source_characters_consumed;
-      UserId += Decode.source_characters_consumed & SourceCharacterMask;
+      uint32_t Consumed = Decoded.bytes_read + Decoded.skip_bytes;
+      At += Consumed;
+      if(UserIdGenerationMode == FONTSHAPER_USER_ID_GENERATION_MODE_SOURCE_INDEX) UserId += (int)Consumed;
     }
   }
 }
@@ -25379,26 +25374,21 @@ FONTSHAPER_EXPORT void font_shaper_shape_utf8(FontShaperState *Context, const ch
   {
     const char *At = Utf8;
     const char *End = Utf8 + Length;
-    while(At < End)
+    while(At < End && Context->error == 0)
     {
-      FontShaperDecode Decode = font_shaper_decode_utf8(At, (FontShaperUn)(End - At));
-
-      if(Decode.valid)
+      uint32_t Codepoint, Offset;
+      FontShaperUtf8Result Decoded = font_shaper_decode_utf8_buffer(At, (uint32_t)(End - At), &Codepoint, &Offset, 1);
+      if(Decoded.error == FONTSHAPER_UTF8_INVALID_SCALAR)
+      { Context->error = FONTSHAPER_SHAPE_ERROR_INVALID_ARGUMENT; break; }
+      if(Decoded.count != 0)
       {
         int Increment = 0;
-        if(UserIdGenerationMode == FONTSHAPER_USER_ID_GENERATION_MODE_CODEPOINT_INDEX)
-        {
-          Increment = 1;
-        }
-        else if(UserIdGenerationMode == FONTSHAPER_USER_ID_GENERATION_MODE_SOURCE_INDEX)
-        {
-          Increment = Decode.source_characters_consumed;
-        }
-
-        font_shaper_internal_shape_codepoint(Context, Decode.codepoint, Increment);
+        if(UserIdGenerationMode == FONTSHAPER_USER_ID_GENERATION_MODE_CODEPOINT_INDEX) Increment = 1;
+        else if(UserIdGenerationMode == FONTSHAPER_USER_ID_GENERATION_MODE_SOURCE_INDEX) Increment = (int)Decoded.bytes_read;
+        font_shaper_internal_shape_codepoint(Context, (int)Codepoint, Increment);
+        At += Decoded.bytes_read;
       }
-
-      At += Decode.source_characters_consumed;
+      else At += Decoded.skip_bytes;
     }
   }
 }
@@ -31877,14 +31867,10 @@ FONTSHAPER_EXPORT void font_shaper_guess_text_properties(void *Text, int TextSiz
 
       case FONTSHAPER_TEXT_FORMAT_UTF8:
       {
-        FontShaperDecode Decode = font_shaper_decode_utf8(At, End - At);
-
-        PositionIncrement = Decode.source_characters_consumed;
-
-        if(Decode.valid)
-        {
-          Codepoint = Decode.codepoint;
-        }
+        uint32_t Offset;
+        FontShaperUtf8Result Decoded = font_shaper_decode_utf8_buffer(At, (uint32_t)(End - At), &Codepoint, &Offset, 1);
+        if(Decoded.count != 0) PositionIncrement = Decoded.bytes_read;
+        else if(Decoded.skip_bytes != 0) PositionIncrement = Decoded.skip_bytes;
       } break;
       }
 
@@ -31996,15 +31982,9 @@ FONTSHAPER_EXPORT void font_shaper_break_entire_string(FontShaperDirection Direc
 
     case FONTSHAPER_TEXT_FORMAT_UTF8:
     {
-      FontShaperDecode Decode = font_shaper_decode_utf8(InputElement, End - InputElement);
-
-      if(Decode.valid)
-      {
-        Codepoint = Decode.codepoint;
-
-        InputElementSize = Decode.source_characters_consumed;
-        SourceCharacterCount = Decode.source_characters_consumed;
-      }
+      uint32_t Offset;
+      FontShaperUtf8Result Decoded = font_shaper_decode_utf8_buffer(InputElement, (uint32_t)(End - InputElement), &Codepoint, &Offset, 1);
+      if(Decoded.count != 0) InputElementSize = SourceCharacterCount = Decoded.bytes_read;
     } break;
     }
 
@@ -32086,87 +32066,6 @@ FONTSHAPER_EXPORT void font_shaper_break_entire_string_utf8(FontShaperDirection 
                                             FontShaperBreakFlags *BreakFlags, int BreakFlagCapacity, int *BreakFlagCount)
 {
   font_shaper_break_entire_string(Direction, JapaneseLineBreakStyle, ConfigFlags, Utf8, Utf8Length, FONTSHAPER_TEXT_FORMAT_UTF8, Breaks, BreakCapacity, BreakCount, BreakFlags, BreakFlagCapacity, BreakFlagCount);
-}
-
-FONTSHAPER_EXPORT FontShaperDecode font_shaper_decode_utf8(const char *Utf8, FontShaperUn Length)
-{
-  FontShaperDecode Result = FONTSHAPER__ZERO;
-  const char *Utf8Start = Utf8;
-
-  if(Length)
-  {
-    FontShaperU8 First = (FontShaperU8)*Utf8++;
-    FontShaperUn FollowupCharacterCount = 0;
-
-    switch((First & 0xF0) >> 4)
-    {
-    case 0:
-    case 1:
-    case 2:
-    case 3:
-    case 4:
-    case 5:
-    case 6:
-    case 7:
-    {
-      Result.codepoint = First & 0x7F;
-      Result.valid = 1;
-    }
-    break;
-
-    case 0xC:
-    case 0xD:
-    {
-      FollowupCharacterCount = 1;
-      Result.codepoint = First & 0x1F;
-      Result.valid = 1;
-    }
-    break;
-
-    case 0xE:
-    {
-      FollowupCharacterCount = 2;
-      Result.codepoint = First & 0xF;
-      Result.valid = 1;
-    }
-    break;
-
-    case 0xF:
-    {
-      FollowupCharacterCount = 3;
-      Result.codepoint = First & 7;
-      Result.valid = 1;
-    }
-    break;
-    }
-
-    if(Length > FollowupCharacterCount)
-    {
-      FONTSHAPER__FOR(FollowupCharacterIndex, 0, FollowupCharacterCount)
-      {
-        FontShaperU8 C = (FontShaperU8)*Utf8++;
-
-        if((C & 0xC0) == 0x80)
-        {
-          Result.codepoint = (Result.codepoint << 6) | (C & 0x3F);
-        }
-        else
-        {
-          Result.valid = 0;
-
-          break;
-        }
-      }
-    }
-    else
-    {
-      Result.valid = 0;
-    }
-  }
-
-  Result.source_characters_consumed = (FontShaperU32)(Utf8 - Utf8Start);
-
-  return Result;
 }
 
 FONTSHAPER_EXPORT FontShaperEncodeUtf8 font_shaper_encode_utf8(int Codepoint)
