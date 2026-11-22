@@ -11,7 +11,8 @@ setup = source[setup_start:source.index("    // Loop 1:", start)]
 a = source.index("    while (chunk_start < state->l0_count)", source.index("    // Loop 1:", start))
 loop = source[a:source.index("    // AT THIS POINT:", a)]
 fence_loop = loop.replace("state_accumulate_loop_end", "fence_test_loop_end").replace(
-    "rewind_context", "fence_test_rewind")
+    "rewind_context", "fence_test_rewind").replace("rejected_bullet", "fence_test_rejected_bullet").replace(
+    "check_all_loop_end", "fence_test_check_all_loop_end")
 qstart = source.index("        if (chunk_idx == buffer_size)", source.index("    // Loop 2:", start))
 qend = source.index("\n        }", qstart) + len("\n        }")
 query_refill = source[qstart:qend]
@@ -149,11 +150,32 @@ checked:
     u8 fence_doc[] = "``` info`bad\n   ``` ok\n> quote\n- item\n``\n~~~\n```` text\n    ````\n ````\t\n"
                      "~~~~ info`ok\n~~~\n~~~~~\n+no-space\n++ repeated\n-   item\n"
                      "    + child\n      - grandchild\n     - sibling\n- top\n"
-                     "\n  ```\n  literal\n# heading\ntext\n```\ntext\n";
-    const u32 lengths[] = {0, 0, 3, 3, 3, 3, 3, 3, 3, 0, 4, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 3, 0, 0, 3};
-    const u8 markers[] = {0, 0, '`', '`', '`', '`', '`', '`', '`', 0, '~', '~', 0, 0, 0, 0, 0, 0, 0, 0, 0, '`', '`', 0, 0, '`'};
-    const u16 list_tops[] = {4, 6, 8, 7, 2, 2, 2, 2, 0, 0, 0};
-    const u32 list_depths[] = {1, 2, 3, 2, 1, 1, 1, 1, 0, 0, 0};
+                     "\n  ```\n  literal\n# heading\ntext\n```\ntext\n"
+                     "```\n- item\nlazy\n\n  indented\n\ndedented\nafter\n"
+                     "- item\n+bad\n\n+bad\n- item\n  ```\n+bad\nafter\n"
+                     "- *emphasis*\nlazy\n\noutside\n- # heading\noutside\nafter\n"
+                     "- #hashtag\nlazy\n\noutside\n- #\noutside\n"
+                     "- item\n  #hashtag\nlazy\n  #\noutside\nafter\n";
+    const u32 lengths[] = {0, 0, 3, 3, 3, 3, 3, 3, 3, 0, 4, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 3, 0, 0, 3,
+                           3, 0, 0, 0, 0, 0, 0, 0,
+                           0, 0, 0, 0, 0, 0, 3, 0,
+                           0, 0, 0, 0, 0, 0, 0,
+                           0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    const u8 markers[] = {0, 0, '`', '`', '`', '`', '`', '`', '`', 0, '~', '~', 0, 0, 0, 0, 0, 0, 0, 0, 0, '`', '`', 0, 0, '`',
+                         '`', 0, 0, 0, 0, 0, 0, 0,
+                         0, 0, 0, 0, 0, 0, '`', 0,
+                         0, 0, 0, 0, 0, 0, 0};
+    const u16 list_tops[] = {4, 6, 8, 7, 2, 2, 2, 2, 0, 0, 0, 0, 0, 2, 2, 2, 2, 2, 0,
+                            0, 2, 2, 2, 0, 2, 2, 0,
+                            0, 2, 2, 2, 0, 2, 0,
+                            0, 2, 2, 2, 0, 2, 0, 2, 2, 2, 2, 0};
+    const u32 list_depths[] = {1, 2, 3, 2, 1, 1, 1, 1, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 0,
+                               0, 1, 1, 1, 0, 1, 1, 0,
+                               0, 1, 1, 1, 0, 1, 0,
+                               0, 1, 1, 1, 0, 1, 0, 1, 1, 1, 1, 0};
+    const u32 paragraphs[] = {1, 1, 0, 1, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0,
+                              0, 1, 1, 0, 0, 0, 0,
+                              0, 1, 1, 0, 0, 0, 0, 1, 1, 1, 0, 0};
     DocPiece piece = {.bytes = fence_doc, .length = sizeof(fence_doc) - 1};
     DocView view = {.pieces = &piece, .count = 1, .total_length = piece.length};
     Arena arena = arena_create();
@@ -166,7 +188,11 @@ checked:
 ''' + setup + fence_loop + r'''
         CHECK(chunk_start + chunk_idx == i && fence_marker_length == lengths[i]);
         CHECK(extra_idx == (u32)(i > 2) + (u32)(i > 3) + (u32)(i > 12) + (u32)(i > 13) +
-                           (u32)(i > 14) + (u32)(i > 15) + (u32)(i > 16) + (u32)(i > 17) + (u32)(i > 18));
+                           (u32)(i > 14) + (u32)(i > 15) + (u32)(i > 16) + (u32)(i > 17) +
+                           (u32)(i > 18) + (u32)(i > 27) + (u32)(i > 34) + (u32)(i > 35) +
+                           (u32)(i > 37) + (u32)(i > 38) + (u32)(i > 40) +
+                           (u32)(i > 42) + (u32)(i > 46) + (u32)(i > 49) + (u32)(i > 53) + (u32)(i > 55));
+        if (i >= 28) CHECK(paragraph_open == paragraphs[i - 28]);
         if (fence_marker_length != 0) CHECK(fence_marker_byte == markers[i]);
         if (i <= 14) CHECK(list_stack_count == 0 && list_columns[0] == 0);
         else {

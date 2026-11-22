@@ -120,6 +120,7 @@ internal Editor editor_create(
             editor.markers.bullet_count =
                 font_shaper_shape(&editor.fs_state, bullet, sizeof(bullet) - 1, (FontShaperShapeOptions){0});
             assert(SCOPE_EDITOR, font_shaper_shape_error(&editor.fs_state) == FONTSHAPER_SHAPE_ERROR_NONE);
+            assert(SCOPE_EDITOR, editor.markers.bullet_count <= 1);
 
             u32                     glyph_idx = 0;
             const FontShaperRecord* record    = font_shaper_next(&editor.fs_state);
@@ -145,6 +146,7 @@ internal Editor editor_create(
             editor.markers.task_unchecked_count = font_shaper_shape(
                 &editor.fs_state, task_unchecked, sizeof(task_unchecked) - 1, (FontShaperShapeOptions){0});
             assert(SCOPE_EDITOR, font_shaper_shape_error(&editor.fs_state) == FONTSHAPER_SHAPE_ERROR_NONE);
+            assert(SCOPE_EDITOR, editor.markers.task_unchecked_count <= 3);
 
             u32                     glyph_idx = 0;
             const FontShaperRecord* record    = font_shaper_next(&editor.fs_state);
@@ -158,7 +160,6 @@ internal Editor editor_create(
                     };
 
                     glyph_idx += 1;
-                    break;
                 }
 
                 record = font_shaper_next(&editor.fs_state);
@@ -171,6 +172,7 @@ internal Editor editor_create(
             editor.markers.task_checked_count = font_shaper_shape(
                 &editor.fs_state, task_checked, sizeof(task_checked) - 1, (FontShaperShapeOptions){0});
             assert(SCOPE_EDITOR, font_shaper_shape_error(&editor.fs_state) == FONTSHAPER_SHAPE_ERROR_NONE);
+            assert(SCOPE_EDITOR, editor.markers.task_checked_count <= 3);
 
             u32                     glyph_idx = 0;
             const FontShaperRecord* record    = font_shaper_next(&editor.fs_state);
@@ -184,7 +186,6 @@ internal Editor editor_create(
                     };
 
                     glyph_idx += 1;
-                    break;
                 }
 
                 record = font_shaper_next(&editor.fs_state);
@@ -311,7 +312,7 @@ DrawLayer editor_get_ui_layer(rop(rw Editor) editor,
                 break;
             case FONTSHAPER_RECORD_HARD_BREAK:
                 break;
-            case FONTSHAPER_RECORD_GLYPH:
+            case FONTSHAPER_RECORD_GLYPH: {
                 f32 advance = (f32)record->glyph.advance_x * scale;
 
                 if (x + advance > ((f32)width - MARGIN) / 3) {
@@ -328,6 +329,7 @@ DrawLayer editor_get_ui_layer(rop(rw Editor) editor,
                 x += advance;
 
                 break;
+            }
         }
 
         record = font_shaper_next(&editor->fs_state);
@@ -509,22 +511,26 @@ DrawLayer editor_get_text_layer(rop(rw Editor) editor,
                     } else {
                         // Ordered "N." number varies; shape fresh.
                         char marker_chars[16]  = {0};
-                        u32  marker_char_count = 0;
+                        u32  marker_char_count = 15;
                         {
+                            // TODO '1.' vs '1)'
+                            marker_chars[marker_char_count] = '.';
+                            marker_char_count -= 1;
                             u32 number = cur.data.item.number;
                             do {
                                 marker_chars[marker_char_count] = (char)('0' + number % 10);
-                                marker_char_count += 1;
+                                marker_char_count -= 1;
                                 number /= 10;
-                            } while (number && marker_char_count < 9);
-                            marker_chars[marker_char_count++] = '.';
+                            } while (number > 0 && marker_char_count > 5);
                         }
 
                         glyphs             = glyph_buff;
                         u32 glyph_buff_idx = 0;
                         {
-                            glyphs_count = font_shaper_shape(
-                                &editor->fs_state, marker_chars, marker_char_count, (FontShaperShapeOptions){0});
+                            glyphs_count = font_shaper_shape(&editor->fs_state,
+                                                             marker_chars + marker_char_count + 1,
+                                                             15 - marker_char_count,
+                                                             (FontShaperShapeOptions){0});
                             assert(SCOPE_EDITOR,
                                    font_shaper_shape_error(&editor->fs_state) == FONTSHAPER_SHAPE_ERROR_NONE);
 
@@ -539,7 +545,6 @@ DrawLayer editor_get_text_layer(rop(rw Editor) editor,
                                     };
 
                                     glyph_buff_idx += 1;
-                                    break;
                                 }
 
                                 record = font_shaper_next(&editor->fs_state);
@@ -619,6 +624,7 @@ DrawLayer editor_get_text_layer(rop(rw Editor) editor,
                                                          cur.data.replacement.length,
                                                          (FontShaperShapeOptions){0});
                         assert(SCOPE_EDITOR, font_shaper_shape_error(&editor->fs_state) == FONTSHAPER_SHAPE_ERROR_NONE);
+                        assert(SCOPE_EDITOR, glyphs_count <= 6);
 
                         const FontShaperRecord* record = font_shaper_next(&editor->fs_state);
                         while (record != 0) {
@@ -631,7 +637,6 @@ DrawLayer editor_get_text_layer(rop(rw Editor) editor,
                                 };
 
                                 glyph_buff_idx += 1;
-                                break;
                             }
 
                             record = font_shaper_next(&editor->fs_state);
@@ -754,14 +759,9 @@ DrawLayer editor_get_text_layer(rop(rw Editor) editor,
                                 // NOTE We are guaranteed to not have a hard break here because of markdown processing
                                 //      and the fact that we ignore everything except LF
                                 break;
-                            case FONTSHAPER_RECORD_GLYPH:
+                            case FONTSHAPER_RECORD_GLYPH: {
                                 // Wrap at permitted boundaries and draw.
                                 f32 advance = (f32)record->glyph.advance_x * scale;
-
-                                // Guaranteed no line breaks
-                                if ((record->glyph.break_flags & FONTSHAPER_BREAK_FLAG_LINE_SOFT) != 0) {
-                                    last_break_idx = layer.glyph_count;
-                                }
 
                                 // wrap at width on glyph boundaries (ligatures intact)
                                 if (x + advance > (f32)width - MARGIN) {
@@ -777,6 +777,11 @@ DrawLayer editor_get_text_layer(rop(rw Editor) editor,
                                     y += dy;
                                 }
 
+                                // Guaranteed no line breaks
+                                if ((record->glyph.break_flags & FONTSHAPER_BREAK_FLAG_LINE_SOFT) != 0) {
+                                    last_break_idx = layer.glyph_count;
+                                }
+
                                 // append GlyphDrawCmd
                                 layer.glyphs[layer.glyph_count] =
                                     glyph_draw_cmd(record, font, x, y, scale, text_color_idx);
@@ -785,6 +790,7 @@ DrawLayer editor_get_text_layer(rop(rw Editor) editor,
                                 x += advance;
 
                                 break;
+                            }
                         }
 
                         record = font_shaper_next(&editor->fs_state);

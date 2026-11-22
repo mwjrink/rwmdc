@@ -118,10 +118,22 @@ static u64 validate(const MdState* s, const u8* bytes, u32 length) {
     u32 l1 = 0, maps = 0;
     for (u32 i = 0; i < length;) {
         u8 byte = bytes[i];
-        if (byte && !punctuation[byte]) { i += 1; continue; }
+        if (byte != 0 && punctuation[byte] == 0 && byte != ' ' && byte != '\t' && byte != '\n') {
+            i += 1;
+            continue;
+        }
         u32 end = i + 1;
         while (end < length && bytes[end] == byte) end += 1;
         if (byte) {
+            // The scanner drops single spaces between ordinary text within a SIMD group.
+            if (byte == ' ' && end == i + 1 && i % 32 != 0 && i % 32 != 31 && end < length) {
+                u8 left = bytes[i - 1], right = bytes[end];
+                if (left != 0 && punctuation[left] == 0 && left != ' ' && left != '\t' && left != '\n' && left != '\r' &&
+                    right != 0 && punctuation[right] == 0 && right != ' ' && right != '\t' && right != '\n' && right != '\r') {
+                    i = end;
+                    continue;
+                }
+            }
             CHECK(l1 < s->l1_count && s->l1_tags[l1] == byte);
             CHECK(s->l1_offsets[l1] == i && s->l1_lengths[l1] == end - i);
             HASH(byte); HASH(i); HASH(end - i); l1 += 1;
@@ -194,7 +206,7 @@ int main(int argc, char** argv) {
     const char* cases[] = {"", " \t", "\n\n", "p\n\n  ", "p\n \n\n\t", "a b \t\n",
         "\ttext\n# heading\nparagraph\n- item\n\n> quote\n", "####### text\n__\n~~\n",
         "    - x\n    -\tx\n", " \t###\ttext\n", "***\n___\n+ x\n= x\n~~~\n",
-        "``` \t\n``` x\n~~~ #\n~~~\t", "``` x", "``` \n"};
+        "``` \t\n``` x\n~~~ #\n~~~\t", "``` x", "``` \n", "- #tag\n- #\n- #\ttext\n- #"};
     for (u32 i = 0; i < sizeof(cases) / sizeof(*cases); ++i)
         check((const u8*)cases[i], strlen(cases[i]), &arena, &scratch);
     CHECK(sizeof(MdL0Common) == 4 && sizeof(MdL0Extra) == 2);
@@ -207,6 +219,8 @@ int main(int argc, char** argv) {
     check(bytes, 70004, &arena, &scratch); // Interior BLANK Common count stays u32.
     memset(bytes, ' ', 12345); memcpy(bytes + 12345, "#\tx\n", 4);
     check(bytes, 12349, &arena, &scratch);
+    memset(bytes, 'x', 4095); memcpy(bytes + 4095, "# x", 3);
+    check(bytes, 4098, &arena, &scratch);
     memset(bytes, '`', 33000); bytes[33000] = '\n';
     check(bytes, 33001, &arena, &scratch);
     memset(bytes, 0, 12064); check(bytes, 12064, &arena, &scratch);

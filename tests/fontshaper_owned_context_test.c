@@ -64,7 +64,7 @@ static Result read_result(FontShaperState* shaper) {
         }
         CHECK(!count);
     }
-    CHECK(result.count == shaper->glyph_storage.live_count); // Expert reader includes separator glyphs.
+    CHECK(result.count == shaper->glyph_storage->live_count); // Expert reader includes separator glyphs.
     unsigned first = result.count;
     for (unsigned i = font_shaper_shape_run_count(shaper); i > 0; --i) {
         FontShaperRun run;
@@ -582,6 +582,42 @@ static void record_stream(TestFont* fonts) {
     free(backing.base);
 }
 
+static void move_state(TestFont* fonts) {
+    Backing backing = {0};
+    FontShaperState* state = create(fonts, 1, INPUT_CAPACITY, GLYPH_CAPACITY, CACHE_BYTES, &backing);
+    FontShaperState* old = allocate(sizeof(*old));
+    *old = *state;
+    FontShaperFeatureOverride feature = {FONTSHAPER_FEATURE_TAG_liga, 0};
+    FontShaperShapeOptions options = {.features = &feature, .feature_count = 1};
+    const char text[] = "office";
+    CHECK(font_shaper_shape(old, text, sizeof(text) - 1, options) == 6);
+    FontShaperUn cache_used = old->cache_memory.used;
+    FontShaperRun run;
+    CHECK(font_shaper_shape_get_run(old, 0, &run));
+    FontShaperShapeCodepointIterator input = font_shaper_shape_current_codepoints_iterator(old);
+    CHECK(font_shaper_next(old)->kind == FONTSHAPER_RECORD_RUN);
+    *state = *old;
+    free(old);
+
+    FontShaperGlyph* glyph;
+    CHECK(font_shaper_glyph_iterator_next(&run.glyphs, &glyph));
+    CHECK(font_shaper_next(state) == &glyph->output);
+    FontShaperShapeCodepoint codepoint;
+    CHECK(font_shaper_shape_codepoint_iterator_next(&input, &codepoint, NULL));
+    CHECK(codepoint.codepoint == 'o');
+    CHECK(font_shaper_shape(state, text, sizeof(text) - 1, options) == 6);
+    CHECK(state->cache_memory.used == cache_used);
+
+    CHECK(font_shaper_shape_begin(state, 0, 0) == FONTSHAPER_SHAPE_ERROR_NONE);
+    font_shaper_shape_codepoint(state, 'f');
+    FontShaperState moved = *state;
+    memset(state, 0xa5, sizeof(*state));
+    font_shaper_shape_codepoint(&moved, 'i');
+    CHECK(font_shaper_shape_end(&moved) == FONTSHAPER_SHAPE_ERROR_NONE);
+    CHECK(font_shaper_shape_glyph_count(&moved) == 1);
+    free(backing.base);
+}
+
 int main(void) {
     TestFont fonts[] = {
         load_font("/usr/share/fonts/TTF/NotoSerifNerdFont-Regular.ttf"),
@@ -597,6 +633,7 @@ int main(void) {
     batch_equivalence(fonts, 0);
     batch_failures(fonts);
     record_stream(fonts);
+    move_state(fonts);
     for (unsigned i = 0; i < 3; ++i) { free(fonts[i].compiled); free(fonts[i].blob); }
     puts("fontshaper caller storage: deterministic size, exact/unaligned bounds, eager results, passive rereads, language bounds, whole-buffer/options/byte offsets, failure/retry and lifetime checks passed");
     return 0;

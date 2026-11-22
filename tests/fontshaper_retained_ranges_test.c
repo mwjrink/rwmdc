@@ -58,7 +58,7 @@ static Result collect(TestState* state) {
         }
     }
     CHECK(!font_shaper_shape_error(shaper));
-    CHECK(shaper->glyph_storage.live_count == result.count);
+    CHECK(shaper->glyph_storage->live_count == result.count);
     FontShaperUn pass_used = shaper->pass_memory.used;
     FontShaperUn cache_used = shaper->cache_memory.used;
     for (unsigned repeat = 0; repeat < 3; ++repeat) {
@@ -72,7 +72,7 @@ static Result collect(TestState* state) {
                 FontShaperGlyph* glyph;
                 CHECK(font_shaper_glyph_iterator_next(&it, &glyph));
                 CHECK(reread.count < result.count);
-                CHECK(glyph == &shaper->glyph_storage.glyphs[slots[reread.count]]);
+                CHECK(glyph == &shaper->glyph_storage->glyphs[slots[reread.count]]);
                 CHECK(!memcmp(glyph, &saved[reread.count], sizeof(*glyph)));
                 reread.glyphs[reread.count++] = public_glyph(shaper, &ranges[i].run, glyph);
             }
@@ -81,7 +81,7 @@ static Result collect(TestState* state) {
         }
         same_result(&result, &reread);
         CHECK(shaper->pass_memory.used == pass_used && shaper->cache_memory.used == cache_used);
-        CHECK(shaper->next_run == run_count && !shaper->glyph_storage.range_active);
+        CHECK(shaper->next_run == run_count && !shaper->glyph_storage->range_active);
     }
     return result;
 }
@@ -105,7 +105,7 @@ static void capacity_check(TestFont* fonts) {
     CHECK(font_shaper_shape_end(retained.shaper) == FONTSHAPER_SHAPE_ERROR_OUT_OF_MEMORY);
     FontShaperRun run;
     CHECK(!font_shaper_shape_run(retained.shaper, &run));
-    CHECK(retained.shaper->glyph_storage.live_count <= 8);
+    CHECK(retained.shaper->glyph_storage->live_count <= 8);
     free_test_state(&retained);
     free_test_state(&reference);
 }

@@ -15,7 +15,7 @@ already implemented in `fontshaper.h`.
 Related measurements: [font-shaping-optimizations.md](font-shaping-optimizations.md).
 The ASCII spike remains experimental; integrating it is not a prerequisite.
 
-## Current ownership: concrete state and caller-supplied backing (API version 10)
+## Current ownership: movable state and caller-supplied backing (API version 12)
 
 This supersedes the allocator-based ownership implemented during steps 2–3.
 There is only one normal creation path; the old allocator constructor/type and
@@ -35,10 +35,11 @@ FontShaperU32 count = font_shaper_shape(&state, text, length, options);
   state/context APIs. The query excludes `sizeof(FontShaperState)` and includes
   padding for any backing alignment; creation partitions glyph/scratch/cache
   storage inside that block. No opaque state wrapper or second mutable object.
-- Constructor-local self-pointers are avoided: arena pointers and config-list
-  sentinels bind on Begin at the caller's final address. A newly created state
-  can be returned/copied before first use; keep its address stable after Begin.
-  Copies share backing, so they are not independent shaping states.
+- State can be moved by value before, during, or after shaping. Glyph storage
+  and input-block tables live in caller backing, so existing readers survive
+  a state move. Cache lists are null-terminated and never link to state fields.
+  Copies share backing; continue shaping from only one copy. Starting another
+  shaping operation invalidates previous results on that backing.
 - No public allocator callbacks, stored allocator, backing-release callback,
   ownership pointer/size or library destroy operation. Only the internal storage
   pointers/bounds needed to reuse the state are retained.

@@ -2877,7 +2877,7 @@ typedef struct FontShaperShapeCodepoint
 typedef struct FontShaperShapeCodepointIterator
 {
   FontShaperShapeCodepoint *codepoint;
-  FontShaperState *state;
+  FontShaperShapeCodepoint *const *input_blocks;
 
   FontShaperU32 end_block_index;
   FontShaperU32 one_past_last_codepoint_index;
@@ -2949,7 +2949,7 @@ typedef struct FontShaperRun
 // State API. Compiled fonts are borrowed and must stay at stable addresses.
 // State is returned by value; variable-sized storage uses one caller-owned block.
 // No allocator is retained.
-#define FONTSHAPER_STATE_API_VERSION 11
+#define FONTSHAPER_STATE_API_VERSION 12
 
 typedef struct FontShaperStateInfo
 {
@@ -2974,8 +2974,9 @@ typedef struct FontShaperShapeOptions
 
 // Concrete, caller-owned bookkeeping. Arrays/cache/workspace live in the supplied
 // backing block, not inside this value. Treat fields as implementation details.
-// Return/copy the newly created value freely; keep its address stable after the
-// first Begin/Shape. Copies share backing storage, not independent shaping state.
+// The state can move by value during or after shaping; iterators survive the move.
+// Copies share backing; use only one copy to continue or start shaping. Starting
+// another operation invalidates old results on that backing, regardless of copy.
 typedef struct FontShaperInternalMemory
 {
   void *data;
@@ -2989,6 +2990,7 @@ typedef struct FontShaperInternalArena
 } FontShaperInternalArena;
 #define FONTSHAPER__INPUT_CODEPOINT_FIRST_BLOCK_MSB 6
 #define FONTSHAPER__INPUT_CODEPOINT_ONE_PAST_LAST_BLOCK_MSB 27
+#define FONTSHAPER__INPUT_BLOCK_COUNT (FONTSHAPER__INPUT_CODEPOINT_ONE_PAST_LAST_BLOCK_MSB - FONTSHAPER__INPUT_CODEPOINT_FIRST_BLOCK_MSB)
 typedef FontShaperU32 FontShaperInternalStateFlags;
 
 typedef struct FontShaperInternalStateFont
@@ -2996,30 +2998,16 @@ typedef struct FontShaperInternalStateFont
   FontShaperFont *font;
 } FontShaperInternalStateFont;
 
-typedef struct FontShaperInternalExistingShapeConfigBlockHeader
-{
-  struct FontShaperInternalExistingShapeConfigBlockHeader *prev;
-  struct FontShaperInternalExistingShapeConfigBlockHeader *next;
-} FontShaperInternalExistingShapeConfigBlockHeader;
-
-typedef struct FontShaperInternalExistingGlyphConfigBlockHeader
-{
-  struct FontShaperInternalExistingGlyphConfigBlockHeader *prev;
-  struct FontShaperInternalExistingGlyphConfigBlockHeader *next;
-} FontShaperInternalExistingGlyphConfigBlockHeader;
-
 struct FontShaperState
 {
   void *state_scratch, *state_glyphs;
   FontShaperUn state_scratch_size;
   FontShaperU32 phase; // 0: idle/failed, 1: input, 2: complete.
-  FontShaperInternalArena scratch_arena;
   FontShaperInternalMemory pass_memory;
   FontShaperUn codepoint_capacity, glyph_capacity, execution_mark;
   FontShaperUn cached_scratch_size, cached_codepoint_capacity, cached_glyph_capacity;
   FontShaperLanguage cached_scratch_language;
   // ponytail: append-only cache; add between-pass eviction for unbounded style churn.
-  FontShaperInternalArena cache_arena;
   FontShaperInternalMemory cache_memory;
   FontShaperB32 config_cache_dirty;
 
@@ -3033,9 +3021,9 @@ struct FontShaperState
 
   FontShaperUn input_codepoint_count;
   int next_user_id;
-  FontShaperShapeCodepoint *input_blocks[FONTSHAPER__INPUT_CODEPOINT_ONE_PAST_LAST_BLOCK_MSB - FONTSHAPER__INPUT_CODEPOINT_FIRST_BLOCK_MSB];
+  FontShaperShapeCodepoint **input_blocks;
 
-  FontShaperGlyphStorage glyph_storage;
+  FontShaperGlyphStorage *glyph_storage;
   FontShaperShapeScratchpad *execution_scratchpad;
 
   FontShaperStateFlags public_flags; // Flags that can be set by the user at creation time.
@@ -3064,10 +3052,9 @@ struct FontShaperState
   FontShaperU32 next_run;
   FontShaperU32 read_run, read_glyph, read_remaining, read_stage; // Flat read cursor only.
   FontShaperU32 output_glyph_count; // Drawable GLYPH records only, excludes sentinels.
-  FontShaperU32 empty_run_boundary;
 
-  FontShaperInternalExistingShapeConfigBlockHeader existing_shape_config_block_sentinel;
-  FontShaperInternalExistingGlyphConfigBlockHeader existing_glyph_config_block_sentinel;
+  struct FontShaperInternalExistingShapeConfigBlock *shape_config_head, *shape_config_tail;
+  struct FontShaperInternalExistingGlyphConfigBlock *glyph_config_head, *glyph_config_tail;
 
   FontShaperU32 scratch_feature_override_count;
   FontShaperFeatureOverride scratch_feature_overrides[FONTSHAPER_MAX_SIMULTANEOUS_FEATURES];
@@ -12620,12 +12607,6 @@ struct FontShaperGlyphConfig
   FontShaperU32 has_enabled_lookups;
 };
 
-typedef struct FontShaperInternalArenaLifetime
-{
-  FontShaperInternalArena *arena;
-  FontShaperUn used;
-} FontShaperInternalArenaLifetime;
-
 
 typedef struct FontShaperInternalGlyphRange
 {
@@ -12826,7 +12807,7 @@ typedef struct FontShaperInternalExistingGlyphConfig
 #define FONTSHAPER__EXISTING_SHAPE_CONFIGS_PER_BLOCK 32
 typedef struct FontShaperInternalExistingShapeConfigBlock
 {
-  FontShaperInternalExistingShapeConfigBlockHeader header;
+  struct FontShaperInternalExistingShapeConfigBlock *next;
 
   FontShaperU32 count;
   FontShaperInternalExistingShapeConfig items[FONTSHAPER__EXISTING_SHAPE_CONFIGS_PER_BLOCK];
@@ -12835,7 +12816,7 @@ typedef struct FontShaperInternalExistingShapeConfigBlock
 #define FONTSHAPER__EXISTING_GLYPH_CONFIGS_PER_BLOCK 32
 typedef struct FontShaperInternalExistingGlyphConfigBlock
 {
-  FontShaperInternalExistingGlyphConfigBlockHeader header;
+  struct FontShaperInternalExistingGlyphConfigBlock *next;
 
   FontShaperU32 count;
   FontShaperInternalExistingGlyphConfig items[FONTSHAPER__EXISTING_GLYPH_CONFIGS_PER_BLOCK];
@@ -12855,17 +12836,6 @@ typedef struct FontShaperInternalRunMetadata
   FontShaperU32 context_end;
   FontShaperU32 first_glyph, glyph_count;
 } FontShaperInternalRunMetadata;
-
-FONTSHAPER_INLINE FontShaperB32 font_shaper_internal_existing_shape_config_block_is_valid(FontShaperState *Context, FontShaperInternalExistingShapeConfigBlock *Block)
-{
-  FontShaperB32 Result = &Block->header != &Context->existing_shape_config_block_sentinel;
-  return Result;
-}
-FONTSHAPER_INLINE FontShaperB32 font_shaper_internal_existing_glyph_config_block_is_valid(FontShaperState *Context, FontShaperInternalExistingGlyphConfigBlock *Block)
-{
-  FontShaperB32 Result = &Block->header != &Context->existing_glyph_config_block_sentinel;
-  return Result;
-}
 
 typedef struct FontShaperInternalIndicScriptProperties
 {
@@ -15070,11 +15040,6 @@ static int font_shaper_internal_byte_swap_lookup(FontShaperInternalByteswapConte
   return Result;
 }
 
-#define FONTSHAPER__DLLIST_REMOVE(Node) do {(Node)->prev->next = (Node)->next; (Node)->next->prev = (Node)->prev;} while(0)
-#define FONTSHAPER__DLLIST_INSERT_BEFORE(A, B) do{(A)->next = (B); (A)->prev = (B)->prev; (A)->prev->next = (A)->next->prev = (A);} while(0)
-#define FONTSHAPER__DLLIST_INSERT_AFTER(A, B) do{(A)->prev = (B); (A)->next = (B)->next; (A)->prev->next = (A)->next->prev = (A);} while(0)
-#define FONTSHAPER__DLLIST_SENTINEL_INIT(Sentinel) do{(Sentinel)->prev = (Sentinel)->next = (Sentinel);} while(0)
-
 static void font_shaper_internal_byte_swap_coverage(FontShaperInternalByteswapContext *Context, FontShaperInternalCoverage *Coverage)
 {
   if(!font_shaper_internal_already_visited(Context, Coverage))
@@ -17159,27 +17124,13 @@ static void *font_shaper_internal_push_size(FontShaperInternalArena *Arena, Font
   if(!Result) Arena->error = 1;
   return Result;
 }
-static void *font_shaper_internal_push_array_size(FontShaperInternalArena *Arena, FontShaperUn Count, FontShaperUn Size, FontShaperUn Align)
+static void *font_shaper_internal_memory_push_array_size(FontShaperInternalMemory *Memory, FontShaperUn Count, FontShaperUn Size, FontShaperUn Align)
 {
-  if(Size && Count > (FontShaperUn)-1 / Size)
-  { Arena->error = 1; if(Arena->memory) Arena->memory->error = 1; return 0; }
-  return font_shaper_internal_push_size(Arena, Count * Size, Align);
+  if(Size != 0 && Count > (FontShaperUn)-1 / Size)
+  { Memory->error = 1; return 0; }
+  return font_shaper_internal_memory_push(Memory, Count * Size, Align);
 }
-#define font_shaper_internal_push_type(Arena, Type) (Type *)font_shaper_internal_push_size((Arena), sizeof(Type), FONTSHAPER_ALIGNOF(Type))
-#define font_shaper_internal_push_array(Arena, Type, Count) (Type *)font_shaper_internal_push_array_size((Arena), (Count), sizeof(Type), FONTSHAPER_ALIGNOF(Type))
-
-static FontShaperInternalArenaLifetime font_shaper_internal_begin_lifetime(FontShaperInternalArena *Arena)
-{
-  FontShaperInternalArenaLifetime Result = FONTSHAPER__ZERO;
-  Result.arena = Arena;
-  Result.used = Arena->memory ? Arena->memory->used : 0;
-  return Result;
-}
-static void font_shaper_internal_end_lifetime(FontShaperInternalArenaLifetime *Lifetime)
-{
-  if(Lifetime->arena && Lifetime->arena->memory)
-    Lifetime->arena->memory->used = Lifetime->used;
-}
+#define font_shaper_internal_memory_push_array(Memory, Type, Count) (Type *)font_shaper_internal_memory_push_array_size((Memory), (Count), sizeof(Type), FONTSHAPER_ALIGNOF(Type))
 
 static FontShaperUn font_shaper_internal_probe_capacity(FontShaperShapeConfig *Config)
 {
@@ -24338,18 +24289,16 @@ FONTSHAPER_EXPORT FontShaperState *font_shaper_place_state_header(void *Memory, 
   FontShaperState *Result = FONTSHAPER__ALIGN_POINTER(FontShaperState, Memory, FONTSHAPER_ALIGNOF(FontShaperState));
   FONTSHAPER_MEMSET(Result, 0, sizeof(*Result));
   Result->public_flags = Flags;
-  FONTSHAPER__DLLIST_SENTINEL_INIT(&Result->existing_shape_config_block_sentinel);
-  FONTSHAPER__DLLIST_SENTINEL_INIT(&Result->existing_glyph_config_block_sentinel);
   return Result;
 }
 
 static void font_shaper_internal_reset_state_configs(FontShaperState *Context)
 {
   Context->cache_memory.used = 0;
-  Context->cache_memory.error = Context->cache_arena.error = 0;
+  Context->cache_memory.error = 0;
   Context->config_cache_dirty = 0;
-  FONTSHAPER__DLLIST_SENTINEL_INIT(&Context->existing_shape_config_block_sentinel);
-  FONTSHAPER__DLLIST_SENTINEL_INIT(&Context->existing_glyph_config_block_sentinel);
+  Context->shape_config_head = Context->shape_config_tail = 0;
+  Context->glyph_config_head = Context->glyph_config_tail = 0;
   Context->prepared_shape_config = 0;
   Context->prepared_feature_overrides = 0;
   Context->prepared_glyph_config = 0;
@@ -24363,7 +24312,6 @@ FONTSHAPER_EXPORT int font_shaper_set_state_cache(FontShaperState *Context, void
   Context->cache_memory = FONTSHAPER__ZERO_TYPE(FontShaperInternalMemory);
   Context->cache_memory.data = Memory;
   Context->cache_memory.capacity = Size;
-  Context->cache_arena.memory = &Context->cache_memory;
   Context->cached_scratch_size = 0;
   font_shaper_internal_reset_state_configs(Context);
   return 1;
@@ -24610,6 +24558,8 @@ static FontShaperUn font_shaper_internal_state_scratch_size(FontShaperState *Con
   if(ConfigMax && Keys <= ConfigTotal / ConfigMax) ConfigTotal = Keys * ConfigMax;
   FontShaperUn Size = 0;
 #define FONTSHAPER__PASS(N,T) if(!font_shaper_internal_bound_add(&Size,(N),sizeof(T),FONTSHAPER_ALIGNOF(T))) return 0
+  FONTSHAPER__PASS(1,FontShaperGlyphStorage);
+  FONTSHAPER__PASS(FONTSHAPER__INPUT_BLOCK_COUNT,FontShaperShapeCodepoint *);
   FONTSHAPER__PASS(Runs + 1,FontShaperU32);
   FONTSHAPER__PASS(CodepointCapacity,FontShaperU32); // Output cluster projection.
   FONTSHAPER__PASS(Runs,FontShaperInternalRunMetadata);
@@ -24667,14 +24617,16 @@ static void font_shaper_internal_shape_begin(FontShaperState *Context, FontShape
   Context->phase = 1;
   {
     FontShaperUn Size = font_shaper_size_of_state_scratch(Context, Language, CodepointCapacity, GlyphCapacity);
-    if(!Scratch || !Size || !font_shaper_initialize_glyph_storage(&Context->glyph_storage, Destination, GlyphCapacity))
+    if(Scratch == 0 || Size == 0)
     { Context->error = FONTSHAPER_SHAPE_ERROR_OUT_OF_MEMORY; return; }
     Context->pass_memory = FONTSHAPER__ZERO_TYPE(FontShaperInternalMemory);
     Context->pass_memory.data = Scratch;
     Context->pass_memory.capacity = Size;
-    Context->scratch_arena.memory = &Context->pass_memory;
-    Context->cache_arena.memory = &Context->cache_memory;
-    Context->scratch_arena.error = 0;
+    Context->glyph_storage = font_shaper_internal_memory_push_array(&Context->pass_memory, FontShaperGlyphStorage, 1);
+    Context->input_blocks = font_shaper_internal_memory_push_array(&Context->pass_memory, FontShaperShapeCodepoint *, FONTSHAPER__INPUT_BLOCK_COUNT);
+    if(Context->glyph_storage == 0 || Context->input_blocks == 0 ||
+        font_shaper_initialize_glyph_storage(Context->glyph_storage, Destination, GlyphCapacity) == 0)
+    { Context->error = FONTSHAPER_SHAPE_ERROR_OUT_OF_MEMORY; return; }
     Context->codepoint_capacity = CodepointCapacity;
     Context->glyph_capacity = GlyphCapacity;
     Context->execution_mark = 0;
@@ -24685,11 +24637,11 @@ static void font_shaper_internal_shape_begin(FontShaperState *Context, FontShape
     Context->prepared_glyph_config = 0;
     if(!Context->cache_memory.data || Context->config_cache_dirty)
       font_shaper_internal_reset_state_configs(Context);
-    FONTSHAPER_MEMSET(Context->input_blocks, 0, sizeof(Context->input_blocks));
+    FONTSHAPER_MEMSET(Context->input_blocks, 0, sizeof(*Context->input_blocks) * FONTSHAPER__INPUT_BLOCK_COUNT);
     Context->run_capacity = (FontShaperU32)CodepointCapacity + 1;
-    Context->run_boundaries = font_shaper_internal_push_array(&Context->scratch_arena, FontShaperU32, (FontShaperUn)Context->run_capacity + 1);
-    Context->output_clusters = font_shaper_internal_push_array(&Context->scratch_arena, FontShaperU32, CodepointCapacity);
-    Context->runs = font_shaper_internal_push_array(&Context->scratch_arena, FontShaperInternalRunMetadata, Context->run_capacity);
+    Context->run_boundaries = font_shaper_internal_memory_push_array(&Context->pass_memory, FontShaperU32, (FontShaperUn)Context->run_capacity + 1);
+    Context->output_clusters = font_shaper_internal_memory_push_array(&Context->pass_memory, FontShaperU32, CodepointCapacity);
+    Context->runs = font_shaper_internal_memory_push_array(&Context->pass_memory, FontShaperInternalRunMetadata, Context->run_capacity);
     if(!Context->run_boundaries || !Context->output_clusters || !Context->runs)
     { Context->error = FONTSHAPER_SHAPE_ERROR_OUT_OF_MEMORY; return; }
 
@@ -24711,7 +24663,6 @@ static void font_shaper_internal_shape_begin(FontShaperState *Context, FontShape
     Context->read_run = Context->read_remaining = Context->read_stage = 0;
     Context->output_glyph_count = 0;
     Context->read_glyph = FONTSHAPER__GLYPH_END;
-    if(!Context->run_boundaries) Context->run_boundaries = &Context->empty_run_boundary;
     Context->run_boundaries[0] = 0;
 
     font_shaper_break_begin(&Context->break_state, ParagraphDirection, FONTSHAPER_JAPANESE_LINE_BREAK_STYLE_NORMAL, 0);
@@ -24771,10 +24722,6 @@ FONTSHAPER_EXPORT FontShaperState font_shaper_create_state(void *Memory, FontSha
   Result.state_scratch_size = ScratchSize;
   if(Info->cache_size) Result.cache_memory.data = font_shaper_internal_pointer_push(&Bump, Info->cache_size, 1);
   Result.cache_memory.capacity = Info->cache_size;
-  // Self-referential arenas/list sentinels are bound at Begin, at the caller's
-  // final address, never to this constructor-local value.
-  Result.config_cache_dirty = 1;
-  font_shaper_initialize_glyph_storage(&Result.glyph_storage, Result.state_glyphs, Info->glyph_capacity);
   return Result;
 }
 
@@ -24783,7 +24730,7 @@ FONTSHAPER_EXPORT FontShaperShapeError font_shaper_shape_begin(FontShaperState *
 {
   if(!Context || !Context->state_scratch) return FONTSHAPER_SHAPE_ERROR_INVALID_ARGUMENT;
   if(Context->error == FONTSHAPER_SHAPE_ERROR_OUT_OF_MEMORY ||
-     Context->cache_memory.error || Context->cache_arena.error) Context->config_cache_dirty = 1;
+     Context->cache_memory.error) Context->config_cache_dirty = 1;
   Context->error = FONTSHAPER_SHAPE_ERROR_NONE;
   Context->phase = 0;
   Context->flags = 0;
@@ -24845,7 +24792,7 @@ static FontShaperShapeCodepoint *font_shaper_internal_input_codepoint(FontShaper
     FontShaperShapeCodepoint *Block = Context->input_blocks[InputIndex.block_index];
     if(!Block && AllocateIfNeeded)
     {
-      Block = font_shaper_internal_push_array(&Context->scratch_arena, FontShaperShapeCodepoint, InputIndex.block_codepoint_count);
+      Block = font_shaper_internal_memory_push_array(&Context->pass_memory, FontShaperShapeCodepoint, InputIndex.block_codepoint_count);
       if(!Block)
       {
         Context->error = FONTSHAPER_SHAPE_ERROR_OUT_OF_MEMORY;
@@ -24872,7 +24819,7 @@ static FontShaperShapeCodepointIterator font_shaper_internal_input_codepoint_ite
     FontShaperInternalInputCodepointIndex StartInputIndex = font_shaper_internal_input_codepoint_index(StartCodepointIndex);
     FontShaperInternalInputCodepointIndex OnePastLastInputIndex = font_shaper_internal_input_codepoint_index(OnePastLastCodepointIndex);
 
-    Result.state = Context;
+    Result.input_blocks = Context->input_blocks;
     Result.block_index = StartInputIndex.block_index;
     Result.codepoint_index = StartInputIndex.codepoint_index;
     Result.end_block_index = OnePastLastInputIndex.block_index;
@@ -24895,11 +24842,14 @@ static int font_shaper_internal_next_input_codepoint(FontShaperShapeCodepointIte
 {
   int Result = 0;
 
+  if(It->input_blocks == 0 || It->block_index > It->end_block_index) return 0;
   if(It->codepoint_index >= It->current_block_codepoint_count)
   {
     It->block_index += 1;
     It->codepoint_index = 0;
-    It->current_block_codepoint_count = (It->block_index == It->end_block_index) ? It->one_past_last_codepoint_index : (1u << (It->block_index + FONTSHAPER__INPUT_CODEPOINT_FIRST_BLOCK_MSB));
+    if(It->block_index > It->end_block_index) return 0;
+    if(It->block_index == It->end_block_index) It->current_block_codepoint_count = It->one_past_last_codepoint_index;
+    else It->current_block_codepoint_count = 1u << (It->block_index + FONTSHAPER__INPUT_CODEPOINT_FIRST_BLOCK_MSB);
   }
 
   if((It->block_index <= It->end_block_index) &&
@@ -24910,7 +24860,8 @@ static int font_shaper_internal_next_input_codepoint(FontShaperShapeCodepointIte
       *CodepointIndex = (int)It->flat_codepoint_index;
     }
 
-    It->codepoint = &It->state->input_blocks[It->block_index][It->codepoint_index++];
+    It->codepoint = &It->input_blocks[It->block_index][It->codepoint_index];
+    It->codepoint_index += 1;
     It->flat_codepoint_index += 1;
 
     Result = 1;
@@ -24921,7 +24872,7 @@ static int font_shaper_internal_next_input_codepoint(FontShaperShapeCodepointIte
 
 FONTSHAPER_EXPORT int font_shaper_shape_codepoint_iterator_is_valid(FontShaperShapeCodepointIterator *It)
 {
-  int Result = It->state && (It->block_index <= It->end_block_index);
+  int Result = It->input_blocks != 0 && (It->block_index <= It->end_block_index);
   return Result;
 }
 
@@ -25142,7 +25093,7 @@ static FontShaperB32 font_shaper_internal_resolve_effective_features(FontShaperS
     if(!Set)
     {
       FontShaperUn Bytes = sizeof(*Set) + (Count - 1) * sizeof(*Values);
-      Set = (FontShaperInternalEffectiveFeatures *)font_shaper_internal_push_size(&Context->scratch_arena, Bytes,
+      Set = (FontShaperInternalEffectiveFeatures *)font_shaper_internal_memory_push(&Context->pass_memory, Bytes,
           FONTSHAPER_ALIGNOF(FontShaperInternalEffectiveFeatures));
       if(!Set)
       {
@@ -25635,9 +25586,9 @@ FONTSHAPER_EXPORT FontShaperShapeError font_shaper_shape_end(FontShaperState *Co
   }
   if(Context->state_scratch && Context->error == FONTSHAPER_SHAPE_ERROR_OUT_OF_MEMORY)
   {
-    if(Context->cache_memory.error || Context->cache_arena.error)
+    if(Context->cache_memory.error != 0)
       Context->error = FONTSHAPER_SHAPE_ERROR_CACHE_CAPACITY;
-    else if(Context->glyph_storage.error)
+    else if(Context->glyph_storage != 0 && Context->glyph_storage->error != 0)
       Context->error = FONTSHAPER_SHAPE_ERROR_GLYPH_CAPACITY;
   }
   Context->next_run = 0;
@@ -25650,11 +25601,10 @@ FONTSHAPER_EXPORT FontShaperShapeError font_shaper_shape_end(FontShaperState *Co
 
 static FontShaperShapeConfig *font_shaper_internal_find_or_create_shape_config(FontShaperState *Context, FontShaperFont *Font, FontShaperScript Script, FontShaperLanguage Language)
 {
-  FontShaperInternalArena *ConfigArena = &Context->scratch_arena;
-  if(Context->cache_memory.data) ConfigArena = &Context->cache_arena;
-  for(FontShaperInternalExistingShapeConfigBlock *Block = (FontShaperInternalExistingShapeConfigBlock *)Context->existing_shape_config_block_sentinel.next;
-      font_shaper_internal_existing_shape_config_block_is_valid(Context, Block);
-      Block = (FontShaperInternalExistingShapeConfigBlock *)Block->header.next)
+  FontShaperInternalMemory *ConfigMemory = &Context->pass_memory;
+  if(Context->cache_memory.data) ConfigMemory = &Context->cache_memory;
+  for(FontShaperInternalExistingShapeConfigBlock *Block = Context->shape_config_head;
+      Block != 0; Block = Block->next)
   {
     FONTSHAPER__FOR(I, 0, Block->count)
     {
@@ -25663,34 +25613,39 @@ static FontShaperShapeConfig *font_shaper_internal_find_or_create_shape_config(F
         return Existing->config;
     }
   }
-  FontShaperInternalExistingShapeConfigBlock *Last = (FontShaperInternalExistingShapeConfigBlock *)Context->existing_shape_config_block_sentinel.prev;
-  if(!font_shaper_internal_existing_shape_config_block_is_valid(Context, Last) ||
-     Last->count == FONTSHAPER__EXISTING_SHAPE_CONFIGS_PER_BLOCK)
+  FontShaperInternalExistingShapeConfigBlock *Last = Context->shape_config_tail;
+  if(Last == 0 || Last->count == FONTSHAPER__EXISTING_SHAPE_CONFIGS_PER_BLOCK)
   {
-    FontShaperInternalExistingShapeConfigBlock *Block = font_shaper_internal_push_type(ConfigArena, FontShaperInternalExistingShapeConfigBlock);
-    if(!Block)
+    FontShaperInternalExistingShapeConfigBlock *Block = font_shaper_internal_memory_push_array(ConfigMemory, FontShaperInternalExistingShapeConfigBlock, 1);
+    if(Block == 0)
     {
       Context->error = FONTSHAPER_SHAPE_ERROR_OUT_OF_MEMORY;
       return 0;
     }
-    FONTSHAPER__DLLIST_INSERT_BEFORE(&Block->header, &Context->existing_shape_config_block_sentinel);
+    Block->next = 0;
     Block->count = 0;
-    Last = Block;
+    if(Last != 0) Last->next = Block;
+    else Context->shape_config_head = Block;
+    Context->shape_config_tail = Last = Block;
   }
   FontShaperUn Size = (FontShaperUn)font_shaper_size_of_shape_config(Font, Script, Language);
   void *Output = 0;
-  if(Size) Output = font_shaper_internal_push_size(ConfigArena, Size, 1);
-  FontShaperInternalArenaLifetime Lifetime = font_shaper_internal_begin_lifetime(&Context->scratch_arena);
-  void *Scratch = Size ? font_shaper_internal_push_size(&Context->scratch_arena, Size, 1) : 0;
-  FontShaperShapeConfig *Result = Output && Scratch ? font_shaper_place_shape_config(Font, Script, Language,
-      Output, Scratch, 0) : 0;
-  font_shaper_internal_end_lifetime(&Lifetime);
+  if(Size != 0) Output = font_shaper_internal_memory_push(ConfigMemory, Size, 1);
+  FontShaperUn Mark = Context->pass_memory.used;
+  FontShaperShapeConfig *Result = 0;
+  if(Output != 0)
+  {
+    void *Scratch = font_shaper_internal_memory_push(&Context->pass_memory, Size, 1);
+    if(Scratch != 0) Result = font_shaper_place_shape_config(Font, Script, Language, Output, Scratch, 0);
+  }
+  Context->pass_memory.used = Mark;
   if(!Result)
   {
     Context->error = FONTSHAPER_SHAPE_ERROR_OUT_OF_MEMORY;
     return 0;
   }
-  FontShaperInternalExistingShapeConfig *Existing = &Last->items[Last->count++];
+  FontShaperInternalExistingShapeConfig *Existing = &Last->items[Last->count];
+  Last->count += 1;
   Existing->config = Result;
   Existing->font = Font;
   Existing->script = Script;
@@ -25701,11 +25656,10 @@ static FontShaperShapeConfig *font_shaper_internal_find_or_create_shape_config(F
 static FontShaperGlyphConfig *font_shaper_internal_find_or_create_glyph_config(FontShaperState *Context, FontShaperShapeConfig *ShapeConfig, FontShaperFeatureOverride *FeatureOverrides, int FeatureOverrideCount)
 {
   if(!FeatureOverrideCount) return 0;
-  FontShaperInternalArena *ConfigArena = &Context->scratch_arena;
-  if(Context->cache_memory.data) ConfigArena = &Context->cache_arena;
-  for(FontShaperInternalExistingGlyphConfigBlock *Block = (FontShaperInternalExistingGlyphConfigBlock *)Context->existing_glyph_config_block_sentinel.next;
-      font_shaper_internal_existing_glyph_config_block_is_valid(Context, Block);
-      Block = (FontShaperInternalExistingGlyphConfigBlock *)Block->header.next)
+  FontShaperInternalMemory *ConfigMemory = &Context->pass_memory;
+  if(Context->cache_memory.data) ConfigMemory = &Context->cache_memory;
+  for(FontShaperInternalExistingGlyphConfigBlock *Block = Context->glyph_config_head;
+      Block != 0; Block = Block->next)
   {
     FONTSHAPER__FOR(I, 0, Block->count)
     {
@@ -25719,23 +25673,24 @@ static FontShaperGlyphConfig *font_shaper_internal_find_or_create_glyph_config(F
       if(Match == Existing->feature_override_count) return Existing->glyph_config;
     }
   }
-  FontShaperInternalExistingGlyphConfigBlock *Last = (FontShaperInternalExistingGlyphConfigBlock *)Context->existing_glyph_config_block_sentinel.prev;
-  if(!font_shaper_internal_existing_glyph_config_block_is_valid(Context, Last) ||
-     Last->count == FONTSHAPER__EXISTING_GLYPH_CONFIGS_PER_BLOCK)
+  FontShaperInternalExistingGlyphConfigBlock *Last = Context->glyph_config_tail;
+  if(Last == 0 || Last->count == FONTSHAPER__EXISTING_GLYPH_CONFIGS_PER_BLOCK)
   {
-    FontShaperInternalExistingGlyphConfigBlock *Block = font_shaper_internal_push_type(ConfigArena, FontShaperInternalExistingGlyphConfigBlock);
-    if(!Block)
+    FontShaperInternalExistingGlyphConfigBlock *Block = font_shaper_internal_memory_push_array(ConfigMemory, FontShaperInternalExistingGlyphConfigBlock, 1);
+    if(Block == 0)
     {
       Context->error = FONTSHAPER_SHAPE_ERROR_OUT_OF_MEMORY;
       return 0;
     }
-    FONTSHAPER__DLLIST_INSERT_BEFORE(&Block->header, &Context->existing_glyph_config_block_sentinel);
+    Block->next = 0;
     Block->count = 0;
-    Last = Block;
+    if(Last != 0) Last->next = Block;
+    else Context->glyph_config_head = Block;
+    Context->glyph_config_tail = Last = Block;
   }
   if(Context->cache_memory.data)
   {
-    FontShaperFeatureOverride *Copy = font_shaper_internal_push_array(ConfigArena, FontShaperFeatureOverride, (FontShaperUn)FeatureOverrideCount);
+    FontShaperFeatureOverride *Copy = font_shaper_internal_memory_push_array(ConfigMemory, FontShaperFeatureOverride, (FontShaperUn)FeatureOverrideCount);
     if(!Copy)
     {
       Context->error = FONTSHAPER_SHAPE_ERROR_OUT_OF_MEMORY;
@@ -25746,7 +25701,7 @@ static FontShaperGlyphConfig *font_shaper_internal_find_or_create_glyph_config(F
   }
   FontShaperUn Size = (FontShaperUn)font_shaper_size_of_glyph_config(ShapeConfig, FeatureOverrides, FeatureOverrideCount);
   void *Output = 0;
-  if(Size) Output = font_shaper_internal_push_size(ConfigArena, Size, 1);
+  if(Size != 0) Output = font_shaper_internal_memory_push(ConfigMemory, Size, 1);
   FontShaperGlyphConfig *Result = 0;
   if(Output) Result = font_shaper_place_glyph_config(ShapeConfig, FeatureOverrides, FeatureOverrideCount, Output);
   if(!Result)
@@ -25754,7 +25709,8 @@ static FontShaperGlyphConfig *font_shaper_internal_find_or_create_glyph_config(F
     Context->error = FONTSHAPER_SHAPE_ERROR_OUT_OF_MEMORY;
     return 0;
   }
-  FontShaperInternalExistingGlyphConfig *Existing = &Last->items[Last->count++];
+  FontShaperInternalExistingGlyphConfig *Existing = &Last->items[Last->count];
+  Last->count += 1;
   Existing->shape_config = ShapeConfig;
   Existing->feature_overrides = FeatureOverrides;
   Existing->feature_override_count = (FontShaperU32)FeatureOverrideCount;
@@ -25926,10 +25882,11 @@ static int font_shaper_internal_execute_run(FontShaperState *Context, FontShaper
   FontShaperU32 First = Context->run_boundaries[Index], End = Context->run_boundaries[Index + 1];
   FontShaperInternalRunMetadata *Metadata = &Context->runs[Index];
   FontShaperShapeConfig *Config = Metadata->config;
-  FontShaperU32 Before = Context->glyph_storage.live_count;
+  FontShaperGlyphStorage *Storage = Context->glyph_storage;
+  FontShaperU32 Before = Storage->live_count;
   // ponytail: GSUB slot-bitsets can span the retained prefix; rebase their index
   // if many tiny runs make those row scans significant, without moving glyphs.
-  Context->glyph_storage.first = Context->glyph_storage.end = FONTSHAPER__GLYPH_END;
+  Storage->first = Storage->end = FONTSHAPER__GLYPH_END;
   if(First != End)
   {
     FontShaperShapeCodepointIterator It = font_shaper_internal_input_codepoint_iterator(Context, First, End);
@@ -25937,34 +25894,36 @@ static int font_shaper_internal_execute_run(FontShaperState *Context, FontShaper
     while(font_shaper_internal_next_input_codepoint(&It, &InputIndex))
     {
       FontShaperShapeCodepoint *Input = It.codepoint;
-      if(!font_shaper_internal_push_mapped_glyph(&Context->glyph_storage, Config->font, Input->codepoint,
+      if(!font_shaper_internal_push_mapped_glyph(Storage, Config->font, Input->codepoint,
           Input->glyph_config, InputIndex, Input->mapped_glyph_id))
         goto OutOfMemory;
     }
-    if(Context->execution_scratchpad) Context->scratch_arena.memory->used = Context->execution_mark;
-    Context->execution_mark = Context->scratch_arena.memory->used;
+    if(Context->execution_scratchpad != 0) Context->pass_memory.used = Context->execution_mark;
+    Context->execution_mark = Context->pass_memory.used;
     FontShaperUn Size = font_shaper_size_of_shape_scratchpad(Config, Context->glyph_capacity);
-    void *Scratch = Size ? font_shaper_internal_push_size(&Context->scratch_arena, Size, 1) : 0;
-    Context->execution_scratchpad = Scratch ? font_shaper_place_shape_scratchpad(Config, Scratch, Context->glyph_capacity) : 0;
+    void *Scratch = 0;
+    if(Size != 0) Scratch = font_shaper_internal_memory_push(&Context->pass_memory, Size, 1);
+    Context->execution_scratchpad = 0;
+    if(Scratch != 0) Context->execution_scratchpad = font_shaper_place_shape_scratchpad(Config, Scratch, Context->glyph_capacity);
     if(!Context->execution_scratchpad) goto OutOfMemory;
     FontShaperShapeScratchpad *Scratchpad = Context->execution_scratchpad;
     if(Metadata->context_first < First)
       Scratchpad->joining_before = font_shaper_internal_get_unicode_joining_type(font_shaper_internal_input_codepoint(Context, Metadata->context_first, 0)->codepoint);
     if(Metadata->context_end > End)
       Scratchpad->joining_after = font_shaper_internal_get_unicode_joining_type(font_shaper_internal_input_codepoint(Context, Metadata->context_end - 1, 0)->codepoint);
-    font_shaper_internal_shape_direct(Scratchpad, &Context->glyph_storage, Metadata->direction);
-    if(Scratchpad->error || Context->glyph_storage.error)
+    font_shaper_internal_shape_direct(Scratchpad, Storage, Metadata->direction);
+    if(Scratchpad->error || Storage->error)
     {
       Context->error = Scratchpad->error;
       if(!Context->error) Context->error = FONTSHAPER_SHAPE_ERROR_OUT_OF_MEMORY;
       return 0;
     }
   }
-  Metadata->first_glyph = Context->glyph_storage.first;
-  Metadata->glyph_count = Context->glyph_storage.live_count - Before;
-  for(FontShaperU32 At = Metadata->first_glyph; At != Context->glyph_storage.end; At = Context->glyph_storage.links[At].next)
+  Metadata->first_glyph = Storage->first;
+  Metadata->glyph_count = Storage->live_count - Before;
+  for(FontShaperU32 At = Metadata->first_glyph; At != Storage->end; At = Storage->links[At].next)
   {
-    FontShaperGlyph *Glyph = &Context->glyph_storage.glyphs[At];
+    FontShaperGlyph *Glyph = &Storage->glyphs[At];
     if(Glyph->user_id_or_codepoint_index < 0 || (FontShaperUn)Glyph->user_id_or_codepoint_index >= Context->input_codepoint_count)
     { Context->error = FONTSHAPER_SHAPE_ERROR_INVALID_FONT; return 0; }
     FontShaperShapeCodepoint *Input = font_shaper_internal_input_codepoint(Context, (FontShaperU32)Glyph->user_id_or_codepoint_index, 0);
@@ -26027,7 +25986,7 @@ FONTSHAPER_EXPORT int font_shaper_shape_get_run(FontShaperState *Context, FontSh
   Run->direction = Metadata->direction;
   Run->paragraph_direction = Metadata->paragraph_direction;
   Run->flags = Metadata->flags;
-  Run->glyphs.glyph_storage = &Context->glyph_storage;
+  Run->glyphs.glyph_storage = Context->glyph_storage;
   Run->glyphs.current_index = Metadata->first_glyph;
   Run->glyphs.remaining = Metadata->glyph_count;
   return 1;
@@ -26053,8 +26012,8 @@ FONTSHAPER_EXPORT const FontShaperRecord *font_shaper_next(FontShaperState *Stat
     }
     while(State->read_remaining)
     {
-      const FontShaperGlyph *Glyph = &State->glyph_storage.glyphs[State->read_glyph];
-      State->read_glyph = State->glyph_storage.links[State->read_glyph].next;
+      const FontShaperGlyph *Glyph = &State->glyph_storage->glyphs[State->read_glyph];
+      State->read_glyph = State->glyph_storage->links[State->read_glyph].next;
       --State->read_remaining;
       if(Glyph->output_kind) return &Glyph->output;
     }

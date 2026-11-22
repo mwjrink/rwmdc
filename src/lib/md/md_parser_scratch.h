@@ -212,6 +212,11 @@ STATIC_ASSERT(sizeof(MdL0Extra) == 2);
 
 typedef struct MdL1Metadata MdL1Metadata;
 
+// L1 tags store the ASCII marker plus this flag on '#' runs with an ATX terminator.
+enum {
+    MD_L1_ATX_SEPARATOR = 0x80,
+};
+
 typedef struct MdMap {
     u32        offset;
     u8         text[6];
@@ -411,7 +416,13 @@ MdState md_create(rop(ro DocView) source, rop(rw Arena) arena, rop(rw ScratchAre
                 };
                 mappings_count += 1;
             } else {
-                l1_tags[l1_count]    = run_tag;
+                u8 l1_tag = run_tag;
+                if (run_tag == '#') {
+                    if (run_end == source->total_length || lexical_tags[run_index] == ' ' ||
+                        lexical_tags[run_index] == '\t' || lexical_tags[run_index] == '\n')
+                        l1_tag |= MD_L1_ATX_SEPARATOR;
+                }
+                l1_tags[l1_count]    = l1_tag;
                 l1_offsets[l1_count] = run_offset;
                 l1_lengths[l1_count] = run_length;
                 l1_count += 1;
@@ -645,6 +656,7 @@ MdResult md_get(rop(rw MdState) state, rop(rw Arena) arena, rop(rw ScratchArena)
     u32  fence_marker_length = 0; // Zero means no fence is open.
     u16* list_columns        = scratch_alloc_aligned(scratch, u16, state->l0_count);
     u32  list_stack_count    = 0;
+    u32  paragraph_open      = false;
 
     list_columns[list_stack_count] = 0; // Top-level content column.
 
@@ -705,31 +717,58 @@ MdResult md_get(rop(rw MdState) state, rop(rw Arena) arena, rop(rw ScratchArena)
             next_idx = hit_mask_idx * 64 + (u32)__tzcnt_u64(active_hit_mask);
 
         u32 parent_idx = list_stack_count;
+        u32 l0_end     = 0;
+        u32 pre_indent = 0;
         if (list_stack_count > 0) {
             // Check continuation through the next hit, or through the end of the window.
             u32 check_end = min(next_idx + (active_hit_mask != 0), state->l0_count - 1 - chunk_start);
             while (chunk_idx < check_end && list_stack_count > 0) {
                 u32 line_idx = chunk_start + chunk_idx;
-                if (state->l0_offsets[line_idx + 1] > begin)
+                l0_end       = state->l0_offsets[line_idx + 1];
+                if (l0_end > begin)
                     goto rewind_context;
 
                 u8 tag = buffer_ptr[chunk_idx];
-                if (tag != MD_L0_BLANK) {
-                    // TODO Allow lazy continuation of an open paragraph.
-                    u32 pre_indent = state->l0_common[line_idx].pre_indent;
-                    while (pre_indent < list_columns[parent_idx])
-                        parent_idx -= 1;
+                if (tag == MD_L0_BLANK) {
+                    paragraph_open = false;
+                    goto check_all_loop_end;
+                }
 
-                    // Outside a fence, commit bullet dedent only after validating the marker.
-                    if (parent_idx < list_stack_count && (fence_marker_length != 0 || tag != MD_L0_UNORDERED_LIST)) {
-                        list_stack_count    = parent_idx;
-                        fence_marker_length = 0;
+                if (tag == MD_L0_PARAGRAPH && paragraph_open != 0)
+                    goto check_all_loop_end;
+
+                pre_indent = state->l0_common[line_idx].pre_indent;
+                while (pre_indent < list_columns[parent_idx])
+                    parent_idx -= 1;
+
+                if (tag == MD_L0_ATX_HEADING && (fence_marker_length == 0 || parent_idx < list_stack_count)) {
+                    if (pre_indent < (u32)list_columns[parent_idx] + 4) {
+                        u32 line_start = state->l0_offsets[line_idx];
+                        while (state->l1_offsets[l1_idx] < line_start)
+                            l1_idx += 1;
+                        if (state->l1_tags[l1_idx] == '#')
+                            tag = MD_L0_PARAGRAPH;
+                    } else {
+                        tag = MD_L0_PARAGRAPH;
+                    }
+                    if (tag == MD_L0_PARAGRAPH && paragraph_open != 0) {
+                        parent_idx = list_stack_count;
+                        goto check_all_loop_end;
                     }
                 }
 
-                if (chunk_idx == next_idx)
-                    break;
+                if (parent_idx < list_stack_count)
+                    fence_marker_length = 0;
 
+                // A rejected bullet may still continue the current paragraph.
+                if (tag != MD_L0_UNORDERED_LIST) {
+                    if (parent_idx < list_stack_count)
+                        list_stack_count = parent_idx;
+                    paragraph_open = tag == MD_L0_PARAGRAPH && list_stack_count > 0 && fence_marker_length == 0 &&
+                                     pre_indent < (u32)list_columns[parent_idx] + 4;
+                }
+
+            check_all_loop_end:
                 chunk_idx += 1;
             }
         }
@@ -745,19 +784,28 @@ MdResult md_get(rop(rw MdState) state, rop(rw Arena) arena, rop(rw ScratchArena)
             continue;
         }
 
-        chunk_idx  = next_idx;
-        u32 l0_idx = chunk_start + chunk_idx;
-        u32 l0_end = state->l0_offsets[l0_idx + 1];
-        if (l0_end > begin)
-            break;
+        // The continuation scan advances past the hit only if it checked it.
+        u32 hit_checked = chunk_idx > next_idx;
+        chunk_idx       = next_idx;
+        u32 l0_idx      = chunk_start + chunk_idx;
+        if (hit_checked == 0) {
+            l0_end = state->l0_offsets[l0_idx + 1];
+            if (l0_end > begin)
+                break;
+        }
 
         u8 l0_tag = buffer_ptr[chunk_idx];
         chunk_idx += 1;
         active_hit_mask &= active_hit_mask - 1;
 
         if (fence_marker_length != 0) {
-            if (l0_tag == MD_L0_FENCE_NO_TRAILING_TEXT &&
-                state->l0_common[l0_idx].pre_indent < (u32)list_columns[list_stack_count] + 4) {
+            if (l0_tag == MD_L0_FENCE_NO_TRAILING_TEXT) {
+                if (hit_checked == 0)
+                    pre_indent = state->l0_common[l0_idx].pre_indent;
+
+                if (pre_indent >= (u32)list_columns[list_stack_count] + 4)
+                    goto state_accumulate_loop_end;
+
                 u32 l0_start = state->l0_offsets[l0_idx];
 
                 // find l1
@@ -777,26 +825,45 @@ MdResult md_get(rop(rw MdState) state, rop(rw Arena) arena, rop(rw ScratchArena)
             case MD_L0_UNORDERED_LIST: {
                 // clang-format on
 
-                u32 pre_indent = state->l0_common[l0_idx].pre_indent;
+                if (hit_checked == 0)
+                    pre_indent = state->l0_common[l0_idx].pre_indent;
 
                 // cheapest early exit
                 if (pre_indent >= ((u32)list_columns[parent_idx] + 4))
-                    break;
+                    goto rejected_bullet;
 
                 // second cheapest early exit
                 u32 post_indent = state->l0_extra[extra_idx].post_indent;
                 if (post_indent == 0)
-                    break;
+                    goto rejected_bullet;
 
                 // most expensive early exit/validation
                 u32 l0_start = state->l0_offsets[l0_idx];
                 while (state->l1_offsets[l1_idx] < l0_start)
                     l1_idx += 1;
                 if (state->l1_lengths[l1_idx] != 1)
-                    break;
+                    goto rejected_bullet;
 
-                // at this point, this is a valid list continuation
-
+                u32 body_start = l0_start + state->l0_common[l0_idx].content_start;
+                u32 body_l1    = l1_idx + 1;
+                paragraph_open = post_indent <= 4 && body_start < l0_end - 1;
+                if (paragraph_open != 0 && body_l1 < state->l1_count && state->l1_offsets[body_l1] == body_start) {
+                    switch (state->l1_tags[body_l1]) {
+                        case '>':
+                            paragraph_open = false;
+                            break;
+                        case '#' | MD_L1_ATX_SEPARATOR:
+                            paragraph_open = state->l1_lengths[body_l1] > 6;
+                            break;
+                        case '`':
+                        case '~':
+                            paragraph_open = state->l1_lengths[body_l1] < 3;
+                            break;
+                        default:
+                            // Inline punctuation does not prevent a paragraph from opening.
+                            break;
+                    }
+                }
                 if (post_indent > 4)
                     post_indent = 1;
 
@@ -804,15 +871,24 @@ MdResult md_get(rop(rw MdState) state, rop(rw Arena) arena, rop(rw ScratchArena)
                 list_columns[list_stack_count] = (u16)(pre_indent + 1 + post_indent);
                 break;
 
+            rejected_bullet:
+                if (paragraph_open == 0) {
+                    list_stack_count = parent_idx;
+                    paragraph_open   = parent_idx > 0 && pre_indent < (u32)list_columns[parent_idx] + 4;
+                }
+                break;
+
                 // clang-format off
             }
-            case MD_L0_THEMATIC_BREAK: break;
+            case MD_L0_THEMATIC_BREAK:
             case MD_L0_BLOCK_QUOTE: break;
             case MD_L0_FENCED_CODE_BLOCK:
             case MD_L0_FENCE_NO_TRAILING_TEXT: {
                 // clang-format on
 
-                if (state->l0_common[l0_idx].pre_indent >= (u32)list_columns[list_stack_count] + 4)
+                if (hit_checked == 0)
+                    pre_indent = state->l0_common[l0_idx].pre_indent;
+                if (pre_indent >= (u32)list_columns[list_stack_count] + 4)
                     break;
 
                 // A fence candidate's leading marker is its first L1 run.
@@ -837,6 +913,7 @@ MdResult md_get(rop(rw MdState) state, rop(rw Arena) arena, rop(rw ScratchArena)
 
                 fence_marker_byte   = marker;
                 fence_marker_length = length;
+                paragraph_open      = false;
 
                 break;
                 // clang-format off
